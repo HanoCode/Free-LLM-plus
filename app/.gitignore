@@ -1,0 +1,9 @@
+node_modules
+dist
+.cprof*
+.cp-*
+shot-*.png
+*.log
+
+# Electron 本地二进制缓存与冒烟产物
+electron-cache

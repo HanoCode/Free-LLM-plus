@@ -1,0 +1,33 @@
+{
+  "name": "freeport",
+  "private": true,
+  "version": "0.1.0",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "description": "Freeport — local gateway that unifies free LLM providers and injects them into coding agents",
+  "scripts": {
+    "dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"wait-on tcp:127.0.0.1:5273 && cross-env FP_DEV=1 electron .\"",
+    "dev:web": "vite",
+    "build": "tsc -b && vite build",
+    "start": "npm run build && electron .",
+    "smoke": "cross-env FP_SMOKE=1 FP_DEV=1 electron .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "^0.469.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zustand": "^5.0.2"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.4.11",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  }
+}

@@ -1,0 +1,77 @@
+/* ============================================================
+   Freeport — design tokens
+   单一真源：所有颜色 / 间距 / 字号都在这里，页面不写死色值
+   ============================================================ */
+
+:root {
+  /* surfaces */
+  --bg: #fafaf9;
+  --panel: #ffffff;
+  --panel-2: #f5f5f4;
+  --panel-3: #efeeec;
+  --line: #e7e5e4;
+  --line-strong: #d6d3d1;
+
+  /* text */
+  --text: #1c1917;
+  --text-2: #44403c;
+  --muted: #78716c;
+  --faint: #a8a29e;
+
+  /* accent — single accent, no gradients */
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-soft: #eef2ff;
+  --accent-line: #c7d2fe;
+
+  /* semantic */
+  --ok: #059669;
+  --ok-soft: #ecfdf5;
+  --warn: #d97706;
+  --warn-soft: #fffbeb;
+  --bad: #dc2626;
+  --bad-soft: #fef2f2;
+  --info: #0284c7;
+  --info-soft: #f0f9ff;
+
+  /* elevation */
+  --shadow: 0 1px 2px rgba(28, 25, 23, 0.04), 0 1px 3px rgba(28, 25, 23, 0.03);
+  --shadow-pop: 0 8px 24px rgba(28, 25, 23, 0.12);
+  --radius: 10px;
+
+  /* type */
+  --mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
+}
+
+html[data-theme='dark'] {
+  --bg: #0c0a09;
+  --panel: #171412;
+  --panel-2: #1f1b19;
+  --panel-3: #292524;
+  --line: #292524;
+  --line-strong: #3f3a36;
+
+  --text: #fafaf9;
+  --text-2: #e7e5e4;
+  --muted: #a8a29e;
+  --faint: #78716c;
+
+  --accent: #818cf8;
+  --accent-hover: #a5b4fc;
+  --accent-soft: #1e1b4b;
+  --accent-line: #3730a3;
+
+  --ok: #34d399;
+  --ok-soft: #052e2b;
+  --warn: #fbbf24;
+  --warn-soft: #2d1f05;
+  --bad: #f87171;
+  --bad-soft: #2d0a0a;
+  --info: #38bdf8;
+  --info-soft: #082f49;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
