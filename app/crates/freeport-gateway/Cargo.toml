@@ -1,0 +1,25 @@
+[package]
+name = "freeport-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freeport 的数据面：HTTP 入口、失败接力、流式转发。"
+
+[dependencies]
+freeport-core = { path = "../freeport-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+axum = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = { workspace = true }

@@ -1,13 +1,16 @@
-# Freeport 架构设计（v1.1 · 已定稿）
+# Freeport 架构设计（v1.3 · Tauri 已落地）
 
 > Freeport（自由港）：本机常驻的「大模型额度聚合网关」桌面应用。自动发现可用厂商/模型（含订阅额度与 Cookie 会话）→ 统一 OpenAI / Anthropic / Gemini 协议 → 一键注入已安装的 Agent。
+
+> **v1.3 变更（M1.5 已落地）**：Tauri 2 + Rust 迁移完成，**Electron 代码已从仓库删除**。网关拆为 `freeport-core`（模型/错误/冷却/路由/DTO）与 `freeport-gateway`（store/providers/axum server）两个 lib crate，`src-tauri` 只做宿主；同一二进制支持 GUI 与 `--headless` 双形态。前端页面零改动，仅替换 `src/lib/ipc.ts` 门面。完整论证见 [`ADR-001-runtime.md`](./ADR-001-runtime.md)。
 
 ## 决策记录（2026-10-19）
 
 | 决策项 | 结论 | 影响 |
 |---|---|---|
 | 产品名 | **Freeport（自由港）** | Bundle ID `dev.freeport.app`；CLI 命令 `freeport` |
-| 技术栈 | **Electron 38 + TypeScript 全栈** | 可直接移植 temp 中全部 TS 协议/适配器代码；包体 ~150MB 为已知代价 |
+| 技术栈（v1.1，**已废弃**） | ~~Electron 38 + TypeScript 全栈~~ | 废弃理由见 ADR-001 §1：242MB 运行时 / 空载 200–300MB / 关窗即断服 |
+| 技术栈（v1.2） | **Tauri 2 + Rust 内核 + React 前端** | 包体 15–35MB；常驻网关 15–25MB；网关为 lib，GUI 与 daemon 共用 |
 | 合规边界 | **Tier A/B/C 全量支持（含 webCookie）** | 新增 Auth Broker 子系统；不上架应用商店；需法务文案与风控 |
 | Tier C 首批 | **OpenCode Zen（主）+ GitHub Copilot（备）** | 两家都有官方 OAuth/设备码路径，不依赖浏览器 Cookie 库；Cookie 类只做 **OpenCode Zen 的 web 会话**作为探路 |
 | 注入范围 | **12 个 Agent + 2 个引导式** | 注入器必须做成配置驱动的插件框架，而非硬编码 |
@@ -23,8 +26,10 @@
 | 问题 | 结论 |
 |---|---|
 | 这个产品本质上是什么 | **本地反向代理 + 能力探测 + 配置注入器**，不是聊天客户端 |
+| 那么它该长什么形状 | **一台常驻服务，不是一个 GUI**。网关做成 lib，GUI 与 daemon 是两个宿主（§3.1） |
+| 运行时选什么 | **Tauri 2 + Rust**：包体 15–35 MB、常驻 15–25 MB、关窗仍可服务（ADR-001） |
 | 最难的不是「聚合」 | 是 **工具调用（tool calling）能不能跑通**、**429/额度账本**、**流式跨协议转换** |
-| 参考项目里最该抄谁 | 路由/配额/协议 → `freellmapi`；provider 广度 → `9router`；一键注入 → `router` + `freellmapi`；托盘与本地转发最小实现 → `RuiC-oc-ferry` |
+| 参考项目里最该抄谁 | 运行时/双形态/路由 → `magpie` + `cc-switch`；路由/配额/协议 → `freellmapi`；provider 广度 → `9router`；一键注入 → `router` + `magpie` |
 | 最该避免的 | 「名字里带 free 就当免费」「无脑轮询所有 provider」「把逆向订阅当免费额度」 |
 | 稳定性的本质 | 不是「支持多少家」，而是 **失败作用域判定 + 时间预算 + 配额账本** 三件事（§3.6） |
 | MVP 边界 | 本机回环、单用户；Tier A 全量 + Tier C 两家（OpenCode Zen / Copilot）；注入先做 5 个核心 Agent |
@@ -50,7 +55,15 @@
 | **llm4free** | Python 库 + OpenAI 兼容 server | Python 3.10+ | 278 文件 | 40+ 模型统一 SDK，含 webai/逆向能力 | ★★☆☆☆ 大量逆向/网页会话，合规风险高；仅参考「统一 client 抽象」 |
 | **awesome-free-llm-apis** | 静态目录 | JSON + Node 校验脚本 | 16 厂商/123 模型 | 免费厂商结构化数据 + 每日可用性校验 | ★★★★☆ **目录数据格式**可直接借鉴；校验脚本思路可复用 |
 | **Free-LLM / awesome-freellm-apis** | 静态目录 | Markdown | 47 厂商/210 模型 | 社区维护的免费 API 索引，含 credit card 透明度标注 | ★★★☆☆ 冷启动数据源；需人工核验时效 |
+| **magpie**（yetone） | **单二进制：GUI(Wails) / TUI / CLI / web / serve / launchd** | **Go 1.26 + Wails v3** | 3283 Go 文件, 60+ Agent | 「每个 agent 的模型放一处」：本地网关 + 账号池 + 配额耗尽自动换号 + 一文件一注入器 | ★★★★★ **运行时架构的教科书**：网关即 lib、双形态、SWRR、rest 自解释、models.dev 目录 |
+| **cc-switch** | **Tauri 2 桌面**（窗口 + 托盘） | **Rust + React 18 + axum + rusqlite** | 33 MB dmg, 60+ Agent | Claude Code / Codex / Gemini CLI 的一站式供应商切换 + 本地代理 + 故障转移 | ★★★★★ **Tauri 生产验证**：三态熔断、failover 队列、usage rollup、provider 适配器分层 |
 | **chatgpt2api** | Python 服务 + Web 面板 + Docker | Python / FastAPI + React | 1 个上游（ChatGPT 官网），图片为主 | OpenAI 账号池 + OAuth token 生命周期 + 官网图片链路逆向 + 代理链 + 任务队列 | ★★★☆☆ **不接主链路**：只吸收「凭据保活/刷新退避/状态机/代理优先级」四组实战参数；作为 v1.5 扩展宿主（Extension）的样板。逆向图片链路风险过高，不进 v1 |
+
+**magpie 与 cc-switch 是本轮复议新增的两个参照，它们回答的不是「怎么聚合厂商」，而是「一个常驻网关该长什么形状」**：
+- magpie 证明「网关 + 60 个注入器 + GUI + TUI」可以只有 **22.5 MB**，靠的是「网关是库，界面是可选宿主」；
+- cc-switch 证明 **Tauri 2 能扛住三协议代理 + SSE 流式 + SQLite + 60 个 Agent 配置**，且只有 **33.2 MB**。
+
+完整解构与选型论证见 [`ADR-001-runtime.md`](./ADR-001-runtime.md)。
 
 ### 1.2 9router 的 provider 分类（实测统计）
 
@@ -117,43 +130,73 @@ effective = base × headroomFactor × rateLimitFactor
 
 ### 3.1 进程模型
 
+**单二进制 · 双形态**。网关是一组 Rust lib crate，GUI 与 daemon 只是两个宿主。
+
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Desktop Shell（托盘 + 主窗口 + 自启 + 更新）                   │
-│  ┌────────────────┐   ┌──────────────────────────────────┐   │
-│  │  UI (React)    │←→ │  Control Plane (RPC / IPC)        │   │
-│  └────────────────┘   │  · 目录同步  · 凭据保险库          │   │
-│                       │  · 探针引擎  · Agent 注入器        │   │
-│                       │  · 配置备份/回滚                   │   │
-│                       └──────────────┬───────────────────┘   │
-│                                      │ 同进程 / 共享 DB       │
-│  ┌───────────────────────────────────▼───────────────────┐   │
-│  │  Data Plane：HTTP Server  127.0.0.1:PORT               │   │
-│  │  Ingress → Auth → Resolve → Gate → Route → Adapter     │   │
-│  │           → Translate(SSE) → Account → Log             │   │
-│  └───────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
-                              │ HTTPS
-                    ┌─────────┴──────────┐
-                    ▼                    ▼
-              官方免费 API          扩展 sidecar（可选）
-                              （图片 / 音频，独立进程）
+┌──────────────────────────────────────────────────────────────────┐
+│  一个可执行文件 freeport                                          │
+│                                                                  │
+│  ┌────────────────────────┐        ┌───────────────────────────┐ │
+│  │ 形态 A：GUI（默认）     │        │ 形态 B：--headless        │ │
+│  │ Tauri 窗口 + 托盘       │        │ 无窗口，由系统服务托管      │ │
+│  │ ┌────────────────────┐ │        │                           │ │
+│  │ │ WebView: React UI  │ │        │                           │ │
+│  │ └─────────┬──────────┘ │        │                           │ │
+│  │           │ invoke     │        │                           │ │
+│  │ ┌─────────▼──────────┐ │        │                           │ │
+│  │ │  Control Plane     │ │        │                           │ │
+│  │ │  目录/凭据/探针/注入 │ │        │                           │ │
+│  │ └─────────┬──────────┘ │        │                           │ │
+│  │           │ 同进程调用   │        │                           │ │
+│  │ ┌─────────▼──────────┐ │        │ ┌───────────────────────┐ │ │
+│  │ │ freeport-gateway   │◀┼────────┼▶│ freeport-gateway      │ │ │
+│  │ │ （同一份 lib）      │ │        │ │ （同一份 lib）         │ │ │
+│  │ └─────────┬──────────┘ │        │ └───────────┬───────────┘ │ │
+│  └───────────┼────────────┘        └─────────────┼───────────┘ │
+└──────────────┼───────────────────────────────────┼─────────────┘
+               │ HTTP 127.0.0.1:PORT              │
+               ▼                                   ▼
+        官方免费 API / 订阅端点              官方免费 API / 订阅端点
 ```
 
-**关键决策：Data Plane 与 UI 同进程、共享同一个 DB 连接。**
+**关键决策（取代 v1.1 的「Data Plane 与 UI 同进程」）**
 
-理由：单用户本机场景，无需跨进程；避免 `freellmapi` 遇到的「bundle 后 DB 单例出现两份」问题；省掉 IPC 序列化与端口二次分配。托盘退出时一起退出。
+| # | 决策 | 理由 |
+|---|---|---|
+| 1 | `freeport-gateway` 是 **lib crate**，不是 bin | GUI、daemon、未来的 CLI/TUI 共用一份实现，不会出现「两套网关行为不一致」 |
+| 2 | GUI 默认**进程内**起网关 | 单窗口场景零 IPC 开销，最简路径 |
+| 3 | 关窗时按设置**移交** daemon | 用户勾选「保持网关运行」→ spawn `--headless` → 等 `/health` 就绪 → GUI 退出 |
+| 4 | 再次点图标 → 检测到已有 daemon → GUI 以**控制台模式**启动 | 写操作经 `POST /admin/*` 转给 daemon，不重复绑定端口 |
+| 5 | 端口冲突用「先停后起」而非 `SO_REUSEPORT` | 空窗 <300ms，agent 侧本身有重试；避免两个实例同时服务造成配额账本分裂 |
+
+**为什么不拆成两个进程常驻**：单二进制双形态既拿到了进程隔离的收益（daemon 无 WebView，常驻 15–25MB），又避免了「两个 exe 要分别签名、分别公证、分别更新、版本可能错配」的发布复杂度。这是 magpie 验证过的路径。
+
+**v1.1 旧决策的失效原因**：Electron 下「同进程」意味着网关的寿命 = 窗口的寿命，而产品定位是 7×24 常驻。要维持常驻只能托盘隐藏，但 Chromium 的 200–300MB 仍在。这不是实现问题，是宿主选错了。
 
 ### 3.2 分层职责
 
 | 层 | 职责 | 不做什么 |
 |---|---|---|
-| Shell | 生命周期、托盘、自启、单实例锁、更新、崩溃重启 | 不写业务逻辑 |
-| UI | 展示、配置编辑、diff 预览、日志检索 | 不直接发上游请求 |
-| Control Plane | 目录、凭据、探针、注入、备份 | 不处理业务流量 |
-| Data Plane | 鉴权、模型解析、门禁、路由、协议转换、流式、记账 | 不弹 UI、不写用户配置 |
-| Adapter | 单一 provider 的 wire 细节与 quirk | 不做路由决策 |
-| Translator | 三协议 ⇄ Canonical IR | 不感知 provider |
+| **GUI Host**（`src-tauri`） | 窗口、托盘、自启、单实例锁、更新、窗位记忆、daemon 移交 | 不写业务逻辑，不直接发上游请求 |
+| **Daemon Host**（`--headless`） | 仅托管 Data Plane + 巡检调度；无窗口、无 WebView | 不弹 UI、不改用户配置（除注入同步） |
+| UI（WebView / React） | 展示、配置编辑、diff 预览、日志检索 | 不碰 `fs` / `net`，一切经 `invoke` 白名单 |
+| Control Plane（lib） | 目录、凭据、探针、注入、备份、更新检查 | 不处理业务流量 |
+| Data Plane（lib） | 鉴权、模型解析、门禁、路由、协议转换、流式、记账 | 不弹 UI、不写用户配置 |
+| Adapter（lib） | 单一 provider 的 wire 细节与 quirk | 不做路由决策 |
+| Translator（lib） | 三协议 ⇄ Canonical IR | 不感知 provider |
+
+**crate 边界即架构边界**（防止腐化）：
+
+```
+crates/freeport-core/     IR、路由算法、账本、错误分类   —— 纯逻辑，无 IO，100% 可单测
+crates/freeport-gateway/  axum server + 中间件链 + adapter —— 依赖 core
+crates/freeport-inject/   注入器（一文件一适配器）        —— 只碰文件，不碰网络
+crates/freeport-catalog/  目录同步 + 签名校验 + patch
+crates/freeport-probe/    探针 + 巡检调度
+src-tauri/                GUI 宿主，链接以上全部
+```
+
+禁止反向依赖：`core` 不得 `use freeport_gateway`，`inject` 不得 `use freeport_probe`。CI 用 `cargo-deny` + 自定义依赖图检查。
 
 ### 3.3 核心抽象：Canonical IR（这是整个架构的支点）
 
@@ -195,7 +238,44 @@ type CanonicalStreamEvent =
 
 ### 3.4 目录与发现（Discover）
 
-三层数据，优先级从高到低：
+> **v1.2 修订：不自建全量模型目录，改为「跟随 models.dev + 自建免费额度增量」**
+>
+> v1.1 计划三层全自建（内置基线 + 签名 feed + 运行时探测），意味着我们要持续维护 100+ 厂商、上千个模型的名称、上下文窗口、价格、能力位。这是 models.dev 已经在做的事，重复维护只会得到一份更慢、更旧、更容易错的副本。
+>
+> magpie 的做法值得直接采纳：`catalog` 以 **models.dev + 各厂商 `/models`** 为底，`catalog.Sync` / `KeepFresh` 负责保鲜，自己不存全量。
+>
+> 修订后的三层：
+>
+> | 层 | 内容 | 来源 | 我们维护？ |
+> |---|---|---|---|
+> | L0 模型元数据 | 模型清单、上下文窗口、价格、能力位、别名 | **models.dev + 厂商 `/models`** | ❌ 跟随，可缓存离线 |
+> | L1 免费额度情报 | rpm/rpd/tpm/tpd、是否需绑卡、地区限制、重置周期 | **自建签名 feed（Pro 资产）** | ✅ 核心 |
+> | L2 运行时可观测 | 实际可用性、TTFT、错误画像、真实限额学习 | 探针 + 真实流量 | ✅ 核心 |
+>
+> 这样签名 feed 从「数 MB 全量目录」缩到「数十 KB 增量」：
+> - 更新更快（每日多次也无压力）
+> - 出错面更小（只覆盖我们自己的字段，覆盖不到 models.dev 的更新）
+> - 商业边界更清晰（**免费额度情报**才是 Pro 卖的，模型清单是公共知识）
+>
+> L1 的 schema：
+>
+> ```jsonc
+> {
+>   "providerId": "opencode-zen",
+>   "modelPattern": "grok-code*",
+>   "free": { "rpm": 20, "rpd": 200, "tpm": null, "tpd": null },
+>   "requiresCard": false,
+>   "regions": ["*"],
+>   "reset": "utc_midnight",
+>   "source": "https://opencode.ai/docs/zen/#limits",
+>   "verifiedAt": "2026-10-19T06:00:00Z",
+>   "confidence": 0.9
+> }
+> ```
+>
+> `confidence` 由「文档明示 > 探针实测 > 用户上报 > 社区推测」加权，UI 上如实显示来源与验证时间。
+
+**三层数据，优先级从高到低：**
 
 | 层 | 来源 | 更新 | 作用 |
 |---|---|---|---|
@@ -435,6 +515,24 @@ GitHub Actions 足够，成本≈0。`beta` 频道的意义是让新 provider �
 
 这是整个产品**唯一不能糊弄**的部分。用户感知的「稳」，90% 来自这里：同样的 20 家免费厂商，路由做得好就是「几乎不断」，做得差就是「一天崩八次」。
 
+> **v1.2 修订：从「连乘打分」改为「三层可解释决策」**
+>
+> v1.1 用 `score = base × headroom × rateLimit × userOverride` 一个式子决定一切。问题不是算得不对，而是**线上出问题时无法回答「为什么这次选了它」**——四个乘子互相淹没，日志里只剩一个数字。
+>
+> 改为三层，每层可独立观测、独立关闭、独立解释（参考 magpie 的 `routes.Smart` 与 cc-switch 的 `circuit_breaker`）：
+>
+> ```
+> ① Gate   ：三态熔断 + 四窗口账本 + 能力门禁 + 凭据  →  硬过滤，不参与排序
+> ② Order  ：SWRR 平滑加权轮询                        →  决定档位与长期比例
+> ③ Pick   ：同档内「最早刷新优先 → 剩余最多 → 8% 探索」→  决定这一跳用谁
+> ```
+>
+> - **① Gate** 只做「能不能用」，输出候选集与每项的 `restReason/restUntil`。
+> - **② Order** 用 NGINX 的 smooth WRR（权重 3:1 的实际序列是 `a,a,b,a,a,a,b,a`），保证**短期比例**就准确，而不是只有长期平均对。key 权重、group member 权重都用它。
+> - **③ Pick** 在同权重档内排序，第一优先级是 **「剩余额度最早刷新的先用」**——不用的额度会过期作废，晚刷新的额度可以留着，这是经济最优。同档内再按三轴打分与 Thompson 探索。
+>
+> 下文 §3.6.3–§3.6.5 的三轴公式**保留，但降级为第 ③ 层的内部排序**，不再参与全局连乘。
+
 #### 3.6.1 请求流水线
 
 ```
@@ -474,7 +572,9 @@ Ingress ──▶ ① Resolve  ──▶ ② Gate ──▶ ③ Rank ──▶ �
 
 > 剔除顺序有讲究：先能力、再凭据、最后请求级 skip。这样「所有模型都因为没 key 被剔除」能报 503 `no_providers_configured`，而不是误导成 429 限流。
 
-#### 3.6.3 打分：三轴凸组合 × 三个守卫乘子
+#### 3.6.3 Pick 层排序：三轴凸组合 × 三个守卫乘子（仅同档内）
+
+> **v1.2 定位**：本节的式子只在第 ② 层 SWRR 产出的**同一权重档内**生效，用于决定档内先后。它不再跨档比较，也不再承担「这个模型该不该被用」的判断——那是 ① Gate 的职责。
 
 **第一层：质量轴（权重和恒为 1，结果 ∈ [0,1]）**
 
@@ -548,19 +648,61 @@ sort key = (match_tier ASC, score DESC, priority ASC)
 - `priority`：用户链里的手工顺序，只做**平局打破**。这样既保留手动控制感，又不让「手工置顶一个 0 成功率模型」毁掉整体可用性。
 - **粘性会话 pin**：同一会话（首条 user message 的 SHA-1）30 分钟内把上次成功的模型移到队首；命中但该模型已冷却则放弃 pin。
 
-#### 3.6.6 Key 选择（模型定了，用哪个 key）
+#### 3.6.6 Key / 账号选择：SWRR + 会话粘性
 
 | 策略 | 规则 | 适用 |
 |---|---|---|
-| `auto`（默认） | 该模型下按 key 级 R 采样 + 轮转 | 通用 |
-| `least-remaining` | 跳过共享池，按**剩余额度最多**的可用 key 排序 | 多账号、平台有账号级总配额 |
+| `weighted`（默认） | SWRR 平滑加权轮询；权重来自 key 级 R 与用户手设倍率 | 通用，多 key 时短期比例即准 |
+| `least-remaining` | 按**剩余额度占比**排序，余量少的不接新请求 | 多账号、平台有账号级总配额 |
+| `in-order` | 严格按用户排的顺序，前一个不可用才下一个 | 主备 key（付费主 + 免费备） |
 
-先过滤：`enabled` 且 `status ∈ {healthy, unknown}` 且不在冷却 且 未达并发上限。
-`unknown` 视为可用——没探测过不等于坏，让真实请求去证伪。
+先过滤：`enabled` 且 `status ∈ {healthy, unknown}` 且不在 `Open/HalfOpen` 且未达并发上限。`unknown` 视为可用——没探测过不等于坏，让真实请求去证伪。
+
+> **v1.2 新增：affinity（会话粘性）——这是 coding agent 场景的生死线**
+>
+> magpie 的 `affinity.go` 与 cc-switch 的 `session.rs` 都在做同一件事，我们 v1.1 漏了。
+>
+> ```
+> key = sha256(sessionId ‖ model)        // sessionId 来自客户端 header 或首条 user message
+> TTL = 30 min（滑动续期）
+> 规则：命中 → 该 provider/key 置顶，除非它已 Open
+>       命中但该 key 已耗尽 → 换 key，但**优先同 provider**（保住厂商侧缓存）
+>       未命中 → 正常 SWRR，成功后写入
+> ```
+>
+> 为什么必须有：Claude Code / Codex 这类 agent 一次任务会发几十次请求，每次都带完整历史。若每跳换一个 key/账号，厂商侧的 prompt cache 全部失效——成本和首字延迟同时爆炸，用户感受是「这个网关比直连贵还慢」。**粘性换来的缓存命中，比多用一个 key 的额度更值钱。**
+>
+> 例外：当某 key 剩余额度低于 10% 时主动解除粘性，把长会话迁到余量充足的 key 上，避免任务做到一半断掉。
 
 #### 3.6.7 失败接力：判定作用域，而不是「重试三次」
 
 失败处理的第一件事不是退避，而是**判断这次失败属于谁**。判错作用域是绝大多数聚合网关崩掉的根因：一个平台 5xx，却在它的 4 个 key × 6 个模型上各烧一跳，40 秒过去用户还在等。
+
+> **v1.2：作用域不变，恢复机制改为三态熔断**
+>
+> 作用域（key / model / platform 三级）与冷却时长表继续沿用。变化在于「冷却到期之后」：
+>
+> ```
+> Closed ──(连续失败 ≥ N 或 错误率 > 阈值)──▶ Open
+>   ▲                                          │
+>   │                                    (timeout 到期)
+>   │                                          ▼
+>   └──────(半开连续成功 ≥ M 次)─────────── HalfOpen
+>                                              │
+>                                         (试探失败) ──▶ Open（翻倍 timeout）
+> ```
+>
+> v1.1 的「冷却到期直接恢复」会让一个尚未恢复的 provider 立刻再吃一次失败，然后再进冷却——每次都白烧一跳。`HalfOpen` 只放**一个**试探请求通过（用最小代价：`/models` 或 1 token），成功才真正放量。
+>
+> 参数（按作用域分级，均可远程配置）：
+>
+> | 作用域 | failure_threshold | timeout | success_threshold |
+> |---|---|---|---|
+> | key | 3 | 5 min → ×2，封顶 1 h | 1 |
+> | model | 3（15 min 窗口内） | 10 min → ×2，封顶 2 h | 1 |
+> | platform | 5 | 90 s → ×2，封顶 15 min | 2 |
+>
+> `Open` 状态必须携带 `reason`（英文字段 + i18n 码）与 `resetAt`，直接渲染成 UI 上的一句话：**「预计 14:32 恢复 · 额度耗尽」**，而不是一个红点。这是「可解释」落到用户界面的那一步。
 
 **错误 → 作用域 → 动作（完整矩阵）**
 
@@ -738,7 +880,38 @@ return exhausted('retries_exhausted', lastError)                      // 按「�
 
 ### 3.8 一键注入（Inject）
 
-**Agent Adapter 插件模型**（配置文件驱动，不写死代码）
+> **v1.2 修订：放弃配置 DSL，改为「一文件一适配器 + 共享工具库」**
+>
+> v1.1 计划用 JSON 声明式 DSL 描述每个 Agent 的注入方式。复议后放弃，理由是 magpie 的实证：60+ 个 Agent 全是**一个 `.go` 文件一个适配器**，没有统一 DSL，也没有抽象工厂。
+>
+> 真实的长尾适配里，「写哪个键」只占工作量的三成，剩下七成是：路径探测的多平台差异、配置格式的方言（JSONC 尾逗号、YAML 注释丢失、TOML 表结构）、agent 自己也在写同一文件的并发竞争、老版本配置的迁移、以及「这个 agent 读的是环境变量而另一个读的是项目级文件」。这些**无法被声明式 DSL 表达**，硬塞进去只会得到一个需要写代码的 DSL——比直接写代码更差。
+>
+> 新结构：
+>
+> ```
+> crates/freeport-inject/
+>   mod.rs            // trait AgentAdapter { detect, plan, apply, verify, rollback }
+>   util/{atomic.rs, managed_block.rs, jsonc.rs, backup.rs, lock.rs}
+>   agents/
+>     claude_code.rs
+>     codex_cli.rs
+>     cline.rs
+>     continue_.rs
+>     opencode.rs
+>     gemini_cli.rs
+>     aider.rs
+>     roo_code.rs
+>     kilo_code.rs
+>     goose.rs
+>     crush.rs
+>     workbuddy.rs
+> ```
+>
+> 可复用的部分（托管块合并、原子写、备份链、文件锁、diff 生成）全部下沉到 `util`，**但它们是被调用的函数，不是被填充的模板**。第 13 个 Agent 到来时，新增一个文件，不改任何既有文件。
+>
+> 下面的 JSON 结构**仅作为 `AgentAdapter` 的元数据定义**保留（用于 UI 展示「目标文件/协议/难度」），不再承担执行语义。
+
+**Agent Adapter 元数据（用于 UI 与探测，非执行 DSL）**
 
 ```jsonc
 {
@@ -831,7 +1004,7 @@ interface Credential {
   id: string
   providerId: string
   kind: CredentialKind
-  secretRef: string            // Keychain 引用，不存明文
+  secretRef: string            // 本机密钥库条目名，不存明文
   scopes?: string[]
   expiresAt?: number
   refreshable: boolean
@@ -844,7 +1017,7 @@ interface Credential {
 
 | 路径 | 实现 | 适用 |
 |---|---|---|
-| API Key | 用户粘贴 → 0600 临时文件 → Keychain → 立即验证 | Tier A/B |
+| API Key | 用户粘贴 → 立即验证 → AES-256-GCM 加密落 `secrets.json`（0600） | Tier A/B |
 | OAuth PKCE | 内置 `BrowserWindow` 打开授权页 → 回环 `127.0.0.1/callback` 收 code → 换 token | C1 主流 |
 | Device Code | 展示 user_code → 轮询 token endpoint | C1（无回环的 provider） |
 | Cookie 会话 | `BrowserWindow` + `session.fromPartition('persist:provider-x')` → 登录后读 `cookies.get()` → 存加密 jar | C2 |
@@ -898,8 +1071,8 @@ provider ─┬─ account A (api_key)  ─┐
 | 监听 | 仅 `127.0.0.1`；局域网需显式开启并强提示 |
 | 鉴权 | 本地随机 token（32B），`Authorization: Bearer`；可选「回环免鉴权」 |
 | 来源 | 带 `Origin` 头的请求一律 403（端口不给浏览器用），防 DNS rebinding / 网页探测 |
-| 密钥存储 | macOS Keychain / Windows DPAPI；DB 只存引用；导出需二次确认 |
-| 会话 Cookie | 加密 jar（AES-256-GCM，密钥在 Keychain），按 provider 隔离 partition，退出可一键清除全部会话 |
+| 密钥存储 | 本机密钥库：`vault.key`（32B，0600）为根密钥，`secrets.json` 存 AES-256-GCM 密文；DB 只存条目名与掩码；导出需二次确认 |
+| 会话 Cookie | 加密 jar（AES-256-GCM，根密钥同本机密钥库），按 provider 隔离 partition，退出可一键清除全部会话 |
 | 登录窗口 | 独立 `BrowserWindow`，禁用 devtools、禁用外部导航白名单之外跳转，登录完立即销毁 |
 | 凭证可见性 | UI 只显示后 4 位；复制需点击且 30s 后自动清剪贴板（可选） |
 | 日志 | 正则脱敏（`sk-*`, `gsk_*`, `AIza*`, `hf_*`, `xai-*`）；请求体默认不落盘，仅元数据 |
@@ -952,30 +1125,36 @@ extensions(id, name, version, manifest_json, status, port,
            installed_at, last_started_at, crash_count)
 ```
 
-### 3.11 目录结构（建议）
+### 3.11 目录结构（v1.2 · Rust workspace）
 
 ```
 free-llm-plus/
-├─ apps/
-│  ├─ desktop/            # 壳：托盘、窗口、自启、更新、单实例
-│  ├─ ui/                 # React 前端（构建产物内嵌）
-│  └─ gateway/            # HTTP 服务 + 路由 + 适配器
-├─ packages/
-│  ├─ core/               # Canonical IR、类型、错误模型
-│  ├─ providers/          # 每个厂商一个 adapter（声明式 + 少量代码）
-│  ├─ translate/          # openai / anthropic / gemini / ollama
-│  ├─ probe/              # 探针引擎（liveness / capability）
-│  ├─ health/             # 巡检调度、预算、健康状态机、digest
-│  ├─ inject/             # agent 适配器 + 合并/备份/回滚
-│  ├─ catalog/            # 内置基线 + 签名 feed + 事件应用
-│  ├─ extensions/         # Extension Host：manifest 校验、supervisor、端口分配
-│  └─ shared/             # DB schema、日志、脱敏、加密
-├─ catalog/
-│  ├─ catalog.json        # 内置基线（随版本）
-│  └─ schema.json
-├─ feed/                  # 仅维护者仓库：签名 feed 的构建产物与脚本
+├─ Cargo.toml                 # workspace
+├─ crates/
+│  ├─ freeport-core/          # Canonical IR、路由算法、账本、错误分类 —— 纯逻辑，无 IO
+│  │  ├─ ir/                  #   CanonicalRequest / CanonicalStreamEvent
+│  │  ├─ route/               #   Gate(三态熔断) / Order(SWRR) / Pick(排序) / affinity
+│  │  ├─ quota/               #   四窗口账本 + reserve/release
+│  │  └─ error/               #   错误分类与作用域矩阵
+│  ├─ freeport-gateway/       # axum server + 中间件链 + adapter + SSE 翻译
+│  │  ├─ middleware/          #   auth / ratelimit / trace / redact
+│  │  ├─ providers/           #   每个厂商一个 adapter（wire 细节 + quirk）
+│  │  └─ translate/           #   openai / anthropic / gemini ⇄ IR
+│  ├─ freeport-inject/        # Agent 注入（一文件一适配器）
+│  │  ├─ util/                #   原子写 / 托管块 / jsonc / 备份 / 文件锁
+│  │  └─ agents/              #   claude_code.rs / codex_cli.rs / ...
+│  ├─ freeport-catalog/       # models.dev 跟随 + 免费额度 feed + 签名校验 + patch
+│  ├─ freeport-probe/         # 探针 + 巡检调度 + 预算 + 健康状态机
+│  └─ freeport-extensions/    # Extension Host（v1.5）
+├─ src-tauri/                 # GUI 宿主：窗口、托盘、自启、更新、daemon 移交
+│  ├─ src/
+│  └─ tauri.conf.json
+├─ src/                       # React 前端（构建产物由 Tauri 加载）
+├─ feed/                      # 仅维护者仓库：签名 feed 构建产物与脚本
 └─ docs/
 ```
+
+**与 v1.1 的差异**：`apps/*` + `packages/*` 的 TS monorepo 改为 Cargo workspace。前端不再是「一个 app」，而是 `src-tauri` 的静态资源。这样 `cargo build` 产出的就是完整应用，没有 `npm run build && electron-builder` 的两段式链路。
 
 ---
 
@@ -1385,45 +1564,69 @@ coding         →  …（仅 tools 能力模型）
 
 ---
 
-## 6. 技术选型（已定稿）
+## 6. 技术选型（v1.2 · 已复议）
 
 ```
-Electron 38 (Chromium 140 / Node 22)
-TypeScript 5.9 · esbuild 打包主进程
-UI:      React 19 + Vite 7 + Tailwind CSS v4 + Radix Primitives
-状态:    Zustand（本地 UI 态） + TanStack Query（异步/缓存）
-图表:    Recharts
-HTTP:    Hono + @hono/node-server（主进程内，127.0.0.1）
-DB:      better-sqlite3（WAL，单例，仅主进程）
-加密:    keytar → macOS Keychain / Windows DPAPI
-Cookie:  Electron session（persist: partition） + AES-256-GCM 加密 jar
-更新:    electron-updater + GitHub Releases
-打包:    electron-builder（dmg / zip / nsis）
-测试:    Vitest（单元/集成） + Playwright（Electron E2E + 注入到临时 HOME）
-日志:    pino（结构化） + 正则脱敏 + 滚动文件
+Runtime:  Tauri 2（Rust 1.85+，stable）
+内核:     Rust 2021 · tokio · axum 0.7 · hyper 1 · reqwest 0.12(rustls)
+UI:       React 19 + Vite 7 + TypeScript 5.9 + Tailwind v4 + Radix Primitives
+状态:     Zustand（本地 UI 态） + TanStack Query（异步/缓存）
+HTTP:     axum（进程内，127.0.0.1:8787；库形态，GUI 与 daemon 共用）
+DB:       rusqlite（bundled，WAL，单连接 + 线程池）
+加密:     AES-256-GCM 本机密钥库（vault.key + secrets.json，均 0600）
+Cookie:   WKWebView / WebView2 独立数据目录 + 加密 cookie jar
+更新:     tauri-plugin-updater（签名 manifest + 差量）+ tauri-action
+打包:     tauri bundler（dmg / zip / nsis / msi）
+测试:     cargo test（core/gateway 纯逻辑） + Vitest（UI） + Playwright（WebDriver E2E）
+日志:     tracing + rolling file + 正则脱敏
 ```
 
-**为什么不用 Tauri**：本项目 70% 的工作量在「协议转换 + 厂商 quirk + 注入合并」，这些在 temp 里有大量 TS 现成实现；用 Rust 重写会把 MVP 从 ~6 周拉到 ~11 周。包体劣势用「首装下载 + 后续差量更新」缓解。
+**为什么改**（完整论证见 `ADR-001-runtime.md`）：
 
-**主进程职责边界（防止架构腐化）**
+| 指标 | Electron 38 | Tauri 2 | 差 |
+|---|---|---|---|
+| 安装包（mac） | 85–100 MB | 15–35 MB | **-70%** |
+| GUI 空载内存 | 200–300 MB | 90–140 MB | ~-55% |
+| **常驻网关内存** | 55–75 MB | **15–25 MB** | **-70%** |
+| 关窗后继续服务 | 需托盘常驻 | 原生双形态 | 结构性质变 |
 
-| 允许在主进程 | 必须放渲染进程 |
-|---|---|
-| HTTP 服务、DB、Keychain、Cookie jar、文件写入 | 所有 UI 渲染、图表、表单 |
-| 注入的读/写/备份/回滚 | diff 的展示与确认交互 |
-| 探针调度 | 探针结果的排序与筛选 |
+v1.1 拒绝 Tauri 的理由是「TS 现成代码多，Rust 会把 MVP 从 6 周拉到 11 周」。这个判断在 M0 成立，但忽略了两个变化：
+1. **M1 网关只有约 1.5k 行**，重写成本是 12 人日，不是 5 周——**现在是唯一的低成本窗口**；
+2. **前端 1.8 MB 是纯静态产物**，Tauri 直接加载，10 个页面和设计系统零改动，迁移只涉及 `bridge.ts` 一个文件。
 
-渲染进程**不直接** `fs` / `net`：通过 `contextBridge` 暴露受限 API（白名单通道），`nodeIntegration: false`、`contextIsolation: true`、`sandbox: true`。
+真正被 Rust 增加的只有网关层，而网关层恰恰是最适合 Rust 的部分（长连接、流式、背压、内存确定性）。
+
+**已废弃的 Electron 方案**（保留记录，避免重复讨论）：
+
+```
+Electron 38 (Chromium 140 / Node 22) · TypeScript 5.9 · esbuild
+HTTP: Hono + @hono/node-server · DB: better-sqlite3 · 加密: keytar
+更新: electron-updater · 打包: electron-builder
+```
+
+**职责边界（防止架构腐化）**
+
+| 位置 | 允许 | 必须放在别处 |
+|---|---|---|
+| `src-tauri`（GUI Host） | 窗口、托盘、单实例、窗位、自启、更新、daemon 移交 | 任何协议转换、路由、账本逻辑 |
+| `--headless`（Daemon Host） | 托管 Data Plane + 巡检 | 任何 UI 渲染 |
+| WebView（React） | 展示、表单、diff 预览、图表 | 不碰 `fs` / `net`，一切经 `invoke` 白名单 |
+| `freeport-core` | 纯算法与数据结构 | 不得引入 IO / 网络 / 文件系统 |
+| `freeport-gateway` | HTTP、协议转换、路由执行 | 不得 `use freeport_inject`（避免形成环） |
+
+WebView 侧安全基线：`withGlobalTauri: false`、CSP 白名单（`default-src 'self'`）、`assetProtocol` 仅限图标目录、**不使用 `shell.open` 直传用户输入**（必须经 URL 白名单校验）。
 
 ### 6.1 发布架构（mac + win）
 
 | 项 | 方案 |
 |---|---|
 | macOS 签名 | Developer ID Application + Hardened Runtime + `notarytool` 公证 + staple |
-| macOS 架构 | arm64 与 x64 分别构建（原生模块需对应 ABI） |
+| macOS 架构 | arm64 与 x64 分别构建（`--target aarch64-apple-darwin` / `x86_64-apple-darwin`） |
 | Windows 签名 | Azure Trusted Signing（EV）或 OV 证书；NSIS 安装包 + 便携版 |
-| 更新通道 | `stable` / `beta` 双通道；`electron-updater` + `latest.yml` |
-| 差量更新 | electron-builder 差分（blockmap），控制下载体积 |
+| Windows WebView2 | Win11 自带；Win10 用 bootstrapper 检测并静默安装（**不打 fixed-version**，避免 +150MB） |
+| 更新通道 | `stable` / `beta` 双通道；`tauri-plugin-updater` + 签名 `latest.json` |
+| 差量更新 | `createUpdaterArtifacts: true`（zstd 压缩，通常 < 3 MB） |
+| 构建 | GitHub Actions 矩阵（macos-14 arm64 / macos-13 x64 / windows-latest），`tauri-apps/tauri-action` |
 | 崩溃上报 | Sentry（**默认关闭**，opt-in 且脱敏：不含 prompt、key、路径） |
 | 遥测 | 默认全关；仅「版本 + 平台 + 是否成功启动」可选上报 |
 | 分发 | 官网 + GitHub Releases；**不上架 App Store / Microsoft Store**（Tier C 约束） |
@@ -1432,12 +1635,13 @@ Cookie:  Electron session（persist: partition） + AES-256-GCM 加密 jar
 
 **发布前必须通过的检查**
 
-1. 干净机器（无 Node、无开发工具）双击可用
+1. 干净机器（无 Rust、无 Node、无 WebView2）双击可用
 2. 升级安装不丢 DB、不覆盖用户配置
 3. 卸载不残留自启项、不残留注入条目
-4. 主进程崩溃后能自动重启并恢复监听
+4. 网关 panic 后 daemon 能被系统服务拉起重启并恢复监听（`launchd KeepAlive` / `systemd Restart=always`）
 5. 日志中不出现任何完整 key / cookie 值（自动化正则扫描）
 6. 首次启动 60 秒内可完成「一个 provider + 一次成功请求」
+7. **关窗 → 网关继续服务**（`curl /health` 仍 200），再开窗口能接管同一实例
 
 ---
 
@@ -1457,6 +1661,11 @@ Cookie:  Electron session（persist: partition） + AES-256-GCM 加密 jar
 | 签名/公证流程卡住 | 无法发布 | 提前 2 周申请 Developer ID 与 Windows 证书；CI 里先跑未签名构建 |
 | 端口被占/防火墙 | 启动失败 | 端口扫描 + 自动切换 + 显式展示实际端口 |
 | 密钥泄露 | 严重 | OS keychain + 日志脱敏 + 0600 + 不回显完整 key |
+| **Rust 开发速度低于预期**（v1.2） | 进度 +2–3 周 | core 层纯逻辑无 IO、全单测；adapter 按 cc-switch 结构照抄；先做 2 天 spike 再决定 |
+| **WKWebView / WebView2 渲染差异**（v1.2） | UI 返工 | 只用 flex/grid + CSS 变量，不用 Chromium 私有特性；CI 加跨引擎截图对比 |
+| **Windows 缺 WebView2 Runtime**（v1.2） | 装完打不开 | Win11 自带；Win10 用 bootstrapper 检测并静默安装（+2MB，不打 fixed-version） |
+| **daemon 与 GUI 双实例抢端口**（v1.2） | 配额账本分裂 | 单实例锁 + 移交前等 `/health` 就绪 + 先停后起（空窗 <300ms） |
+| **Rust 编译慢拖迭代**（v1.2） | 开发体验 | `[profile.dev] opt-level=0` + `codegen-units=256`；逻辑放 core，改 UI 不重编 |
 
 ### 7.1 商业化：开源核心 + Pro（freellmapi 的启示）
 
@@ -1503,10 +1712,11 @@ freellmapi 已经跑通了一条很干净的商业化路径，值得直接借鉴
 
 | 阶段 | 交付 | 验收标准 |
 |---|---|---|
-| M1 骨架 | Electron + Hono + SQLite + 托盘 + `/v1/models` + `/v1/chat/completions`（单 provider 直连） | `curl` 能拿到 Groq 回复 |
-| M2 发现 | 目录 + key 管理 + liveness/能力探针 + 模型列表 UI | 录入 key 后 30s 内看到可用模型与延迟 |
+| M1 骨架 ✅ | **（已完成；Node 版验收后，已在 M1.5 用 Rust 重写并全量替换）** 托盘 + `/v1/models` + `/v1/chat/completions` + 两跳接力 | `curl` 能拿到真实回复；`mock-bad 429 → mock-good 200` |
+| **M1.5 运行时迁移 ✅** | Tauri 2 壳 + Rust `freeport-core/gateway` + 双形态（GUI / `--headless`）+ 关窗移交 + 前端桥替换（Electron 代码已删除） | ① M1 端到端用例在 Rust 版重跑；② 关窗后网关继续服务；③ `--headless` 可独立起服；④ 前端 `tsc` 与 `vite build` 通过 |
+| M2 发现 | 目录（models.dev 为底 + 免费额度 feed）+ key 管理 + liveness/能力探针 + 模型列表 UI | 录入 key 后 30s 内看到可用模型与延迟 |
 | M2.5 巡检 | 巡检调度器 + 探针预算 + 健康状态机 + 每日 Digest | ① 连续运行 7 天，探针消耗不超过设定预算；② 手动让某模型 401，连续 2 次失败后才变 unavailable，且 30 分钟后自动复检；③ 单次 502 不改任何状态 |
-| M3 路由与接力 | 三轴打分 + 守卫乘子 + 错误作用域矩阵 + 冷却阶梯 + 45s 预算 + 冷却探针 + 决策日志 | ① 手动把主 key 打到 429，请求在 **2 跳内**切到可用模型；② 杀掉一个 provider 的域名解析，请求在 45s 内返回 429/502 而非挂死；③ 日志能逐跳解释「为什么跳、跳了多久」 |
+| M3 路由与接力 | 三层决策（Gate/Order/Pick）+ 三态熔断 + SWRR + affinity + 45s 预算 + 决策日志 | ① 手动把主 key 打到 429，请求在 **2 跳内**切到可用模型；② 杀掉一个 provider 的域名解析，请求在 45s 内返回 429/502 而非挂死；③ 日志能逐层解释「被谁拦下 / 权重档 / 为何选中」；④ 同一 session 连续 20 次请求落在同一 key（除非它 Open） |
 | M4 注入骨架 | 注入引擎（diff/备份/锁/原子写/回滚）+ 5 个 agent 适配器 | 注入 Claude Code 后能真实跑一轮对话；恢复后文件与原始一致 |
 | M5 体验 | 概览/Providers/Models/Routing 页面 + 托盘 popover + 空状态 | 全流程无终端操作 |
 | M6 协议加固 | Anthropic + Gemini 入口 + 配额账本 + 粘性会话 | Claude Code 原生协议跑通；连续 200 次请求无 429 泄漏 |
@@ -1525,10 +1735,10 @@ freellmapi 已经跑通了一条很干净的商业化路径，值得直接借鉴
 | # | 决策 | 结论 |
 |---|---|---|
 | 1 | 产品名 | **Freeport（自由港）** |
-| 2 | 技术栈 | Electron 38 + TypeScript 全栈 |
+| 2 | 技术栈（v1.1，**已废弃**） | ~~Electron 38 + TypeScript 全栈~~ → v1.2 改为 **Tauri 2 + Rust**，见 ADR-001 |
 | 3 | 合规 | Tier A/B/C 全量，含 OAuth 订阅与内置窗口 Cookie |
 | 4 | Tier C 首批 | **OpenCode Zen + GitHub Copilot**；Cookie 只做 OpenCode Zen web 会话 |
-| 5 | 注入 | 12 个适配器 + 2 个引导式 |
+| 5 | 注入 | 12 个适配器 + 2 个引导式；**一文件一适配器，不做 DSL**（v1.2） |
 | 6 | 发行 | macOS + Windows，签名/公证/自动更新，官网与 GitHub 分发 |
 | 7 | 局域网共享 | **不做** |
 | 8 | 双语 | **需要**，中/英 |
@@ -1538,32 +1748,45 @@ freellmapi 已经跑通了一条很干净的商业化路径，值得直接借鉴
 | 12 | 目录更新 | **签名 feed + 事件 + 三策略**（auto 默认 / notify / pinned）；新增模型必须经 canary（0.3 倍权重）才转正；单次删除 >15% 自动熔断 |
 | 13 | chat2api | **不进主链路**。v1 走「自定义 OpenAI 兼容端点」；v1.5 走 Extension Host；只吸收其凭据保活与代理优先级参数 |
 
-### 仍需你拍板（不阻塞 M1–M3）
+**v1.2 运行时复议（2026-10-19）**
+
+| # | 决策 | 结论 | 依据 |
+|---|---|---|---|
+| 14 | 运行时 | **Tauri 2 + Rust** | 包体 -70%，常驻内存 -70%；cc-switch 生产验证 |
+| 15 | 进程模型 | **单二进制 · 双形态**（GUI / `--headless`）；网关为 lib crate | magpie 路径；关窗后仍可服务 |
+| 16 | 路由 | **三层**：Gate(三态熔断) → Order(SWRR) → Pick(最早刷新/余量/探索) | 可解释性；取消连乘打分 |
+| 17 | 会话粘性 | **新增 affinity**（30 min 滑动，保 prompt cache） | v1.1 缺口；cc-switch/magpie 均有 |
+| 18 | 目录 | **models.dev 为底，自建仅做免费额度增量** | 避免重复维护全量模型库 |
+| 19 | 迁移窗口 | **现在（M1 末）**，约 12 人日；M3 后不建议 | 网关仅 1.5k 行 |
+
+### 仍需你拍板（不阻塞 M2）
 
 | # | 问题 | 现状 / 建议 |
 |---|---|---|
-| 1 | Pro 定价 | 建议 ¥29/月、¥199/年；首年可做「早鸟终身 ¥299」换口碑 |
-| 2 | 品牌视觉 | 需要你确认风格方向（我给的方案：暖白 + indigo，等宽字体做技术感） |
-| 3 | 官网与文档语言 | 建议中英双语，GitHub README 英文优先、官网中文优先 |
-| 4 | 开源许可证 | 建议 **AGPL-3.0 + 商业授权例外**：防止有人直接拿去卖 SaaS，同时不阻碍个人使用 |
+| 1 | **关窗移交 daemon 的交互细节** | 当前实现：关窗即隐藏、托盘退出才停网关；是否需要在首次关窗时弹一次询问，等你定 |
+| 2 | Pro 定价 | 建议 ¥29/月、¥199/年；首年可做「早鸟终身 ¥299」换口碑 |
+| 3 | 品牌视觉 | 需要你确认风格方向（我给的方案：暖白 + indigo，等宽字体做技术感） |
+| 4 | 官网与文档语言 | 建议中英双语，GitHub README 英文优先、官网中文优先 |
+| 5 | 开源许可证 | 建议 **AGPL-3.0 + 商业授权例外**：防止有人直接拿去卖 SaaS，同时不阻碍个人使用 |
 
 ---
 
-## 10. 开工顺序（下一步）
+## 10. 开工顺序（v1.3 修订）
 
 ```
-Week 0  原型评审（design/prototype.html）→ 确认视觉与信息架构，再动工
-Week 1  仓库骨架 + Electron/Hono/SQLite + /v1/chat/completions 打通 Groq
-Week 2  目录(12家) + key 管理 + liveness/能力探针 + 巡检调度 + 预算 + Models 页
-Week 3  路由三轴打分 + 守卫乘子 + 错误作用域矩阵 + 冷却阶梯 + 45s 预算 + 决策日志
-Week 4  注入引擎 + Claude Code/Codex 两个适配器（做到可回滚、可幂等）
-Week 5  概览/Providers/Routing 页 + 空状态 + 首次启动流程
-Week 6  Anthropic 入口 + 配额账本 + 冷却探针 → 内测版（Tier A）
-Week 7  签名 feed + 变更事件 + 应用策略 + Discover 页（「发布即到」闭环）
-Week 8  Auth Broker（Device Code + 内置窗口 Cookie）+ OpenCode Zen / Copilot
-Week 9  注入扩至 12 个 + 项目级 scope + 双语
-Week 10 签名/公证/更新/EULA → mac+win 发布候选
-Week 11 扩展宿主 + chat2api 样板（v1.5，可与发布并行）
+Week 0  原型评审（design/prototype.html）→ 已确认视觉与信息架构
+Week 1  M1 骨架（Node 版）→ 已验收：health / models / SSE / 两跳接力
+Week 2  M1.5 运行时迁移（Tauri 2 + Rust）→ 已完成，Electron 代码已删除
+Week 3  M2 目录（models.dev 为底 + 免费额度 feed）+ key 管理 + liveness/能力探针
+Week 4  M2.5 巡检调度 + 预算 + 健康状态机 + 每日 Digest
+Week 5  M3 三层路由 + 三态熔断 + SWRR + affinity + 45s 预算 + 决策日志
+Week 6  M4 注入引擎 + Claude Code/Codex 两个适配器（可回滚、可幂等）
+Week 7  M5 概览/Providers/Routing 页 + 空状态 + 首次启动流程
+Week 8  M6 Anthropic 入口 + 配额账本 → 内测版（Tier A）
+Week 9  M7 Auth Broker（Device Code + 内置窗口 Cookie）+ OpenCode Zen / Copilot
+Week 10 M8 注入扩至 12 个 + 项目级 scope + 双语
+Week 11 M9 签名/公证/更新/EULA → mac+win 发布候选
+Week 12 M10 扩展宿主 + chat2api 样板（v1.5，可与发布并行）
 ```
 
 **第 3 周是分水岭**：路由与接力的验收不是「能用」，而是「能解释」。如果第 3 周结束还做不到「任意一次失败都能在日志里说出跳了几跳、为什么跳、每跳花了多久」，就不要继续往前做功能——后面所有体验都建立在这层之上。
@@ -1594,3 +1817,14 @@ Week 11 扩展宿主 + chat2api 样板（v1.5，可与发布并行）
 | 凭据保活 / 刷新退避 / 状态机参数 | `chatgpt2api/services/account_service.py`（`_ACCESS_TOKEN_REFRESH_SKEW` / `_INVALID_CONFIRM_SECONDS` / 退避常量） |
 | 代理优先级链 | `chatgpt2api/services/proxy_service.py` + `docs/deployment.md` |
 | 账号池轮转与限流恢复 | `chatgpt2api/services/account_service.py`（pick / refresh_accounts） |
+| **单二进制多形态 / 命令分发** | `magpie/internal/cli/main.go`（`run()` 的 switch）+ `internal/cli/gui_on.go` |
+| **网关即 lib（GUI 与 daemon 共用）** | `magpie/internal/gui/backend.go`（`startBackend`）+ `internal/cli/daemon_cli.go` |
+| **launchd / systemd 托管** | `magpie/internal/daemon/{daemon.go,launchd.go,systemd.go}` |
+| **SWRR 平滑加权轮询** | `magpie/internal/gateway/weighted.go` + `internal/routes/round.go` |
+| **「最早刷新优先」策略** | `magpie/internal/routes/strategies.go`（`Smart`） |
+| **rest 自解释（原因 + 恢复时刻）** | `magpie/internal/gateway/routing.go`（`restingUntil`） |
+| **会话粘性 / prompt cache 保持** | `magpie/internal/gateway/affinity.go`；`cc-switch/src-tauri/src/proxy/session.rs` |
+| **三态熔断器** | `cc-switch/src-tauri/src/proxy/circuit_breaker.rs` |
+| **供应商优先级接力队列** | `cc-switch/src-tauri/src/proxy/{provider_router,failover_switch}.rs` |
+| **Tauri 打包 + 更新** | `cc-switch/src-tauri/tauri.conf.json` + `.github/workflows/` |
+| **中间件插件化（可选）** | `magpie/internal/pluginrt/` + `magpie/plugins/{budget,routing,usage}/` |

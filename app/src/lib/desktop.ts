@@ -1,44 +1,26 @@
 /**
- * Electron 桌面端接入层。
- * 浏览器里打开时 window.freeport 不存在，所有调用自动降级为 no-op。
+ * 桌面端接入层。
+ *
+ * 启动时装 Tauri 桥；在普通浏览器里打开时不做任何事，所有调用自然降级。
  */
 
-interface FreeportBridge {
-  isElectron: true;
-  platform: NodeJS.Platform;
-  app: { info: () => Promise<Record<string, unknown>> };
-  win: {
-    minimize: () => Promise<void>;
-    toggleMaximize: () => Promise<boolean>;
-    close: () => Promise<void>;
-  };
-  gateway: {
-    status: () => Promise<{
-      running: boolean;
-      port: number;
-      bind: string;
-      requests24h: number;
-    }>;
-  };
-}
+import './bridge';
+import { installTauriBridge, isTauri } from './ipc';
 
-declare global {
-  interface Window {
-    freeport?: FreeportBridge;
-  }
-}
+const installed = installTauriBridge();
 
 export const isDesktop = typeof window !== 'undefined' && !!window.freeport;
 export const desktop = () => window.freeport ?? null;
+export const isTauriRuntime = installed && isTauri();
 
 /** 在 main.tsx 最先调用：给 <html> 打标记，CSS 据此隐藏假红绿灯、启用拖拽区 */
 export function initDesktop(): void {
   if (!isDesktop) return;
   const root = document.documentElement;
-  root.classList.add('is-electron');
+  root.classList.add('is-desktop');
   root.classList.add(`platform-${window.freeport!.platform}`);
+  if (isTauriRuntime) root.classList.add('is-tauri');
 
-  // 把真实版本号喂给侧栏（data-*，Sidebar 读取）
   window.freeport!.app
     .info()
     .then((info) => {

@@ -2018,30 +2018,101 @@ input[type='range']::-webkit-slider-thumb {
   }
 }
 
-/* ── Electron 桌面外壳 ─────────────────────────────────────
-   仅在 html.is-electron 下生效；浏览器里完全无感。
-   - 隐藏假红绿灯（真实红绿灯由 macOS hiddenInset 提供，
+/* ── 桌面外壳（Tauri）─────────────────────────────────────
+   仅在 html.is-desktop 下生效；浏览器里完全无感。
+   - 隐藏假红绿灯（真实红绿灯由 macOS Overlay 标题栏提供，
      预留的 .traffic 占位保持侧栏 brand 与真红绿灯对齐）
-   - 顶栏作为拖拽区，按钮恢复可点
+   - 顶栏标了 data-tauri-drag-region，可拖窗
    - 禁掉桌面端不需要的橡皮筋滚动                          */
-html.is-electron .traffic {
+html.is-desktop .traffic {
   visibility: hidden;
 }
-html.is-electron .topbar {
-  -webkit-app-region: drag;
-}
-html.is-electron .topbar button,
-html.is-electron .topbar a,
-html.is-electron .topbar input,
-html.is-electron .topbar .avatar {
-  -webkit-app-region: no-drag;
-}
-html.is-electron {
+html.is-desktop {
   overscroll-behavior: none;
 }
-/* Windows 用系统原生标题栏，不注入拖拽区 */
-html.is-electron.platform-win32 .topbar,
-html.is-electron.platform-win32 .sidebar {
-  -webkit-app-region: no-drag;
+
+
+/* ── 接入厂商弹窗 ───────────────────────────── */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 15, 20, 0.32);
+  backdrop-filter: blur(2px);
+  display: grid;
+  place-items: center;
+  z-index: 80;
+  animation: fade 0.12s ease-out;
+}
+.modal {
+  width: 440px;
+  max-width: calc(100vw - 48px);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.2);
+  padding: 18px;
+}
+.modal h3 {
+  margin: 0 0 3px;
+  font-size: 14px;
+  letter-spacing: -0.1px;
+}
+.modal .sub {
+  margin: 0 0 15px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 11px;
+}
+.field label {
+  font-size: 11px;
+  color: var(--muted);
+}
+.field input {
+  height: 33px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  outline: none;
+}
+.field input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.field input:disabled {
+  opacity: 0.6;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+.modal-err {
+  font-size: 12px;
+  color: var(--bad);
+  background: var(--bad-soft);
+  border-radius: 6px;
+  padding: 7px 9px;
+  margin-bottom: 10px;
+  line-height: 1.55;
+  word-break: break-word;
 }
 
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

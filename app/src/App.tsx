@@ -3,6 +3,7 @@ import { Sidebar } from './components/Sidebar';
 import { Topbar } from './components/Topbar';
 import { ToastHost } from './components/ui';
 import { useApp, applyTheme } from './lib/store';
+import { initGateway } from './lib/gateway';
 import { Overview } from './pages/Overview';
 import { Models } from './pages/Models';
 import { Providers } from './pages/Providers';
@@ -38,6 +39,8 @@ export default function App() {
   useEffect(() => {
     document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
   }, [lang]);
+
+  useEffect(() => initGateway(), []);
 
   return (
     <div className="app">

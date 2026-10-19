@@ -20,7 +20,7 @@ export function Topbar() {
   const { page, theme, setTheme, lang, setLang, paused, togglePaused } = useApp();
 
   return (
-    <div className="topbar">
+    <div className="topbar" data-tauri-drag-region>
       <div className="crumbs">
         <span>Freeport</span>
         <ChevronRight />

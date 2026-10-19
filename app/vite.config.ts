@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  // Electron 打包后从 file:// 加载，资源必须相对引用
+  // 打包后由 Tauri 以自定义协议加载，资源必须相对引用
   base: './',
   server: {
     host: '127.0.0.1',

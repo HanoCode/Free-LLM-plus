@@ -1,0 +1,13 @@
+[package]
+name = "freeport-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freeport 的纯逻辑内核：IR、路由、配额、错误分类。无 IO。"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

@@ -15,6 +15,7 @@ import {
 import { useApp, type PageId } from '../lib/store';
 import { T } from '../lib/i18n';
 import { CopyBtn } from './ui';
+import { useGateway } from '../lib/gateway';
 
 interface NavDef {
   id: PageId;
@@ -57,7 +58,16 @@ const groups: { zh: string; en: string; items: NavDef[] }[] = [
 ];
 
 export function Sidebar() {
-  const { page, setPage, paused } = useApp();
+  const { page, setPage } = useApp();
+  const gw = useGateway((s) => s.status);
+  const providers = useGateway((s) => s.providers);
+
+  const running = gw ? gw.running : true;
+  const port = gw?.port ?? 8787;
+  const addr = `http://127.0.0.1:${port}`;
+  const version = document.documentElement.dataset.appVersion || '0.1.0';
+  const requests = gw ? gw.requests24h : 1284;
+  const modelCount = providers.reduce((n, p) => n + p.models, 0);
 
   return (
     <aside className="sidebar">
@@ -85,6 +95,12 @@ export function Sidebar() {
             </div>
             {g.items.map((it) => {
               const Icon = it.icon;
+              const live =
+                it.id === 'models' && modelCount
+                  ? String(modelCount)
+                  : it.id === 'providers' && providers.length
+                    ? String(providers.length)
+                    : it.count;
               return (
                 <button
                   key={it.id}
@@ -95,7 +111,7 @@ export function Sidebar() {
                   <span>
                     <T zh={it.label_zh} en={it.label_en} />
                   </span>
-                  {it.count && <span className={`count ${it.accent ? 'accent' : ''}`}>{it.count}</span>}
+                  {live && <span className={`count ${it.accent ? 'accent' : ''}`}>{live}</span>}
                 </button>
               );
             })}
@@ -106,21 +122,21 @@ export function Sidebar() {
       <div className="sidebar-foot">
         <div className="gw-card">
           <div className="gw-top">
-            <span className={`pulse ${paused ? 'off' : ''}`} style={paused ? { background: 'var(--faint)' } : undefined} />
+            <span className={`pulse ${running ? '' : 'off'}`} style={running ? undefined : { background: 'var(--faint)' }} />
             <span>
-              <T zh={paused ? '网关已暂停' : '网关运行中'} en={paused ? 'Gateway paused' : 'Gateway running'} />
+              <T zh={running ? '网关运行中' : '网关未启动'} en={running ? 'Gateway running' : 'Gateway offline'} />
             </span>
-            <CopyBtn value="http://127.0.0.1:8787" label="" />
+            <CopyBtn value={addr} label="" />
           </div>
           <div className="gw-addr">
-            <span>127.0.0.1:8787</span>
+            <span>127.0.0.1:{port}</span>
             <ArrowUpRight size={11} className="faint" />
           </div>
           <div className="gw-meta">
-            <span>v0.1.0</span>
+            <span>v{version}</span>
             <span>·</span>
             <span>
-              <T zh="今日 1,284 次" en="1,284 today" />
+              <T zh={`今日 ${requests.toLocaleString()} 次`} en={`${requests.toLocaleString()} today`} />
             </span>
           </div>
         </div>

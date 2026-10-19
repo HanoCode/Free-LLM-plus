@@ -1,9 +1,10 @@
 node_modules
 dist
+target
+*.log
+.DS_Store
+
+# 本地运行产生的临时 profile 与截图
 .cprof*
 .cp-*
 shot-*.png
-*.log
-
-# Electron 本地二进制缓存与冒烟产物
-electron-cache

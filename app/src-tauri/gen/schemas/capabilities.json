@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Freeport 主窗口的默认能力","local":true,"windows":["main"],"permissions":["core:default","opener:default"]}}

@@ -129,7 +129,7 @@ export function Accounts() {
               <span className="k">
                 <T zh="存储" en="Storage" />
               </span>
-              <span className="v">Keychain / DPAPI</span>
+              <span className="v">AES-256-GCM · 本机文件</span>
             </div>
             <div className="kv">
               <span className="k">

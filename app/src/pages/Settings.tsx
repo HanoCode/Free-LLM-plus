@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ExternalLink, FolderOpen } from 'lucide-react';
 import { T } from '../lib/i18n';
 import { useApp } from '../lib/store';
+import { useGateway } from '../lib/gateway';
 import { CopyBtn, Switch, toast } from '../components/ui';
 
 export function Settings() {
@@ -13,6 +14,12 @@ export function Settings() {
   const [devMode, setDevMode] = useState(false);
   const [autoApply, setAutoApply] = useState(true);
   const { lang, setLang, theme, setTheme } = useApp();
+  const desktop = useGateway((s) => s.available);
+  const gw = useGateway((s) => s.status);
+  const setRequireAuth = useGateway((s) => s.setRequireAuth);
+  const clearCooldowns = useGateway((s) => s.clearCooldowns);
+
+  const addr = `http://127.0.0.1:${gw?.port ?? 8787}`;
 
   return (
     <>
@@ -45,11 +52,14 @@ export function Settings() {
                 </div>
                 <div className="d">
                   <T zh="只绑回环，不对外暴露" en="loopback only, never exposed" />
+                  {gw && !gw.running && (
+                    <span style={{ color: 'var(--bad)' }}> · {gw.error || 'offline'}</span>
+                  )}
                 </div>
               </div>
               <div className="v" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span className="mono">127.0.0.1:8787</span>
-                <CopyBtn value="http://127.0.0.1:8787" label="" />
+                <span className="mono">127.0.0.1:{gw?.port ?? 8787}</span>
+                <CopyBtn value={addr} label="" />
               </div>
             </div>
             <div className="set-row">
@@ -57,12 +67,48 @@ export function Settings() {
                 <div className="k">
                   <T zh="本地鉴权" en="Local auth" />
                 </div>
+                <div className="d mono" style={{ fontSize: 11 }}>
+                  {desktop && gw ? gw.authToken.slice(0, 8) + '••••••••' : 'fp-••••••••'}
+                </div>
+              </div>
+              <div className="v" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {desktop && gw && <CopyBtn value={gw.authToken} label="" />}
+                {desktop && gw && (
+                  <Switch
+                    on={gw.requireAuth}
+                    onChange={(v) => {
+                      void setRequireAuth(v);
+                      toast(v ? '已开启本地鉴权' : '已关闭本地鉴权（仅回环，风险自担）');
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="冷却中的候选" en="Cooling candidates" />
+                </div>
                 <div className="d">
-                  <T zh="请求需带 fp_local_… 令牌" en="requests require fp_local_… token" />
+                  {gw?.cooldowns?.length
+                    ? gw.cooldowns.map((c) => c.key).join(' · ')
+                    : lang === 'zh'
+                      ? '无'
+                      : 'none'}
                 </div>
               </div>
               <div className="v">
-                <Switch on onChange={() => toast('本地鉴权是安全底线，不允许关闭 / Required')} />
+                {desktop && (
+                  <button
+                    className="btn ghost sm"
+                    onClick={() => {
+                      void clearCooldowns();
+                      toast('已清除全部冷却 / Cooldowns cleared');
+                    }}
+                  >
+                    <T zh="全部解除" en="Clear all" />
+                  </button>
+                )}
               </div>
             </div>
             <div className="set-row">
@@ -70,11 +116,14 @@ export function Settings() {
                 <div className="k">
                   <T zh="协议入口" en="Protocol endpoints" />
                 </div>
-                <div className="d">OpenAI · Anthropic · Gemini</div>
+                <div className="d">
+                  <T zh="OpenAI 已上线 · Anthropic / Gemini 在 M6" en="OpenAI live · Anthropic/Gemini in M6" />
+                </div>
               </div>
               <div className="v">
-                <span className="badge ok">
-                  <T zh="全部开启" en="all on" />
+                <span className="badge ok">OpenAI</span>
+                <span className="badge gray" style={{ marginLeft: 6 }}>
+                  Anthropic · M6
                 </span>
               </div>
             </div>
@@ -401,7 +450,7 @@ export function Settings() {
                 <div className="k">
                   <T zh="版本" en="Version" />
                 </div>
-                <div className="d">Freeport 0.1.0 · Electron 38 · schema 1</div>
+                <div className="d">Freeport 0.1.0 · Tauri 2 + Rust · schema 1</div>
               </div>
               <div className="v">
                 <button className="btn sm" onClick={() => toast('已是最新版本 / Up to date')}>
