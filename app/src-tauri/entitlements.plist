@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Hardened Runtime 的最小集。
+
+      只保留「出网」这一条：Freeport 的职责就是替用户访问上游模型接口，
+      而 hardened runtime 下未声明网络客户端权限的签名包会在部分系统版本上
+      被直接拒绝连接。
+
+      刻意不加的几条：
+      - allow-jit / allow-unsigned-executable-memory：没有 JS JIT 之外的需求，
+        WKWebView 自带，不需要放宽。
+      - disable-library-validation：会允许加载任意 dylib，一旦被替换就是提权入口。
+    -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>

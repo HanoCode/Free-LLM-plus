@@ -20,6 +20,9 @@ use base64::Engine as _;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
+use freeport_auth::cookie::CookieJar;
+use freeport_core::model::{Account, AppData};
+
 use crate::store;
 
 const VAULT_FILE: &str = "vault.key";
@@ -175,6 +178,141 @@ pub fn get_key(provider_id: &str) -> Option<String> {
     decrypt(&v.master, provider_id, blob)
 }
 
+/* ── OAuth 凭据 ──────────────────────────────────────
+ * 和 API key 分开存：同一条凭据将来可能既有 key 又有 token，
+ * 「退出登录」也只该清 token，不该把 key 一起删掉。
+ * 槽位带 `#oauth` 后缀，AAD 同步带上，避免两类密文被互换。 */
+
+const OAUTH_SUFFIX: &str = "#oauth";
+
+fn oauth_slot(account_id: &str) -> String {
+    format!("{account_id}{OAUTH_SUFFIX}")
+}
+
+pub fn set_oauth(account_id: &str, payload: &str) -> Result<(), String> {
+    let slot = oauth_slot(account_id);
+    let mut v = vault().lock().map_err(|_| "密钥库被占用".to_string())?;
+    let blob = encrypt(&v.master, &slot, payload)?;
+    v.items.insert(slot, blob);
+    persist(&v.items);
+    Ok(())
+}
+
+pub fn get_oauth(account_id: &str) -> Option<String> {
+    let slot = oauth_slot(account_id);
+    let v = vault().lock().ok()?;
+    let blob = v.items.get(&slot)?;
+    decrypt(&v.master, &slot, blob)
+}
+
+pub fn has_oauth(account_id: &str) -> bool {
+    get_oauth(account_id).is_some()
+}
+
+/* ── Web 会话凭据（Cookie） ──────────────────────────
+ * 只给「没有公开 API、只认浏览器会话」的厂商用。jar 整坨加密存，
+ * AAD 带上槽位后缀，和 key / token 三类密文互不通用。
+ *
+ * 不自动续期是**产品决定**：会话刷新要靠真实浏览行为，程序去模拟就是
+ * 在绕人家的风控。失效就如实报「请重新登录」。 */
+
+const COOKIE_SUFFIX: &str = "#cookie";
+
+fn cookie_slot(account_id: &str) -> String {
+    format!("{account_id}{COOKIE_SUFFIX}")
+}
+
+pub fn set_cookie(account_id: &str, payload: &str) -> Result<(), String> {
+    let slot = cookie_slot(account_id);
+    let mut v = vault().lock().map_err(|_| "密钥库被占用".to_string())?;
+    let blob = encrypt(&v.master, &slot, payload)?;
+    v.items.insert(slot, blob);
+    persist(&v.items);
+    Ok(())
+}
+
+pub fn get_cookie(account_id: &str) -> Option<String> {
+    let slot = cookie_slot(account_id);
+    let v = vault().lock().ok()?;
+    let blob = v.items.get(&slot)?;
+    decrypt(&v.master, &slot, blob)
+}
+
+pub fn has_cookie(account_id: &str) -> bool {
+    get_cookie(account_id).is_some()
+}
+
+pub fn delete_cookie(account_id: &str) {
+    let Ok(mut v) = vault().lock() else { return };
+    if v.items.remove(&cookie_slot(account_id)).is_some() {
+        persist(&v.items);
+    }
+}
+
+/// 这条凭据能用来发请求吗——API key、OAuth token、web 会话，有一个就算。
+///
+/// web 会话**全过期就不算**：会话不自动续，让它继续占着候选位只会把权重
+/// 浪费在必然 401 的一跳上。界面上会显示成「需要重新登录」。
+pub fn has_credential(account_id: &str) -> bool {
+    if has_oauth(account_id) || get_key(account_id).is_some() {
+        return true;
+    }
+    match get_cookie(account_id)
+        .and_then(|raw| serde_json::from_str::<CookieJar>(&raw).ok())
+    {
+        Some(jar) => !jar.all_expired(chrono::Utc::now().timestamp()),
+        None => false,
+    }
+}
+
+/// 只清 token，保留同一凭据下的 API key。界面上「退出登录」走这里；
+/// 删凭据才用 [`delete_credential`]。
+pub fn delete_oauth(account_id: &str) {
+    let Ok(mut v) = vault().lock() else { return };
+    if v.items.remove(&oauth_slot(account_id)).is_some() {
+        persist(&v.items);
+    }
+}
+
+/// 删掉一条凭据的全部密文（key + token + web 会话）。删厂商/删凭据都走这里。
+pub fn delete_credential(account_id: &str) {
+    let Ok(mut v) = vault().lock() else { return };
+    let mut changed = v.items.remove(account_id).is_some();
+    changed |= v.items.remove(&oauth_slot(account_id)).is_some();
+    changed |= v.items.remove(&cookie_slot(account_id)).is_some();
+    if changed {
+        persist(&v.items);
+    }
+}
+
+/// 把「一厂商一 key」的老配置升级成「一厂商多凭据」。
+///
+/// 老凭据的 id **直接沿用 provider id**：密钥库里的条目不用搬家，也不用解密再加密，
+/// 少一次「迁移中途崩了密钥全丢」的机会。
+pub fn migrate_accounts(data: &mut AppData) -> bool {
+    let mut changed = false;
+    for p in data.providers.iter_mut() {
+        if !p.accounts.is_empty() {
+            continue;
+        }
+        // 既没有密文也没有掩码：这条 provider 本来就没接 key（匿名端点也可能有掩码）
+        if get_key(&p.id).is_none() && p.key_mask.trim().is_empty() {
+            continue;
+        }
+        p.accounts.push(Account {
+            id: p.id.clone(),
+            name: "default".into(),
+            key_mask: p.key_mask.clone(),
+            enabled: true,
+            added_at: p.added_at.clone(),
+            quota: p.quota.take(),
+            health: None,
+        });
+        changed = true;
+    }
+    changed
+}
+
 pub fn delete_key(provider_id: &str) {
     let Ok(mut v) = vault().lock() else { return };
     if v.items.remove(provider_id).is_some() {
@@ -229,6 +367,36 @@ mod tests {
             let last = blob.pop().unwrap();
             blob.push(if last == 'A' { 'B' } else { 'A' });
             assert!(decrypt(&master, "groq", &blob).is_none());
+        });
+    }
+
+    #[test]
+    fn oauth_lives_beside_the_key_not_on_top_of_it() {
+        with_temp_dir("oauth-slot", || {
+            set_key("acct_1", "sk-live-123").unwrap();
+            set_oauth("acct_1", r#"{"kind":"copilot"}"#).unwrap();
+
+            // 两个槽位互不覆盖
+            assert_eq!(get_key("acct_1").as_deref(), Some("sk-live-123"));
+            assert_eq!(get_oauth("acct_1").as_deref(), Some(r#"{"kind":"copilot"}"#));
+            assert!(has_credential("acct_1"));
+
+            // 另一个凭据只拿到自己的那份
+            assert!(get_oauth("acct_2").is_none());
+
+            delete_credential("acct_1");
+            assert!(get_key("acct_1").is_none());
+            assert!(get_oauth("acct_1").is_none());
+            assert!(!has_credential("acct_1"));
+        });
+    }
+
+    #[test]
+    fn oauth_only_account_still_counts_as_usable() {
+        with_temp_dir("oauth-only", || {
+            set_oauth("acct_gh", "{}").unwrap();
+            assert!(has_credential("acct_gh"), "只有 token 的凭据也要能路由");
+            assert!(get_key("acct_gh").is_none());
         });
     }
 }

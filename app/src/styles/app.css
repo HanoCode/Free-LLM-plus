@@ -290,6 +290,17 @@ a {
   width: 13px;
   height: 13px;
 }
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.icon-btn:disabled:hover {
+  background: transparent;
+  color: var(--faint);
+}
+.spin {
+  animation: spin 900ms linear infinite;
+}
 .pro-card {
   margin-top: 8px;
   border: 1px solid var(--accent-line);
@@ -952,10 +963,40 @@ tbody tr:hover {
   font-weight: 700;
   background: var(--panel-3);
   color: var(--faint);
+  cursor: help;
 }
 .cap i.on {
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+/* ── Tooltip（data-tip 属性，纯 CSS，Tauri WebView 可用）── */
+[data-tip] {
+  position: relative;
+}
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 7px);
+  left: 50%;
+  transform: translate(-50%, 3px);
+  padding: 5px 9px;
+  border-radius: 7px;
+  background: var(--text);
+  color: var(--bg);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s, transform 0.15s;
+  z-index: 99;
+}
+[data-tip]:hover::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }
 .mini-track {
   width: 56px;
@@ -2091,6 +2132,30 @@ html.is-desktop {
 .field input:disabled {
   opacity: 0.6;
 }
+/* 项目级仓库路径：单行，与按钮同行，所以不能套 .field 的竖排布局 */
+.repo-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.repo-row input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  outline: none;
+}
+.repo-row input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
 .modal-actions {
   display: flex;
   justify-content: flex-end;
@@ -2115,4 +2180,592 @@ html.is-desktop {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ── Routing v2：真实链路解释器 ─────────────── */
+.route-form {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+.route-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.route-form label > span {
+  font-size: 10.5px;
+  color: var(--faint);
+  letter-spacing: 0.02em;
+}
+.route-form input {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 0 9px;
+  outline: none;
+  min-width: 0;
+}
+.route-form input:focus {
+  border-color: var(--accent);
+}
+.route-sum {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.route-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 7px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+.route-stat b {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.route-stat span {
+  font-size: 10.5px;
+  color: var(--faint);
+}
+.route-stat.ok b {
+  color: var(--ok);
+}
+.route-stat.warn b {
+  color: var(--warn);
+}
+.route-stat.bad b {
+  color: var(--bad);
+}
+.route-stat.info b {
+  color: var(--info);
+}
+
+.route-hop {
+  padding: 8px 10px;
+}
+.route-hop .top {
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.route-fac {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+  flex-wrap: wrap;
+}
+.route-fac i {
+  font-style: normal;
+  opacity: 0.5;
+}
+.route-fac .eq {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.layers {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.layer {
+  display: flex;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--line);
+}
+.layer:last-child {
+  border-bottom: none;
+}
+.layer .ln {
+  width: 19px;
+  height: 19px;
+  flex: none;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  margin-top: 1px;
+}
+.layer .ln.bad {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+.layer .ln.info {
+  background: rgba(80, 140, 255, 0.12);
+  color: var(--info);
+}
+.layer .ln.accent {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.layer .lb {
+  flex: 1;
+  min-width: 0;
+}
+.layer .lh {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.layer .lh b {
+  font-size: 12px;
+  font-weight: 600;
+}
+.layer .lc {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+}
+.layer p {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.reject-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.reject-group .rg-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 5px;
+}
+.reject-group .rg-items {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.rg-item {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 2px 0 2px 2px;
+  min-width: 0;
+}
+.rg-item code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 58%;
+}
+.link-mini {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+.link-mini:hover {
+  text-decoration: underline;
+}
+
+.cd-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cd-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.cd-row code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 45%;
+}
+.cd-row .faint {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.sem-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sem-list li {
+  display: flex;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.sem-list b {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  min-width: 48px;
+  flex: none;
+}
+
+@media (max-width: 900px) {
+  .route-form {
+    grid-template-columns: 1fr 1fr;
+  }
+  .route-form .btn {
+    grid-column: span 2;
+    justify-content: center;
+  }
+}
+
+/* ── 目录 feed（S4）─────────────────────────────── */
+.feed-card {
+  margin-bottom: 6px;
+}
+.feed-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 2px 0 10px;
+}
+.feed-bar .spacer {
+  flex: 1;
+}
+.feed-at {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+.feed-at.ok {
+  color: var(--ok);
+}
+.feed-at.bad {
+  color: var(--bad);
+}
+.feed-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-bottom: 9px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.feed-alert.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.feed-alert.bad {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+.feed-form {
+  display: grid;
+  grid-template-columns: 2fr 1fr 0.75fr 0.75fr auto;
+  gap: 8px;
+  align-items: end;
+}
+.feed-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.feed-form label > span {
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: var(--faint);
+}
+.feed-form input,
+.feed-form select {
+  height: 28px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 11px;
+  outline: none;
+}
+.feed-form input {
+  font-family: var(--mono);
+}
+.feed-form input:focus,
+.feed-form select:focus {
+  border-color: var(--accent);
+}
+.feed-form .feed-save {
+  height: 28px;
+}
+.feed-adv {
+  margin-top: 8px;
+  font-size: 10.5px;
+  color: var(--faint);
+}
+.feed-note {
+  margin-top: 8px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--faint);
+}
+.feed-note b {
+  font-weight: 500;
+  color: var(--dim);
+}
+.feed-events {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+.feed-empty {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--faint);
+}
+.feed-ev {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 4px 0;
+  font-size: 11px;
+  min-width: 0;
+}
+.ev-kind {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 9.5px;
+  font-weight: 560;
+  white-space: nowrap;
+}
+.ev-kind.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.ev-kind.bad {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+.ev-kind.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.ev-kind.info {
+  background: var(--info-soft);
+  color: var(--info);
+}
+.ev-kind.accent {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.feed-ev .ev-body {
+  flex: 1;
+  min-width: 0;
+}
+.feed-ev .ev-title {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.feed-ev .ev-detail {
+  margin-top: 1px;
+  font-size: 10.5px;
+  color: var(--faint);
+}
+
+@media (max-width: 900px) {
+  .feed-form {
+    grid-template-columns: 1fr 1fr;
+  }
+  .feed-form .feed-save {
+    grid-column: span 2;
+    justify-content: center;
+  }
+}
+
+/* canary 徽章：贴在模型名后面，不抢主信息的注意力 */
+.canary-badge {
+  margin-left: 7px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 0 5px;
+  vertical-align: 1px;
+  cursor: help;
+}
+
+/* ── 设备码登录 ───────────────────────────────
+   设备码要能被一眼读到并抄走：等宽、大字距、不给正文抢注意力。 */
+.modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.modal-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+.login-code {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+}
+.login-code-value {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 18px;
+  letter-spacing: 3px;
+  color: var(--text);
+  user-select: all;
+}
+
+/* ── 迁移码 ─────────────────────────────── */
+.transfer-box {
+  width: 100%;
+  min-height: 84px;
+  max-height: 220px;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.55;
+  outline: none;
+  word-break: break-all;
+}
+.transfer-box:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.transfer-split {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.transfer-split::before,
+.transfer-split::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.transfer-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: 7px;
+  background: var(--bad-soft);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.55;
+  cursor: pointer;
+}
+.transfer-warn input {
+  margin-top: 2px;
+  accent-color: var(--bad);
+}
+
+/* web 会话粘贴框：内容是一长串 k=v，等宽字体才好核对 */
+.cookie-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  resize: vertical;
+}
+.cookie-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ── 许可证 ─────────────────────────────── */
+.license-box {
+  min-height: 62px;
+  max-height: 120px;
+  font-size: 10.5px;
+  word-break: break-all;
+}
+.license-note {
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.license-note.bad {
+  background: var(--bad-soft);
+  color: var(--text);
+}
+.license-note.warn {
+  background: var(--warn-soft, var(--accent-soft));
+  color: var(--text);
+  margin: 0 16px 12px;
+}
+.license-foot {
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
 }

@@ -19,11 +19,9 @@ interface AppState {
   page: PageId;
   lang: Lang;
   theme: Theme;
-  paused: boolean;
   setPage: (p: PageId) => void;
   setLang: (l: Lang) => void;
   setTheme: (t: Theme) => void;
-  togglePaused: () => void;
 }
 
 const savedLang = (localStorage.getItem('fp.lang') as Lang) || 'zh';
@@ -53,7 +51,6 @@ export const useApp = create<AppState>((set) => ({
   page: initialPage(),
   lang: savedLang,
   theme: savedTheme,
-  paused: false,
   setPage: (page) => {
     history.replaceState(null, '', `#/${page}`);
     set({ page });
@@ -66,7 +63,6 @@ export const useApp = create<AppState>((set) => ({
     localStorage.setItem('fp.theme', theme);
     set({ theme });
   },
-  togglePaused: () => set((s) => ({ paused: !s.paused })),
 }));
 
 export const applyTheme = (theme: Theme) => {

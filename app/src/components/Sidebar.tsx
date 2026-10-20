@@ -32,10 +32,10 @@ const groups: { zh: string; en: string; items: NavDef[] }[] = [
     en: 'Gateway',
     items: [
       { id: 'overview', label_zh: '概览', label_en: 'Overview', icon: LayoutDashboard },
-      { id: 'models', label_zh: '模型', label_en: 'Models', icon: Boxes, count: '14' },
-      { id: 'providers', label_zh: '厂商', label_en: 'Providers', icon: Server, count: '11' },
-      { id: 'accounts', label_zh: '账号', label_en: 'Accounts', icon: Users, count: '10' },
-      { id: 'discover', label_zh: '发现', label_en: 'Discover', icon: Compass, count: '2', accent: true },
+      { id: 'models', label_zh: '模型', label_en: 'Models', icon: Boxes },
+      { id: 'providers', label_zh: '厂商', label_en: 'Providers', icon: Server },
+      { id: 'accounts', label_zh: '账号', label_en: 'Accounts', icon: Users },
+      { id: 'discover', label_zh: '发现', label_en: 'Discover', icon: Compass, accent: true },
     ],
   },
   {
@@ -43,7 +43,7 @@ const groups: { zh: string; en: string; items: NavDef[] }[] = [
     en: 'Dispatch',
     items: [
       { id: 'routing', label_zh: '路由', label_en: 'Routing', icon: Route },
-      { id: 'agents', label_zh: '注入', label_en: 'Agents', icon: Plug, count: '4' },
+      { id: 'agents', label_zh: '注入', label_en: 'Agents', icon: Plug },
     ],
   },
   {
@@ -61,6 +61,8 @@ export function Sidebar() {
   const { page, setPage } = useApp();
   const gw = useGateway((s) => s.status);
   const providers = useGateway((s) => s.providers);
+  const agents = useGateway((s) => s.agents);
+  const license = useGateway((s) => s.license);
 
   const running = gw ? gw.running : true;
   const port = gw?.port ?? 8787;
@@ -68,6 +70,13 @@ export function Sidebar() {
   const version = document.documentElement.dataset.appVersion || '0.1.0';
   const requests = gw ? gw.requests24h : 1284;
   const modelCount = providers.reduce((n, p) => n + p.models, 0);
+  // 有 Key 才算一份凭据；没填 Key 的厂商不该在「账号」里计数。
+  // 一厂商多凭据之后这里的粒度是凭据，不是厂商。
+  const credentialCount = providers.reduce(
+    (n, p) => n + p.accounts.filter((a) => a.hasKey).length,
+    0,
+  );
+  const injectedCount = agents.filter((a) => a.state === 'injected').length;
 
   return (
     <aside className="sidebar">
@@ -95,12 +104,17 @@ export function Sidebar() {
             </div>
             {g.items.map((it) => {
               const Icon = it.icon;
+              // 只显示真实计数；没有数据时不显示，不用占位数字充数
               const live =
                 it.id === 'models' && modelCount
                   ? String(modelCount)
                   : it.id === 'providers' && providers.length
                     ? String(providers.length)
-                    : it.count;
+                    : it.id === 'accounts' && credentialCount
+                      ? String(credentialCount)
+                      : it.id === 'agents' && injectedCount
+                        ? String(injectedCount)
+                        : it.count;
               return (
                 <button
                   key={it.id}
@@ -146,13 +160,20 @@ export function Sidebar() {
             <T zh="Freeport Pro" en="Freeport Pro" />
           </b>
           <p>
-            <T
-              zh="实时目录 · 额度情报 · 多机同步。免费版功能完整，只是目录 7 天更新一次。"
-              en="Live catalog, quota intel, multi-device sync. Free tier keeps every feature, catalog refreshes weekly."
-            />
+            {license?.pro ? (
+              <T
+                zh={`已激活 · ${license.subject ?? 'Pro'}，还剩 ${license.daysLeft ?? 0} 天。`}
+                en={`Active · ${license.subject ?? 'Pro'}, ${license.daysLeft ?? 0} days left.`}
+              />
+            ) : (
+              <T
+                zh="实时目录 · 额度情报 · 多机同步。免费版功能完整，只是目录 7 天更新一次。"
+                en="Live catalog, quota intel, multi-device sync. Free tier keeps every feature, catalog refreshes weekly."
+              />
+            )}
           </p>
-          <button>
-            <T zh="了解 Pro" en="See Pro" />
+          <button onClick={() => setPage('settings')}>
+            <T zh={license?.pro ? '管理许可证' : '了解 Pro'} en={license?.pro ? 'Manage' : 'See Pro'} />
             <ArrowUpRight size={11} />
           </button>
         </div>

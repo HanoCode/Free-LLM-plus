@@ -1,0 +1,26 @@
+[package]
+name = "freeport-license"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = { version = "0.8", optional = true }
+
+[features]
+default = []
+# 仅签发端（本地 dev 工具 / 测试）需要打开。**不要**在 App 里启用：
+# 启用后私钥签发能力会被链进二进制。
+issuer = ["dep:rand"]
+
+[[example]]
+name = "keygen"
+required-features = ["issuer"]
+
+[[example]]
+name = "issue"
+required-features = ["issuer"]

@@ -1,0 +1,171 @@
+{
+  "version": 2,
+  "builtAt": "2026-10-19",
+  "note": "随版本发布的内置基线。只放「厂商元数据 + 免费额度标注」，模型细节以 models.dev 为准；models.dev 未收录的厂商（匿名端点）才在这里写模型。",
+  "providers": [
+    {
+      "id": "groq",
+      "name": "Groq",
+      "api": "https://api.groq.com/openai/v1",
+      "docs": "https://console.groq.com/keys",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "免费档按模型限速（约 30 RPM / 1K–14.4K RPD）",
+      "quota": { "rpm": 30, "rpd": 14400 }
+    },
+    {
+      "id": "cerebras",
+      "name": "Cerebras",
+      "api": "https://api.cerebras.ai/v1",
+      "docs": "https://cloud.cerebras.ai",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "免费档每日 1M tokens，推理速度极快",
+      "quota": { "rpm": 30, "rpd": 1000 }
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "api": "https://openrouter.ai/api/v1",
+      "docs": "https://openrouter.ai/keys",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "带 :free 后缀的模型价格为 0，另有每日免费请求上限",
+      "quota": { "rpm": 20, "rpd": 50 }
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral",
+      "api": "https://api.mistral.ai/v1",
+      "docs": "https://console.mistral.ai/api-keys",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "Free 套餐需绑定手机号，含 codestral 与每分钟限速",
+      "quota": { "rpm": 60, "rpd": 1000 }
+    },
+    {
+      "id": "nvidia",
+      "name": "NVIDIA NIM",
+      "api": "https://integrate.api.nvidia.com/v1",
+      "docs": "https://build.nvidia.com",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "开发者账号赠送 1000 credits，模型池极广",
+      "quota": { "rpm": 40, "rpd": 1000 }
+    },
+    {
+      "id": "google",
+      "name": "Google AI Studio",
+      "api": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "docs": "https://aistudio.google.com/apikey",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "Gemini 免费档按模型限速（RPM/RPD/T PM 各自独立）",
+      "quota": { "rpm": 15, "rpd": 1500 }
+    },
+    {
+      "id": "zhipuai",
+      "name": "智谱 GLM",
+      "api": "https://open.bigmodel.cn/api/paas/v4",
+      "docs": "https://open.bigmodel.cn/usercenter/apikeys",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "glm-4-flash 系列长期免费，其余按 token 计费",
+      "quota": { "rpm": 60, "rpd": 2000 }
+    },
+    {
+      "id": "siliconflow",
+      "name": "SiliconFlow",
+      "api": "https://api.siliconflow.cn/v1",
+      "docs": "https://cloud.siliconflow.cn/account/ak",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "部分小参数模型免费（如 Qwen2.5-7B），其余按 token 计费",
+      "quota": { "rpm": 60, "rpd": 2000 }
+    },
+    {
+      "id": "alibaba",
+      "name": "阿里云百炼",
+      "api": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "docs": "https://bailian.console.aliyun.com",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "新用户每模型 100 万 tokens 免费额度，有效期 180 天",
+      "quota": { "rpm": 60, "rpd": 2000 }
+    },
+    {
+      "id": "sambanova",
+      "name": "SambaNova",
+      "api": "https://api.sambanova.ai/v1",
+      "docs": "https://cloud.sambanova.ai/apis",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "免费档低速档位，适合离线批处理",
+      "quota": { "rpm": 10, "rpd": 500 }
+    },
+    {
+      "id": "cloudflare-workers-ai",
+      "name": "Cloudflare Workers AI",
+      "api": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+      "docs": "https://dash.cloudflare.com/profile/api-tokens",
+      "tier": "A",
+      "freeTier": true,
+      "freeNote": "每天 10K neurons 免费；baseUrl 里的 {account_id} 需替换为真实账号 ID",
+      "quota": { "rpm": 60, "rpd": 1000 }
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode Zen",
+      "api": "https://opencode.ai/inference/openai/v1",
+      "docs": "https://opencode.ai/auth",
+      "tier": "C",
+      "freeTier": true,
+      "freeNote": "订阅账号额度；支持 API Key 与内置窗口登录，不做多账号共享",
+      "quota": { "rpm": 30, "rpd": 1000 }
+    },
+    {
+      "id": "github",
+      "name": "GitHub Models",
+      "api": "https://models.github.ai/inference",
+      "docs": "https://github.com/settings/tokens",
+      "tier": "C",
+      "freeTier": true,
+      "freeNote": "用 GitHub PAT 调用，免费档按分钟/天限流，数据可能用于训练",
+      "quota": { "rpm": 10, "rpd": 150 }
+    },
+    {
+      "id": "pollinations",
+      "name": "Pollinations",
+      "api": "https://text.pollinations.ai/openai",
+      "docs": "https://pollinations.ai",
+      "tier": "B",
+      "freeTier": true,
+      "freeNote": "匿名公开端点，无需 Key；限速严格，仅作兜底",
+      "quota": { "rpm": 5, "rpd": 200 },
+      "models": [
+        { "id": "openai", "name": "OpenAI (proxy)", "context": 32768 },
+        { "id": "openai-fast", "name": "OpenAI Fast", "context": 32768 },
+        { "id": "mistral", "name": "Mistral (proxy)", "context": 32768 },
+        { "id": "llama", "name": "Llama (proxy)", "context": 32768 },
+        { "id": "qwen-coder", "name": "Qwen Coder (proxy)", "context": 32768 },
+        { "id": "deepseek", "name": "DeepSeek (proxy)", "context": 32768 }
+      ]
+    },
+    {
+      "id": "llm7",
+      "name": "LLM7",
+      "api": "https://api.llm7.io/v1",
+      "docs": "https://token.llm7.io",
+      "tier": "B",
+      "freeTier": true,
+      "freeNote": "公共端点，匿名可用；带 token 可提高限额。工具调用不稳定",
+      "quota": { "rpm": 10, "rpd": 300 },
+      "models": [
+        { "id": "gpt-4o-mini-2024-07-18", "name": "GPT-4o mini (proxy)", "context": 128000 },
+        { "id": "gpt-4.1-nano", "name": "GPT-4.1 nano (proxy)", "context": 128000 },
+        { "id": "mistral-small-3.2", "name": "Mistral Small 3.2", "context": 128000 },
+        { "id": "deepseek-r1-0528", "name": "DeepSeek R1", "context": 65536 }
+      ]
+    }
+  ]
+}

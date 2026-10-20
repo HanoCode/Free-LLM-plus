@@ -1,25 +1,76 @@
-import { useState } from 'react';
-import { ExternalLink, FolderOpen } from 'lucide-react';
-import { T } from '../lib/i18n';
+import { useEffect, useState } from 'react';
+import { ExternalLink } from 'lucide-react';
+import { T, tx } from '../lib/i18n';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
 import { CopyBtn, Switch, toast } from '../components/ui';
+import { ApiKeys } from '../components/ApiKeys';
+import { Transfer } from '../components/Transfer';
+import { License } from '../components/License';
+import type { UpdateCheck } from '../lib/bridge';
+
+const REPO = 'https://github.com/HanoCode/Free-LLM-plus';
 
 export function Settings() {
-  const [autoStart, setAutoStart] = useState(true);
-  const [minimized, setMinimized] = useState(true);
-  const [cleanup, setCleanup] = useState(true);
-  const [probe, setProbe] = useState(true);
-  const [cooldownCheck, setCooldownCheck] = useState(true);
-  const [devMode, setDevMode] = useState(false);
-  const [autoApply, setAutoApply] = useState(true);
   const { lang, setLang, theme, setTheme } = useApp();
   const desktop = useGateway((s) => s.available);
   const gw = useGateway((s) => s.status);
   const setRequireAuth = useGateway((s) => s.setRequireAuth);
+  const setBudget = useGateway((s) => s.setBudget);
   const clearCooldowns = useGateway((s) => s.clearCooldowns);
+  const patrol = useGateway((s) => s.patrol);
+  const setPatrol = useGateway((s) => s.setPatrol);
+  const feed = useGateway((s) => s.feed);
+  const setFeed = useGateway((s) => s.setFeed);
+
+  const [version, setVersion] = useState('—');
+  const [checking, setChecking] = useState(false);
+  const [update, setUpdate] = useState<UpdateCheck | null>(null);
+
+  useEffect(() => {
+    const known = document.documentElement.dataset.appVersion;
+    if (known) {
+      setVersion(known);
+      return;
+    }
+    void window.freeport?.app.info().then((i) => {
+      if (typeof i.version === 'string') setVersion(i.version);
+    });
+  }, []);
 
   const addr = `http://127.0.0.1:${gw?.port ?? 8787}`;
+  const zh = lang === 'zh';
+
+  /** 真去 GitHub 查，不弹「已是最新」的假提示 */
+  const checkUpdate = async () => {
+    const api = window.freeport?.app;
+    if (!api) return toast(zh ? '检查更新需要桌面端' : 'Update check needs the desktop app');
+    setChecking(true);
+    try {
+      const r = await api.checkUpdate();
+      setUpdate(r);
+      if (r.updateAvailable) {
+        toast(zh ? `有新版本 v${r.latest}` : `v${r.latest} is available`);
+      } else {
+        toast(zh ? `已是最新（v${r.current}）` : `Up to date (v${r.current})`);
+      }
+    } catch (e) {
+      toast(String(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const saveDiagnostics = async () => {
+    const api = window.freeport?.app;
+    if (!api) return toast(zh ? '诊断包需要桌面端' : 'Diagnostics need the desktop app');
+    try {
+      const path = await api.saveDiagnostics();
+      if (path) toast(tx(lang, `已保存到 ${path}`, `Saved to ${path}`));
+    } catch (e) {
+      toast(String(e));
+    }
+  };
 
   return (
     <>
@@ -117,48 +168,76 @@ export function Settings() {
                   <T zh="协议入口" en="Protocol endpoints" />
                 </div>
                 <div className="d">
-                  <T zh="OpenAI 已上线 · Anthropic / Gemini 在 M6" en="OpenAI live · Anthropic/Gemini in M6" />
+                  <T
+                    zh="OpenAI Chat · Responses · Anthropic · Gemini · Ollama 全部在线"
+                    en="OpenAI Chat · Responses · Anthropic · Gemini · Ollama all live"
+                  />
                 </div>
               </div>
               <div className="v">
-                <span className="badge ok">OpenAI</span>
-                <span className="badge gray" style={{ marginLeft: 6 }}>
-                  Anthropic · M6
-                </span>
+                <span className="badge ok">5 / 5</span>
               </div>
             </div>
           </div>
+
+          <ApiKeys desktop={desktop} />
+
+          <Transfer desktop={desktop} />
 
           <div className="card">
             <div className="card-head">
               <h3>
                 <T zh="启动与退出" en="Startup" />
               </h3>
+              <span className="sub">
+                <T zh="这三项还没接上后端，先如实标注" en="not wired to the backend yet" />
+              </span>
             </div>
-            <Row
-              k_zh="开机自启"
-              k_en="Launch at login"
-              d_zh="登录后静默启动，只在托盘显示"
-              d_en="starts silently, tray only"
-              on={autoStart}
-              set={setAutoStart}
-            />
-            <Row
-              k_zh="启动时最小化"
-              k_en="Start minimized"
-              d_zh="不弹主窗口，避免打断当前工作"
-              d_en="no window on boot"
-              on={minimized}
-              set={setMinimized}
-            />
-            <Row
-              k_zh="退出时清理注入"
-              k_en="Clean up on quit"
-              d_zh="把 Agent 配置恢复到注入前，避免指向已关闭的端口"
-              d_en="restore agent configs so nothing points at a dead port"
-              on={cleanup}
-              set={setCleanup}
-            />
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="开机自启" en="Launch at login" />
+                </div>
+                <div className="d">
+                  <T zh="需要 autostart 插件，v1.1 接入" en="needs the autostart plugin, v1.1" />
+                </div>
+              </div>
+              <div className="v">
+                <span className="badge gray">
+                  <T zh="未接入" en="pending" />
+                </span>
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="启动时最小化" en="Start minimized" />
+                </div>
+                <div className="d">
+                  <T zh="当前固定行为：启动即显示主窗口" en="current behaviour: window shows on launch" />
+                </div>
+              </div>
+              <div className="v">
+                <span className="badge gray">
+                  <T zh="固定" en="fixed" />
+                </span>
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="退出时清理注入" en="Clean up on quit" />
+                </div>
+                <div className="d">
+                  <T zh="现在是手动：注入页逐项回滚" en="manual for now: revert per agent" />
+                </div>
+              </div>
+              <div className="v">
+                <span className="badge gray">
+                  <T zh="手动" en="manual" />
+                </span>
+              </div>
+            </div>
           </div>
 
           <div className="card">
@@ -173,34 +252,43 @@ export function Settings() {
                   <T zh="代理" en="Proxy" />
                 </div>
                 <div className="d">
-                  <T zh="优先级：账号级 > 运行时 > 全局" en="account > runtime > global" />
+                  <T
+                    zh="跟随系统环境变量 HTTP_PROXY / HTTPS_PROXY，本机回环直连"
+                    en="follows HTTP_PROXY / HTTPS_PROXY env vars; loopback bypasses it"
+                  />
                 </div>
               </div>
               <div className="v">
-                <select className="select" defaultValue="system">
-                  <option value="system">
-                    <T zh="跟随系统" en="System" />
-                  </option>
-                  <option value="none">None</option>
-                  <option value="custom">Custom…</option>
-                </select>
+                <span className="badge gray">
+                  <T zh="环境变量" en="env" />
+                </span>
               </div>
             </div>
             <div className="set-row">
               <div>
                 <div className="k">
-                  <T zh="超时" en="Timeout" />
+                  <T zh="单次请求预算" en="Request budget" />
                 </div>
                 <div className="d">
-                  <T zh="单跳首字节，超过即换下一个" en="per-hop first byte" />
+                  <T zh="从第一跳开始计的总墙钟，用完即收尾" en="total wall clock from the first hop" />
                 </div>
               </div>
               <div className="v">
-                <select className="select" defaultValue="45">
-                  <option value="15">15s</option>
-                  <option value="30">30s</option>
-                  <option value="45">45s</option>
-                  <option value="90">90s</option>
+                <select
+                  className="select"
+                  value={gw?.requestBudgetMs ?? 45000}
+                  disabled={!desktop}
+                  onChange={(e) => {
+                    const ms = Number(e.target.value);
+                    void setBudget(ms).then(() =>
+                      toast(tx(lang, `预算已改为 ${ms / 1000}s`, `Budget set to ${ms / 1000}s`)),
+                    );
+                  }}
+                >
+                  <option value={15000}>15s</option>
+                  <option value={30000}>30s</option>
+                  <option value={45000}>45s</option>
+                  <option value={90000}>90s</option>
                 </select>
               </div>
             </div>
@@ -210,16 +298,13 @@ export function Settings() {
                   <T zh="并发上限" en="Concurrency" />
                 </div>
                 <div className="d">
-                  <T zh="超出的请求排队，不直接 429" en="queue instead of 429" />
+                  <T zh="当前不排队也不限流；超时由预算兜底" en="no queueing or limiting yet; budget is the backstop" />
                 </div>
               </div>
               <div className="v">
-                <select className="select" defaultValue="8">
-                  <option>4</option>
-                  <option>8</option>
-                  <option>16</option>
-                  <option>32</option>
-                </select>
+                <span className="badge gray">
+                  <T zh="不限" en="unbounded" />
+                </span>
               </div>
             </div>
           </div>
@@ -247,8 +332,14 @@ export function Settings() {
               <div className="v">
                 <select
                   className="select"
-                  defaultValue="auto"
-                  onChange={(e) => setAutoApply(e.target.value === 'auto')}
+                  value={feed?.policy ?? 'auto'}
+                  disabled={!desktop}
+                  onChange={(e) => {
+                    const policy = e.target.value;
+                    void setFeed({ policy }).then(() =>
+                      toast(tx(lang, `目录策略：${policy}`, `Catalog policy: ${policy}`)),
+                    );
+                  }}
                 >
                   <option value="auto">auto</option>
                   <option value="notify">notify</option>
@@ -266,7 +357,17 @@ export function Settings() {
                 </div>
               </div>
               <div className="v">
-                <select className="select" defaultValue="stable">
+                <select
+                  className="select"
+                  value={feed?.channel ?? 'stable'}
+                  disabled={!desktop}
+                  onChange={(e) => {
+                    const channel = e.target.value;
+                    void setFeed({ channel }).then(() =>
+                      toast(tx(lang, `目录频道：${channel}`, `Catalog channel: ${channel}`)),
+                    );
+                  }}
+                >
                   <option value="stable">stable</option>
                   <option value="beta">beta</option>
                 </select>
@@ -275,30 +376,33 @@ export function Settings() {
             <div className="set-row">
               <div>
                 <div className="k">
-                  <T zh="静默应用新增" en="Auto-apply additions" />
+                  <T zh="目录签名" en="Feed signature" />
                 </div>
                 <div className="d">
-                  <T zh={autoApply ? '新模型以 0.3 倍权重灰度' : '需手动确认'} en={autoApply ? 'canary at 0.3× weight' : 'needs confirmation'} />
+                  {feed?.hasPubkey
+                    ? tx(lang, '公钥已配置，每次应用前验签', 'pubkey configured, verified on each apply')
+                    : tx(lang, '未配置公钥——目录只读，不会应用任何更新', 'no pubkey — catalog is read-only')}
                 </div>
               </div>
               <div className="v">
-                <Switch on={autoApply} onChange={setAutoApply} />
+                <span className={`badge ${feed?.hasPubkey ? 'ok' : 'warn'}`}>
+                  {feed?.seq ? `seq ${feed.seq}` : tx(lang, '未启用', 'off')}
+                </span>
               </div>
             </div>
             <div className="set-row">
               <div>
                 <div className="k">
-                  <T zh="手动导入" en="Import JSON" />
+                  <T zh="离线导入" en="Offline import" />
                 </div>
                 <div className="d">
-                  <T zh="离线机器用，格式与 feed 一致" en="for offline machines, feed schema" />
+                  <T zh="当前只支持从 feed 同步；离线机器用迁移包" en="sync from feed only; use the transfer bundle offline" />
                 </div>
               </div>
               <div className="v">
-                <button className="btn sm" onClick={() => toast('选择 catalog.json / Pick catalog.json')}>
-                  <FolderOpen size={12} />
-                  <T zh="选择文件" en="Choose" />
-                </button>
+                <span className="badge gray">
+                  <T zh="未接入" en="pending" />
+                </span>
               </div>
             </div>
           </div>
@@ -309,55 +413,106 @@ export function Settings() {
                 <T zh="巡检" en="Health checks" />
               </h3>
               <span className="sub">
-                <T zh="默认开启，但受预算约束" en="on by default, budget-bounded" />
+                <T zh="受预算约束，真实流量优先" en="budget-bounded, real traffic first" />
               </span>
             </div>
             <Row
-              k_zh="每日全量审计"
-              k_en="Daily full audit"
-              d_zh="03:00 起算，±90 分钟抖动"
-              d_en="from 03:00, ±90m jitter"
-              on={probe}
-              set={setProbe}
-            />
-            <Row
-              k_zh="冷却到期复检"
-              k_en="Pre-expiry recheck"
-              d_zh="提前 60 秒探一次，好了就提前解除"
-              d_en="probe 60s early, lift cooldown if healthy"
-              on={cooldownCheck}
-              set={setCooldownCheck}
+              k_zh="自动巡检"
+              k_en="Patrol"
+              d_zh="按到期队列探活：热模型 6h、冷模型 24h，每日再全量一次"
+              d_en="due queue: hot models every 6h, cold every 24h, plus a daily sweep"
+              on={patrol?.enabled ?? true}
+              set={(v) => void setPatrol({ enabled: v })}
             />
             <div className="set-row">
               <div>
                 <div className="k">
-                  <T zh="每日探针预算" en="Daily probe budget" />
+                  <T zh="热模型周期" en="Hot interval" />
                 </div>
                 <div className="d">
-                  <T zh="默认 clamp(日配额×1%, 60, 800)" en="default clamp(1% of quota, 60, 800)" />
+                  <T zh="24 小时内有真实流量的模型" en="models used within 24h" />
                 </div>
               </div>
               <div className="v">
-                <select className="select" defaultValue="300">
-                  <option>100</option>
-                  <option>300</option>
-                  <option>800</option>
-                  <option>unlimited</option>
+                <select
+                  className="select"
+                  value={patrol?.hotHours ?? 6}
+                  onChange={(e) => void setPatrol({ hotHours: Number(e.target.value) })}
+                >
+                  <option value={3}>3h</option>
+                  <option value={6}>6h</option>
+                  <option value={12}>12h</option>
                 </select>
               </div>
             </div>
             <div className="set-row">
               <div>
                 <div className="k">
-                  <T zh="今日已用" en="Used today" />
+                  <T zh="冷模型周期" en="Cold interval" />
+                </div>
+                <div className="d">
+                  <T zh="判为不可用后 30 分钟强制复检一次" en="unavailable models are rechecked after 30m" />
+                </div>
+              </div>
+              <div className="v">
+                <select
+                  className="select"
+                  value={patrol?.coldHours ?? 24}
+                  onChange={(e) => void setPatrol({ coldHours: Number(e.target.value) })}
+                >
+                  <option value={12}>12h</option>
+                  <option value={24}>24h</option>
+                  <option value={72}>72h</option>
+                </select>
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="每日全量体检" en="Daily full sweep" />
+                </div>
+                <div className="d">
+                  <T zh="本地时间，每天只跑一次" en="local time, once per day" />
+                </div>
+              </div>
+              <div className="v">
+                <input
+                  className="select"
+                  type="time"
+                  value={patrol?.sweepAt ?? '03:00'}
+                  onChange={(e) => void setPatrol({ sweepAt: e.target.value })}
+                />
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="今日探针预算" en="Daily probe budget" />
+                </div>
+                <div className="d">
+                  <T zh="默认 clamp(日配额×1%, 60, 800)" en="default clamp(1% of quota, 60, 800)" />
+                </div>
+              </div>
+              <div className="v mono">
+                {patrol ? `${patrol.usedToday} / ${patrol.budgetToday}` : '—'}
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="累计探针" en="Probes total" />
                 </div>
                 <div className="d">
                   <T zh="探针请求单独计数，不占用户额度统计" en="probe traffic is counted separately" />
                 </div>
               </div>
-              <div className="v mono">137 / 300</div>
+              <div className="v mono">
+                {patrol ? `${patrol.probesOk} / ${patrol.probesTotal}` : '—'}
+              </div>
             </div>
           </div>
+
+          <License />
 
           <div className="card">
             <div className="card-head">
@@ -413,15 +568,13 @@ export function Settings() {
                   <T zh="日志保留" en="Log retention" />
                 </div>
                 <div className="d">
-                  <T zh="Pro 可到 90 天" en="Pro keeps 90 days" />
+                  <T zh="内存里最近 300 条，不落盘；重启即清空" en="last 300 in memory, never written to disk" />
                 </div>
               </div>
               <div className="v">
-                <select className="select" defaultValue="7">
-                  <option>1</option>
-                  <option>7</option>
-                  <option>30</option>
-                </select>
+                <span className="badge gray">
+                  <T zh="300 条" en="300" />
+                </span>
               </div>
             </div>
           </div>
@@ -435,14 +588,16 @@ export function Settings() {
             <div className="set-row">
               <div>
                 <div className="k">
-                  <T zh="扩展开发者模式" en="Extension dev mode" />
+                  <T zh="扩展宿主" en="Extension host" />
                 </div>
                 <div className="d">
-                  <T zh="允许加载未签名扩展，每次启动都会提示" en="unsigned extensions, warned on every start" />
+                  <T zh="v1.5 才做；现在没有任何扩展能加载" en="lands in v1.5; nothing can load today" />
                 </div>
               </div>
               <div className="v">
-                <Switch on={devMode} onChange={setDevMode} />
+                <span className="badge gray">
+                  <T zh="未接入" en="pending" />
+                </span>
               </div>
             </div>
             <div className="set-row">
@@ -450,11 +605,42 @@ export function Settings() {
                 <div className="k">
                   <T zh="版本" en="Version" />
                 </div>
-                <div className="d">Freeport 0.1.0 · Tauri 2 + Rust · schema 1</div>
+                <div className="d">
+                  Freeport {version} · {window.freeport?.platform ?? 'web'} · schema 1
+                  {update?.updateAvailable && (
+                    <span style={{ color: 'var(--warn, #c98a2e)' }}> · v{update.latest} 可用</span>
+                  )}
+                </div>
+              </div>
+              <div className="v" style={{ display: 'flex', gap: 6 }}>
+                {update?.updateAvailable && update.url && (
+                  <button
+                    className="btn sm"
+                    onClick={() => void window.freeport?.shell.openExternal(update.url!)}
+                  >
+                    <T zh="去下载" en="Download" />
+                  </button>
+                )}
+                <button className="btn ghost sm" disabled={checking} onClick={() => void checkUpdate()}>
+                  {checking ? <T zh="检查中…" en="Checking…" /> : <T zh="检查更新" en="Check" />}
+                </button>
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="诊断信息" en="Diagnostics" />
+                </div>
+                <div className="d">
+                  <T
+                    zh="导出脱敏快照：版本、厂商与健康、账本、最近 20 条日志。不含密钥、掩码与鉴权 token。"
+                    en="Redacted snapshot: version, providers and health, ledger, last 20 logs. No keys, masks or auth token."
+                  />
+                </div>
               </div>
               <div className="v">
-                <button className="btn sm" onClick={() => toast('已是最新版本 / Up to date')}>
-                  <T zh="检查更新" en="Check" />
+                <button className="btn ghost sm" disabled={!desktop} onClick={() => void saveDiagnostics()}>
+                  <T zh="保存诊断包" en="Save bundle" />
                 </button>
               </div>
             </div>
@@ -464,12 +650,22 @@ export function Settings() {
                   <T zh="许可与隐私" en="License & privacy" />
                 </div>
                 <div className="d">
-                  <T zh="AGPL-3.0 · 本地优先，无遥测" en="AGPL-3.0 · local-first, no telemetry" />
+                  <T zh="AGPL-3.0 · 本地优先，无遥测；崩溃日志只留在本机" en="AGPL-3.0 · local-first, no telemetry; crash logs stay local" />
                 </div>
               </div>
-              <div className="v">
-                <button className="btn ghost sm" onClick={() => toast('打开文档 / Open docs')}>
+              <div className="v" style={{ display: 'flex', gap: 6 }}>
+                <button
+                  className="btn ghost sm"
+                  onClick={() => void window.freeport?.shell.openExternal(`${REPO}/blob/main/docs/EULA.md`)}
+                >
+                  EULA
+                </button>
+                <button
+                  className="btn ghost sm"
+                  onClick={() => void window.freeport?.shell.openExternal(REPO)}
+                >
                   <ExternalLink size={12} />
+                  <T zh="仓库" en="Repo" />
                 </button>
               </div>
             </div>

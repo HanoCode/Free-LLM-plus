@@ -23,6 +23,31 @@ export function Status({
   );
 }
 
+/* ── 空态 ──────────────────────────────────
+   全站统一的「这里真的没有数据」。刻意不接受 children 里的示例行：
+   空态就该是空的，拿假数据把它填满等于骗用户自己。 */
+export function Empty({
+  icon,
+  title,
+  hint,
+}: {
+  icon?: ReactNode;
+  title: ReactNode;
+  hint?: ReactNode;
+}) {
+  return (
+    <div className="empty">
+      {icon}
+      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{title}</div>
+      {hint && (
+        <p style={{ marginTop: 6, lineHeight: 1.65, maxWidth: 520, marginInline: 'auto' }}>
+          {hint}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* ── Switch ─────────────────────────────── */
 export function Switch({
   on,

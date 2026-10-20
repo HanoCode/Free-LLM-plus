@@ -396,6 +396,16 @@ discovered → probing → accepted
 
 结论：**每日体检只跑 liveness，能力探测按需且有 TTL。** 这样既做到「每天检查一次」，又不会把额度烧在探测上。
 
+**校验的主体是凭据，不是厂商**
+
+多账号之后，「这家能用吗」和「这把 key 能用吗」是两个问题：
+
+- `probe_account(provider, account)` 用**指定的一条 key** 打 `/models`，结果只写 `Account::health`；界面上每行一个校验按钮
+- `probe(provider)` 是「整家体检」：挑第一条启用且有 key 的凭据跑一次，等价于上面那个的特例
+- 厂商级 `health` 由凭据汇总得出：**只要还有一条好的，这家就是好的**；全挂才取最近一条的错误原文
+
+不这么分会出现一个很难查的现象：给一个健康厂商补第二把过期 key，点一下「校验」，整家变红、流量绕开——而第一把其实一直好着。探针的失败作用域必须和请求的失败作用域一致（`k:` vs `p:`），否则 UI 上读到的状态和路由的真实行为会对不上。
+
 **频率矩阵（默认值，全部可配）**
 
 | 对象 | 周期 | 触发条件 | 备注 |
@@ -566,11 +576,13 @@ Ingress ──▶ ① Resolve  ──▶ ② Gate ──▶ ③ Rank ──▶ �
 合并后依次做**四类剔除**（剔除不是判死，只是本轮不考虑）：
 
 1. **能力门禁**：`tools` / `vision` / `response_format` / 上下文窗口 / `tpm` 单请求上限
-2. **凭据**：平台没有任何 `enabled + healthy|unknown` 的 key → 整平台移除（避免空转）
-3. **本请求已排除**：`skipKeys` / `skipModels` / `skipPlatforms`
-4. **冷却中**：`isOnCooldown(platform, model, key)` 未过期
+2. **凭据**：某条凭据 `enabled` 为假、没有 key、或四个窗口里任一耗尽 → 剔除**这一条凭据**（同一厂商的另一条 key 不受影响）；整家没有任何可用凭据时，这家才整体消失
+3. **本请求已排除**：`skipped` 集合，元素是 `(provider, account, model)` 三元组——Key 级失败只跳该凭据，Provider 级失败才跳整家
+4. **冷却中**：`isOnCooldown(provider, account, model)` 未过期，三级键 `p:provider` / `m:provider:model` / `k:account`
 
 > 剔除顺序有讲究：先能力、再凭据、最后请求级 skip。这样「所有模型都因为没 key 被剔除」能报 503 `no_providers_configured`，而不是误导成 429 限流。
+
+**候选粒度是 `(provider, account, model)`，不是 `(provider, model)`**。这一条决定了多账号能不能真的生效：候选链、熔断键、账本键三处必须同一个粒度，漏掉任何一处，多接的那条 key 只是界面上多一行字——候选还是按厂商去重，SWRR 轮转键还是 `provider:model`，两条 key 抢同一个桶，额度还是一起算。同一家接两把 key 在上游是两本独立的账，429 也分开给，所以「按厂商加总余量」是假话：A 已耗尽、B 全新，加总后看起来充足，Gate 放行，请求打到 A 上继续 429。
 
 #### 3.6.3 Pick 层排序：三轴凸组合 × 三个守卫乘子（仅同档内）
 
@@ -767,7 +779,9 @@ attempt ≥ 2        检查 elapsed >= budget → 停止，返回 timedOut
 ```
 
 - 每次尝试武装一个 `hedgeTimer`，到点直接 `AbortController.abort()` 掐掉在途请求。
-- **首字节到手立即 `disarmHedge()`**：流已经开始返回，再掐就是截断一个健康响应，且此时已无法接力（响应头已发出）。
+- **首个有效语义块到手才 `disarmHedge()`**：模型名/用量等元数据块不算数——免费厂商最常见的失败形态是「200 + 正常 SSE + 只发 role delta + 空 content」。判定点必须右移到 `text` / `reasoning` / `tool_call` 任一出现，且此时代理尚未向客户端提交响应头，仍可换家。
+- 缓冲有上限（64 KiB）：能疯狂输出说明上游是活的，超限直接放行，不为了「可能失败」把用户堵住。
+- **最后一跳不 Hold**：后面没有候选时缓冲只是白等，直接放行。
 - 预算耗尽返回 429 + `Retry-After`，body 明确写「已尝试 N 跳，最近可恢复时间 X」，绝不返回空 200。
 
 #### 3.6.9 熔断与降级模式
@@ -782,7 +796,8 @@ attempt ≥ 2        检查 elapsed >= budget → 停止，返回 timedOut
 #### 3.6.10 结算与学习
 
 - **租约（lease）**：选 key 时写入「预估 token 占用」，请求结束在 `finally` 释放。没有租约，10 个并发请求会同时读到「还有余量」，然后一起打爆限额——这是 check-then-act 竞态，必须用租约关掉。
-- **记账时机**：成功响应后按上游 `usage` 实写；失败不记 token，但记请求数（很多平台按请求计数）。
+- **记账时机**：请求前按 `输入估算 + max_tokens` 预扣（并发不超卖），拿到 `usage` 后 `settle` 回吐差额。失败时分两种情况：`status == 0`（没连上，上游没计费）全退 token；上游已受理则退到只算输入。**请求数一律不回滚**——上游确实收了这一次。
+- **巡检单列**：账本每个窗口分 `used_user` 与 `used_probe`。RPD 耗尽时不能服务用户，但一条 3 token 的 liveness 仍值得跑；混记就做不出这个区分，也解释不了「我只发了 3 次请求，额度怎么没了」。
 - **学限额**：上游报错里带 `Limit 30000, Requested 33476` 这类信息时，**只收紧不放宽**地写回模型限额。学到之后，下一次请求在本地就被拦住，不用再吃一次 413。
 - **惩罚衰减**：429 惩罚值每 5 分钟衰减 1，最低 0。恢复靠时间，不靠人工重置。
 
@@ -876,6 +891,24 @@ return exhausted('retries_exhausted', lastError)                      // 按「�
 - SSE 结束：`data: [DONE]` vs `message_stop` vs Gemini 无终止符
 - 上游强制流式（如某些 Zen 模型）：非流式请求需内部聚合后再返回
 
+**实现状态（2026-10-19）**
+
+| 入口 | 状态 | 位置 |
+|---|---|---|
+| OpenAI Chat | 已实现 | `server.rs::chat` |
+| OpenAI Responses | 已实现（`input` 摊平、`output` 组装、语义化 SSE 事件） | `responses.rs` + `server.rs::responses_entry` |
+| Anthropic Messages | 已实现（含 `count_tokens`） | `anthropic.rs` + `server.rs::messages` |
+| Gemini generateContent / streamGenerateContent / countTokens | 已实现 | `gemini.rs` + `server.rs::gemini` |
+| Ollama `/api/tags` `/api/chat` `/api/generate` | 已实现 | `ollama.rs` + `server.rs::ollama_*` |
+
+Responses 入口的三条边界：**不实现 `previous_response_id`**（无状态网关，Codex 每轮把完整历史塞进 `input`）、**丢弃 hosted tools**（`web_search` / `file_search` 没有 `name`，透传会让 Gemini 这类严格校验的厂商直接 400）、**不落 `store`**。另外 `reasoning.effort` / `parallel_tool_calls` 也不透传——严格校验的兼容端点会因为多一个键直接 400。注入给 Codex 的默认仍是 `wire_api = "chat"`——那条链路已实机验证过，Responses 入口先给手动配置的用户，等实机跑通再改默认。
+
+四个协议入口都汇到 `chat()`，日志里的 `path` 由各 adapter 用内部头 `x-freeport-path` 标注，所以「请求日志」页能看出这次是从哪个协议进来的。同一条日志还带 `account_id` / `account_name`（名字是**当次快照**，凭据以后被删这条记录仍读得懂），每一次失败尝试的 `attempt.account` 也会写明是哪条 key 挂的。
+
+Gemini 入口的三个坑已按上表处理：`contents` 相邻同角色合并、`functionResponse` 按函数名回填 `tool_call_id`、流式在收尾一次性发完整 `functionCall`（Gemini 不接受分片 `args`）。
+
+Ollama 入口的关键差异：**流式是 NDJSON 不是 SSE**（一行一个 JSON，无 `data:` 前缀），结束靠 `done: true`，且 `stream` **默认 true**（与 OpenAI 相反）。`/api/tags` 直接复用 `/v1/models` 的聚合结果，所以注入给 Zed 的模型名就是 `provider:model`，能原样喂回路由。
+
 **建议**：先只做「OpenAI 入口 + 全 adapter」，Anthropic/Gemini 入口在 P1。因为 90% 的 agent 能说 OpenAI，而 Claude Code 必须 Anthropic。
 
 ### 3.8 一键注入（Inject）
@@ -908,6 +941,8 @@ return exhausted('retries_exhausted', lastError)                      // 按「�
 > ```
 >
 > 可复用的部分（托管块合并、原子写、备份链、文件锁、diff 生成）全部下沉到 `util`，**但它们是被调用的函数，不是被填充的模板**。第 13 个 Agent 到来时，新增一个文件，不改任何既有文件。
+>
+> **落地形态（2026-10-19，与上面的计划有偏差）**：实际写成了 `spec.rs` 里一张 `&[AgentSpec]` 静态表 + 三种 `Strategy`（`JsonKeys` / `TomlBlock` / `Guide`），共享 `json_edit.rs` / `toml_block.rs` / `diff.rs` / `journal.rs`。偏差理由是当前只有 8 个 Agent、且 3 个是 `Guide` 不写文件；在「写入键位」还没分化出真正不同的执行路径之前，拆 12 个文件只会得到 12 个内容雷同的壳。等到出现第一个需要自定义流程的 Agent（如 Kiro 的 AWS 配置、Goose 的 YAML 注释保留），再按上面的结构拆，那时拆才是必要的。
 >
 > 下面的 JSON 结构**仅作为 `AgentAdapter` 的元数据定义**保留（用于 UI 展示「目标文件/协议/难度」），不再承担执行语义。
 
@@ -964,6 +999,23 @@ return exhausted('retries_exhausted', lastError)                      // 按「�
 4. **作用域**：用户级 / 项目级（`--scope project` 写进仓库，适合团队）
 5. **变更可见**：diff 预览 + 写入后展示「改了哪几行」
 6. **不泄密**：日志与 UI 不显示完整 key（只显示后 4 位），文件 0600
+
+**作用域落地（v1：用户级全量 + 项目级仅 Claude Code）**
+
+写入 API 带一个 scope：`Scope::User`（写本机配置，所有项目生效）/ `Scope::Project(root)`（只写那个仓库里的一份文件）。入选门槛只有一条——**那份文件是不是客户端自己认定的「个人本地文件」**。把 key 写进会被提交的文件，等于把本机网关凭据推进团队仓库，一次 push 就撤不回来。
+
+| Agent | 项目级落点 | 依据 |
+|---|---|---|
+| Claude Code | `.claude/settings.local.json` | 官方把它与共享的 `.claude/settings.json` 分开，默认不进 git |
+| OpenCode / Crush | — | 项目级 `opencode.json` / `.crush.json` 就是提交的那份，没有个人层，key 无处安放 |
+| Cline / Roo / Kilo / VS Code Chat | — | 配置在扩展 globalStorage 或用户目录，没有项目级文件 |
+| Codex / Goose / Continue / Aider / Zed / Gemini CLI | — | 只读用户级配置，或配置文件带注释与锚点，代写会破坏结构 |
+
+三条实现约束（都有 e2e 锁）：
+
+1. **回滚记录按 `id@<仓库根>` 分开存**：同一 Agent 在两个仓库各注一次，撤 A 不能连 B 一起撤；用户级那条记录也不该被项目级注入污染（`list()` 仍显示「未注入」）；
+2. **文件是我们建的，撤完就删**（`Entry.created`）：留一个 `{}` 在仓库里比不写更脏；用户中途加了自己的键就只删我们写的那几行；
+3. **key 复用**：项目级与用户级共用同一把 `agent:<id>`，项目级注入不轮换、撤出时也不吊销——否则会把用户级那条路一起断掉。
 
 **v1 支持清单（12 个自动注入 + 2 个引导式）**
 
@@ -1053,16 +1105,77 @@ interface Credential {
 
 ### 3.8.2 账号池（Pool）与配额归属
 
+**已经落地的部分（v1.3，凭据即账号）**
+
 ```
 provider ─┬─ account A (api_key)  ─┐
-          ├─ account B (oauth)     ├─▶ pool: "coding" ─▶ 路由候选
-          └─ account C (cookie)   ─┘
+          └─ account B (api_key)  ─┴─▶ 路由候选（account × model）
 ```
 
-- 配额账本按 **account × model × window** 记账，不按 provider 汇总
-- 账号池按「用途」划分（coding / chat / vision），路由时只在该池内选
-- 单账号被限 → 只降权该账号，不牵连同 provider 其他账号
-- 账号可手动「暂停 / 仅低优先级使用」
+- 一个厂商下挂多条凭据：`Provider.accounts: Vec<Account>`，每条 `{id, name, key_mask, enabled, added_at, quota, health}`
+- 配额账本按 **account × window** 记账，不按 provider 汇总；同一家两把 key 是两本独立的账
+- 单账号被限 → 只降权/冷却该账号（`k:account`），不牵连同 provider 其他账号；只有 5xx / 连不上才用 `p:provider` 连坐整家
+- 每条凭据可单独设四项限额（rpm / rpd / tpm / tpd），留空 = 只记账不拦截
+- 每条凭据有自己的 `health`：校验第二把 key 失败不会把第一把刷红；厂商级 `health` 是「只要还有一条好的就算好」的汇总
+- 账号可手动「启用 / 停用」，停用的不进入候选链
+
+**尚未实现（原计划的 Pool 概念，推迟到 Tier C）**
+
+- 账号按「用途」分池（coding / chat / vision），路由时只在该池内选
+- 账号优先级 / 「仅低优先级使用」；跨池的预算分配
+- `kind` 维度（api_key / oauth / cookie）——目前只有 api_key，OAuth 与 Cookie 属 Tier C 凭据形态
+
+> 为什么不先做 Pool：v1 的痛点是「免费额度被单 key 打满」，补第二把 key 就解决了；
+> 分池要等 Tier C 的多形态凭据（订阅态与免费态额度语义完全不同）才有意义，
+> 提前引入只会让 `plan()` 多一层没人用的过滤。
+
+### 3.8.3 迁移与多机同步（v1：加密迁移码）
+
+换一台机器最贵的成本不是装软件，是「把十几个厂商的 key 再抄一遍」。v1 的做法是**离线迁移码**，不依赖任何服务端：
+
+```
+明文 bundle ──Argon2id(口令, salt)──▶ 32B key ──AES-256-GCM(aad=信封参数)──▶ 迁移码(JSON)
+   ├ providers（不含模型目录与健康度）
+   ├ accounts（含四项限额、启停状态）
+   ├ secrets: account_id → 明文 key
+   ├ api_keys（只搬 key_hash，所以原客户端继续可用）
+   └ routing / patrol
+```
+
+- **信封自带 KDF 参数**（`m/t/p/salt/nonce`），换参数也能解开老迁移码；`v` 是不认识就拒绝的主版本
+- **参数必须在可信区间**：`m ≤ 256MiB`、`t ≤ 16`、`p ≤ 8`，否则一个手写信封就能让 App 去分配 4GiB
+- **AAD = 信封参数本身**，改 salt 或改 KDF 参数都会让解密失败，而不是「降级后还能解出一份弱口令的结果」
+- **口令不进磁盘、不进日志**；导出后立刻从输入框清掉
+- **不搬的东西**：用量台账、冷却、健康度、模型目录、端口与本地鉴权 token、OAuth token（与本机设备绑定）
+
+两种导入语义，界面上必须分开说：
+
+| 模式 | 行为 | 密文处理 |
+|---|---|---|
+| `merge`（默认） | 只补本机没有的厂商/凭据/虚拟 key；同 id 条目保留本地版本，绝不覆盖已有 key | 只写新条目的密文 |
+| `replace` | 整体替换配置 | **先删本机多余凭据的密文**，再写迁移码里的，避免「以为覆盖了、旧 key 还在盘上」 |
+
+合并模式下选路配置只在本地为空时接受对方的——同步配置不该把用户调好的链路打乱。
+
+#### 迁移包文件（`.fpk`）
+
+文件里装的就是迁移码原文（同一个 JSON 信封），换成文件不是为了格式，是为了**传输**：
+
+| 问题 | 文件化之后 |
+|---|---|
+| 1–20KB 的 JSON 粘进微信/邮件会被截断、丢换行 | 当附件传，一个字节都不会变 |
+| 用户不知道该把这段乱码放哪 | 文件可以放 U 盘、AirDrop、网盘 |
+| 少一个字符就解不开 | 路径由原生对话框给，前端不碰文件系统 |
+
+实现约束：
+
+- **先写临时文件再 rename**，并且 `sync_all` 之后才改名——断电/拔盘时要么是完整文件，要么什么都没有；最坏的结果不是「保存失败」，而是留下一个看起来能导入、实际解不开的半截文件
+- **权限 `0600`**：它虽然是密文，也不该让同机其他用户随手拷走
+- **读取有大小闸门**（4 MiB）：正常包几十 KB，超过就是选错文件了，别把它整个读进内存
+- **对话框走 Rust 侧**（`tauri-plugin-dialog` 的 `blocking_*`，在 async 命令线程上调用）：前端不需要文件系统权限，路径也不用来回搬；用户取消返回 `null`，不是错误
+- 口令两条路共用一套校验：**先验口令再弹框**，不让人挑完位置才被告知「口令太短」
+
+> 为什么不是云端同步：先把「换机不重填」这件事做对，比先做一个要登录的账号体系便宜得多。Pro 的多机同步将来复用同一个 bundle 格式，只是把传输层换成服务端。
 
 ### 3.9 安全模型
 
@@ -1618,20 +1731,25 @@ WebView 侧安全基线：`withGlobalTauri: false`、CSP 白名单（`default-sr
 
 ### 6.1 发布架构（mac + win）
 
-| 项 | 方案 |
-|---|---|
-| macOS 签名 | Developer ID Application + Hardened Runtime + `notarytool` 公证 + staple |
-| macOS 架构 | arm64 与 x64 分别构建（`--target aarch64-apple-darwin` / `x86_64-apple-darwin`） |
-| Windows 签名 | Azure Trusted Signing（EV）或 OV 证书；NSIS 安装包 + 便携版 |
-| Windows WebView2 | Win11 自带；Win10 用 bootstrapper 检测并静默安装（**不打 fixed-version**，避免 +150MB） |
-| 更新通道 | `stable` / `beta` 双通道；`tauri-plugin-updater` + 签名 `latest.json` |
-| 差量更新 | `createUpdaterArtifacts: true`（zstd 压缩，通常 < 3 MB） |
-| 构建 | GitHub Actions 矩阵（macos-14 arm64 / macos-13 x64 / windows-latest），`tauri-apps/tauri-action` |
-| 崩溃上报 | Sentry（**默认关闭**，opt-in 且脱敏：不含 prompt、key、路径） |
-| 遥测 | 默认全关；仅「版本 + 平台 + 是否成功启动」可选上报 |
-| 分发 | 官网 + GitHub Releases；**不上架 App Store / Microsoft Store**（Tier C 约束） |
-| 合规物料 | EULA、隐私政策、Tier C 风险说明、下架/删除请求响应流程 |
-| 自动更新开关 | 设置内可关；企业环境可用 `--no-update` |
+| 项 | 方案 | 状态 |
+|---|---|---|
+| macOS 签名 | Developer ID Application + Hardened Runtime + `notarytool` 公证 + staple | 配置就绪（`entitlements.plist` + `hardenedRuntime`），证书走 secrets |
+| macOS 架构 | arm64 与 x64 分别构建（`--target aarch64-apple-darwin` / `x86_64-apple-darwin`） | ✅ 矩阵已配 |
+| Windows 签名 | Azure Trusted Signing（EV）或 OV 证书；NSIS 安装包 + 便携版 | 步骤已写好但**保持注释**，凭据未就位前发未签名包并在 release 正文写明 SmartScreen |
+| Windows WebView2 | Win11 自带；Win10 用 bootstrapper 检测并静默安装（**不打 fixed-version**，避免 +150MB） | 默认行为 |
+| 更新通道 | `stable` / `beta` 双通道；`tauri-plugin-updater` + 签名 `latest.json` | 检查更新已实现（读 GitHub Releases）；升级产物在 `TAURI_UPDATER_PUBKEY` 就位后由 CI 生成 |
+| 差量更新 | `createUpdaterArtifacts: true`（zstd 压缩，通常 < 3 MB） | 同上，跟随更新密钥开关 |
+| 构建 | GitHub Actions 矩阵（macos-14 arm64 / macos-13 x64 / windows-latest），`tauri-apps/tauri-action` | ✅ `.github/workflows/release.yml`（含 tag↔版本一致性闸、发布前全绿闸、checksums） |
+| 崩溃上报 | **不接 Sentry**。panic hook 写 `<data>/crash/crash-<ts>.log`（最近 20 份，只在本机）；设置页可导出脱敏诊断包 | ✅ |
+| 遥测 | 无。一个字节都不上报 | ✅ |
+| 分发 | 官网 + GitHub Releases；**不上架 App Store / Microsoft Store**（Tier C 约束） | ✅ |
+| 合规物料 | EULA、隐私政策、Tier C 风险说明、下架/删除请求响应流程 | `docs/EULA.md` ✅（随包 `resources` 分发），其余待补 |
+| 自动更新开关 | 设置内可关；企业环境可用 `--no-update` | 随升级通道一起接 |
+
+**为什么崩溃上报自己写而不接 Sentry**：Sentry 的最小可用配置也会带上 stack + 请求路径 +
+设备信息，而 Freeport 的进程里同时躺着**全部上游密钥的密文**与用户 prompt。为了一个
+「崩溃率」指标把整台机器的上下文交给第三方，代价过高。本地落盘 + 用户主动导出，
+效果差一点，但守住的是同一件事：没有任何东西未经同意离开这台机器。
 
 **发布前必须通过的检查**
 
@@ -1706,6 +1824,63 @@ freellmapi 已经跑通了一条很干净的商业化路径，值得直接借鉴
 | 免费/付费共用一条代码路径 | tier 只影响**数据源**，不影响任何功能开关——避免两套逻辑分叉 |
 | 可灰度、可熔断 | 目录服务支持按版本回滚；客户端支持远程 `kill-switch`（仅用于下架违规 provider） |
 
+### 7.3 已落地：离线 license（v1）
+
+`crates/freeport-license` 只做「验签 + 算状态」，不做任何功能拦截。
+
+**格式**：标准 JWT，`alg=EdDSA`，签名覆盖 `header.payload`。
+
+```
+{"alg":"EdDSA","typ":"JWT"} . {"sub","tier","feat","iat","exp","mid","seats","kid"} . <64B sig>
+```
+
+| 决定 | 理由 |
+|---|---|
+| 用完整 JWT 而不是「payload.sig」两段 | 用户迟早要把 token 贴进工单/CI/脚本，长得像 JWT 才符合直觉；`kid` 也留了轮换余地 |
+| `alg` 必须白名单校验 | 不校验就等于允许 `alg=none` 自签 |
+| 公钥内置 + 私钥只在签发工具 | 私钥签发能力用 `--features issuer` 单独编译，**不进 App 依赖图** |
+| `mid` 可选 | 绑机器能防一号多机，但换主板/重装就废。默认不绑，销售侧按需绑 |
+| 状态每次现算、不缓存 | 缓存会让「把系统时间调回去」变成续期手段；一次验签约 50µs，不值得冒这个险 |
+| 过期后 7 天宽限期仍算 Pro | 到期那一刻掉能力，误伤的永远是按时付费的人 |
+| `tier` 与 `licensedTier` 分开下发 | 界面才能说清「你买的是 Pro，已到期 3 天，现在是免费版」 |
+| 机器不符 / 已过期 → 拒绝激活且不落盘 | 配置里躺一份无效 token，下次启动还得再解释一遍 |
+
+**红线落地方式**：网关里没有任何 `if !license.is_pro()` 分支。Pro 能力靠服务端按 tier 返回不同数据实现——客户端只应用拿到的数据，不自己判权限（本地判权限既拦不住破解，又会误伤付费用户）。
+
+#### 7.3.1 Pro 数据面：身份随请求走
+
+「按档位下发」需要一个客户端**声明**自己是谁，于是 feed 请求多带两样东西：
+
+| 头 / 字段 | 内容 | 谁消费 |
+|---|---|---|
+| `x-freeport-tier` | `free` / `pro`，本机现算（宽限期也算 pro） | 服务端决定下发粒度 |
+| `Authorization` | `Bearer <license JWT>`，**只有 Pro 才带** | 服务端验签认人，顺带能拒掉过期 token |
+| manifest `tier` | 服务端在 manifest 里标注这份快照属于哪档 | 界面展示「Pro 目录 / 公共目录」 |
+
+三条约束，缺一条就会变成漏洞：
+
+1. **只加身份，不加判断**：客户端不写「免费档不应用某快照」，收不收只看签名。服务端要是不小心把 Pro 下发给了免费用户，那是服务端 bug，客户端没必要替它扣用户的数据。
+2. **凭据只在可信链路上发**：`https://` 或本机回环（`localhost` / `127.0.0.1` / `[::1]`）才带 Bearer。公网明文地址上带 JWT 等于把它广播给路上每一个人。
+3. **快照必须与 manifest 同源**：快照地址在签名里，但配置是用户填的；跨源时不带 Bearer，免得本机许可证被送到第三方域名。
+
+`tier` 本身也进签名载荷（存在时才进，老 manifest 照样能验）。不签的话，中间人可以把免费包标成 Pro 包，让界面说谎。
+
+状态上只多记一个 `FeedState.servedTier`——「服务端说这份目录是哪个档」，纯展示，不参与任何本地分支。解除许可证后下一次检查立刻退回 `free`，不需要重启。
+
+签发工具：
+
+```bash
+# 一次性：生成密钥对；把 public_b64 填进 PROD_PUBKEY，私钥存密码管理器
+cargo run -p freeport-license --features issuer --example keygen
+
+# 每单：签发
+cargo run -p freeport-license --features issuer --example issue -- \
+    --sub user@example.com --days 365 [--mid m_xxxx]
+
+# 客服：确认「是 token 坏了还是构建坏了」（不需要私钥）
+cargo run -p freeport-license --example check -- "<token>"
+```
+
 ---
 
 ## 8. 里程碑（按可验证结果切）
@@ -1717,13 +1892,13 @@ freellmapi 已经跑通了一条很干净的商业化路径，值得直接借鉴
 | M2 发现 | 目录（models.dev 为底 + 免费额度 feed）+ key 管理 + liveness/能力探针 + 模型列表 UI | 录入 key 后 30s 内看到可用模型与延迟 |
 | M2.5 巡检 | 巡检调度器 + 探针预算 + 健康状态机 + 每日 Digest | ① 连续运行 7 天，探针消耗不超过设定预算；② 手动让某模型 401，连续 2 次失败后才变 unavailable，且 30 分钟后自动复检；③ 单次 502 不改任何状态 |
 | M3 路由与接力 | 三层决策（Gate/Order/Pick）+ 三态熔断 + SWRR + affinity + 45s 预算 + 决策日志 | ① 手动把主 key 打到 429，请求在 **2 跳内**切到可用模型；② 杀掉一个 provider 的域名解析，请求在 45s 内返回 429/502 而非挂死；③ 日志能逐层解释「被谁拦下 / 权重档 / 为何选中」；④ 同一 session 连续 20 次请求落在同一 key（除非它 Open） |
-| M4 注入骨架 | 注入引擎（diff/备份/锁/原子写/回滚）+ 5 个 agent 适配器 | 注入 Claude Code 后能真实跑一轮对话；恢复后文件与原始一致 |
-| M5 体验 | 概览/Providers/Models/Routing 页面 + 托盘 popover + 空状态 | 全流程无终端操作 |
-| M6 协议加固 | Anthropic + Gemini 入口 + 配额账本 + 粘性会话 | Claude Code 原生协议跑通；连续 200 次请求无 429 泄漏 |
-| M6.5 目录运营 | 签名 feed + 变更事件 + 应用策略 + Discover 页 + beta 频道 | ① 在 feed 里加一个假模型，客户端 5 分钟内出现（Free 6h 内）且带 candidate 标记；② 删除一个模型，路由立刻不再选中；③ 篡改 feed 签名，客户端拒绝应用并告警 |
-| M7 Auth Broker | OAuth PKCE / Device / 内置窗口 Cookie + token 刷新 + 账号池 | 一个订阅类 provider 可稳定使用 ≥24h，自动续期 |
-| M8 注入全覆盖 | 12 个适配器 + 项目级 scope + 引导式 | 每个适配器都有自动化测试（临时 HOME + 快照比对） |
-| M9 发行 | 签名/公证/双架构/自动更新/崩溃上报/EULA | 干净机器安装即用；升级不丢数据；卸载无残留 |
+| M4 注入骨架 ✅ | 注入引擎（diff/备份/锁/原子写/回滚）+ 5 个 agent 适配器 | 注入 Claude Code 后能真实跑一轮对话；恢复后文件与原始一致 |
+| M5 体验 ✅ | 概览/Providers/Models/Routing 页面 + 托盘 popover + 空状态 | 全流程无终端操作 |
+| M6 协议加固 ✅ | Anthropic + Gemini 入口 + 配额账本 + 粘性会话 | Claude Code 原生协议跑通；连续 200 次请求无 429 泄漏 |
+| M6.5 目录运营 ✅ | 签名 feed + 变更事件 + 应用策略 + Discover 页 + beta 频道；**增量补丁链**（RFC 6902 / 24 跳上限 / 断链回退全量） | ① 在 feed 里加一个假模型，客户端 5 分钟内出现（Free 6h 内）且带 candidate 标记；② 删除一个模型，路由立刻不再选中；③ 篡改 feed 签名，客户端拒绝应用并告警 |
+| M7 Auth Broker ✅ | OAuth PKCE / Device / 内置窗口 Cookie + token 刷新 + 账号池 | 一个订阅类 provider 可稳定使用 ≥24h，自动续期（Copilot 设备码 + 续期已真机验过） |
+| M8 注入全覆盖 ✅ | 19 个适配器（9 个真写文件 / 10 个引导式）+ 项目级 scope | 每个会写文件的适配器都有 e2e（临时 HOME + 语义快照比对 + 幂等 + 回滚），并有一道「新增适配器必须补 e2e」的覆盖闸 |
+| M9 发行 🚧 | 双架构 CI + 签名/公证注入点 + 更新检查 + 崩溃落盘 + EULA | 干净机器安装即用；升级不丢数据；卸载无残留；签名与公证待证书就位 |
 | M10 扩展（v1.5） | Extension Host + chat2api 样板 | 可选安装后 `/v1/images/generations` 可用；扩展崩溃不影响 chat；卸载无残留 |
 
 ---
@@ -1758,6 +1933,7 @@ freellmapi 已经跑通了一条很干净的商业化路径，值得直接借鉴
 | 17 | 会话粘性 | **新增 affinity**（30 min 滑动，保 prompt cache） | v1.1 缺口；cc-switch/magpie 均有 |
 | 18 | 目录 | **models.dev 为底，自建仅做免费额度增量** | 避免重复维护全量模型库 |
 | 19 | 迁移窗口 | **现在（M1 末）**，约 12 人日；M3 后不建议 | 网关仅 1.5k 行 |
+| 20 | 多账号粒度 | **按凭据（Account）算**：候选、冷却、账本、粘性、日志归因五处统一到 `(provider, account, model)` | 同一家两把 key 在上游是两本独立的账，429 也分开给；按厂商加总会让「还剩一半」变成假话 |
 
 ### 仍需你拍板（不阻塞 M2）
 

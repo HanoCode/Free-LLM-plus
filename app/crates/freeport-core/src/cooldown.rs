@@ -1,6 +1,9 @@
 //! 冷却与三态熔断。
 //!
-//! 作用域有两级键：`p:provider` / `m:provider:model` / `k:provider`。
+//! 作用域三级键：`p:provider` / `m:provider:model` / `k:account`。
+//! **Key 级冷却按凭据算**（`k:acct_x`），因为限流、欠费、key 失效都是那条 key 自己的事；
+//! 厂商级（5xx）与模型级（上下文超限、不支持工具）按 provider 算，换条 key 也一样会挂。
+//!
 //! 到期不是直接恢复，而是进入半开：只允许一个试探请求通过，
 //! 成功才真正闭合，失败则把冷却翻倍。这样避免「刚到期就再吃一次失败」。
 
@@ -55,18 +58,35 @@ impl Cooldowns {
         Self::default()
     }
 
-    fn key(scope: Scope, provider_id: &str, model_id: Option<&str>) -> String {
+    fn key(scope: Scope, provider_id: &str, account_id: &str, model_id: Option<&str>) -> String {
         match scope {
             Scope::Provider => format!("p:{provider_id}"),
             Scope::Model => format!("m:{provider_id}:{}", model_id.unwrap_or("*")),
-            Scope::Key => format!("k:{provider_id}"),
+            Scope::Key => format!("k:{account_id}"),
         }
+    }
+
+    /// 一条候选要检查的三个键：厂商、凭据、模型。
+    fn keys(provider_id: &str, account_id: &str, model_id: Option<&str>) -> [String; 3] {
+        [
+            format!("p:{provider_id}"),
+            format!("k:{account_id}"),
+            model_id.map(|m| format!("m:{provider_id}:{m}")).unwrap_or_default(),
+        ]
     }
 
     /// 记一次失败。同一目标反复失败时冷却翻倍，封顶 24h。
     /// 返回实际生效的冷却毫秒数。
-    pub fn hit(&self, scope: Scope, provider_id: &str, model_id: Option<&str>, ms: u64, reason: &str) -> u64 {
-        let key = Self::key(scope, provider_id, model_id);
+    pub fn hit(
+        &self,
+        scope: Scope,
+        provider_id: &str,
+        account_id: &str,
+        model_id: Option<&str>,
+        ms: u64,
+        reason: &str,
+    ) -> u64 {
+        let key = Self::key(scope, provider_id, account_id, model_id);
         let mut map = self.map.lock().unwrap();
         let hits = map.get(&key).map(|r| r.hits + 1).unwrap_or(1);
         let factor = 2_i64.pow((hits - 1).min(4));
@@ -83,27 +103,37 @@ impl Cooldowns {
         eff as u64
     }
 
-    /// 一次成功：清掉该 provider 的 key/provider 冷却，以及这个模型的冷却。
-    pub fn note_success(&self, scope: Scope, provider_id: &str, model_id: Option<&str>) {
-        let key = Self::key(scope, provider_id, model_id);
+    /// 一次成功：清掉这条凭据的冷却、它所属厂商的冷却，以及这个模型的冷却。
+    pub fn note_success(&self, provider_id: &str, account_id: &str, model_id: Option<&str>) {
         let mut map = self.map.lock().unwrap();
-        map.remove(&key);
-        map.remove(&format!("k:{provider_id}"));
         map.remove(&format!("p:{provider_id}"));
+        map.remove(&format!("k:{account_id}"));
         if let Some(m) = model_id {
             map.remove(&format!("m:{provider_id}:{m}"));
         }
     }
 
-    /// 三态快照（任一作用域取最严的那个）。
-    pub fn state(&self, provider_id: &str, model_id: Option<&str>) -> BreakerState {
+    /// 删掉一条凭据时清掉它的 key 级冷却。
+    ///
+    /// 只删 `k:` 这一把：`p:` 属于整家、`m:` 属于这个模型，都还可能有别的
+    /// 凭据在用。留着不删虽然不影响路由（候选里已经没有这条凭据了），
+    /// 但状态栏会挂一条指向不存在的凭据的冷却，看起来像 bug。
+    pub fn forget_account(&self, account_id: &str) {
+        let mut map = self.map.lock().unwrap();
+        map.remove(&format!("k:{account_id}"));
+    }
+
+    /// 三态快照（任一作用域取最严的那个）。必须同时传厂商和凭据：
+    /// 厂商级故障会连坐同一家的所有 key，凭据级故障只挡它自己。
+    pub fn state_for(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        model_id: Option<&str>,
+    ) -> BreakerState {
         let map = self.map.lock().unwrap();
         let mut worst: Option<(&Rest, String)> = None;
-        for key in [
-            format!("p:{provider_id}"),
-            format!("k:{provider_id}"),
-            model_id.map(|m| format!("m:{provider_id}:{m}")).unwrap_or_default(),
-        ] {
+        for key in Self::keys(provider_id, account_id, model_id) {
             if let Some(rest) = map.get(&key) {
                 let is_worse = worst
                     .as_ref()
@@ -125,16 +155,12 @@ impl Cooldowns {
     }
 
     /// 半开时抢占一次试探权；已经有人在探则返回 false。
-    pub fn try_acquire_probe(&self, provider_id: &str, model_id: Option<&str>) -> bool {
+    pub fn try_acquire_probe(&self, provider_id: &str, account_id: &str, model_id: Option<&str>) -> bool {
         let mut map = self.map.lock().unwrap();
-        let keys: Vec<String> = [
-            format!("p:{provider_id}"),
-            format!("k:{provider_id}"),
-            model_id.map(|m| format!("m:{provider_id}:{m}")).unwrap_or_default(),
-        ]
-        .into_iter()
-        .filter(|k| !k.is_empty())
-        .collect();
+        let keys: Vec<String> = Self::keys(provider_id, account_id, model_id)
+            .into_iter()
+            .filter(|k| !k.is_empty())
+            .collect();
 
         for k in keys {
             if let Some(rest) = map.get_mut(&k) {
@@ -151,16 +177,12 @@ impl Cooldowns {
     }
 
     /// 试探失败：把冷却翻倍，并释放试探权。
-    pub fn probe_failed(&self, provider_id: &str, model_id: Option<&str>) {
+    pub fn probe_failed(&self, provider_id: &str, account_id: &str, model_id: Option<&str>) {
         let mut map = self.map.lock().unwrap();
-        let keys: Vec<String> = [
-            format!("p:{provider_id}"),
-            format!("k:{provider_id}"),
-            model_id.map(|m| format!("m:{provider_id}:{m}")).unwrap_or_default(),
-        ]
-        .into_iter()
-        .filter(|k| !k.is_empty())
-        .collect();
+        let keys: Vec<String> = Self::keys(provider_id, account_id, model_id)
+            .into_iter()
+            .filter(|k| !k.is_empty())
+            .collect();
         for k in keys {
             if let Some(rest) = map.get_mut(&k) {
                 let span = (rest.until - (now_ms() - 60_000)).max(60_000);
@@ -215,8 +237,8 @@ mod tests {
     #[test]
     fn doubles_on_repeat_failure() {
         let cd = Cooldowns::new();
-        let a = cd.hit(Scope::Key, "groq", None, 1_000, "rate_limit");
-        let b = cd.hit(Scope::Key, "groq", None, 1_000, "rate_limit");
+        let a = cd.hit(Scope::Key, "groq", "acct_a", None, 1_000, "rate_limit");
+        let b = cd.hit(Scope::Key, "groq", "acct_a", None, 1_000, "rate_limit");
         assert_eq!(a, 1_000);
         assert_eq!(b, 2_000);
     }
@@ -224,17 +246,66 @@ mod tests {
     #[test]
     fn success_clears_model_and_key() {
         let cd = Cooldowns::new();
-        cd.hit(Scope::Model, "groq", Some("llama"), 1_000, "not_found");
-        cd.note_success(Scope::Model, "groq", Some("llama"));
-        assert_eq!(cd.state("groq", Some("llama")), BreakerState::Closed);
+        cd.hit(Scope::Model, "groq", "acct_a", Some("llama"), 1_000, "not_found");
+        cd.note_success("groq", "acct_a", Some("llama"));
+        assert_eq!(
+            cd.state_for("groq", "acct_a", Some("llama")),
+            BreakerState::Closed
+        );
     }
 
     #[test]
     fn expired_cooldown_becomes_half_open() {
         let cd = Cooldowns::new();
-        cd.hit(Scope::Key, "groq", None, 0, "rate_limit");
-        assert!(matches!(cd.state("groq", None), BreakerState::HalfOpen));
-        assert!(cd.try_acquire_probe("groq", None));
-        assert!(!cd.try_acquire_probe("groq", None));
+        cd.hit(Scope::Key, "groq", "acct_a", None, 0, "rate_limit");
+        assert!(matches!(
+            cd.state_for("groq", "acct_a", None),
+            BreakerState::HalfOpen
+        ));
+        assert!(cd.try_acquire_probe("groq", "acct_a", None));
+        assert!(!cd.try_acquire_probe("groq", "acct_a", None));
+    }
+
+    /// 限流是那条 key 的事：冷却 A 不能让 B 也停摆，否则多账号白接。
+    #[test]
+    fn key_scope_is_isolated_between_accounts() {
+        let cd = Cooldowns::new();
+        cd.hit(Scope::Key, "groq", "acct_a", Some("llama"), 60_000, "rate_limit");
+        assert!(matches!(
+            cd.state_for("groq", "acct_a", Some("llama")),
+            BreakerState::Open { .. }
+        ));
+        assert_eq!(
+            cd.state_for("groq", "acct_b", Some("llama")),
+            BreakerState::Closed,
+            "同一个厂商的另一条 key 不该被连坐"
+        );
+    }
+
+    /// 上游 5xx 是厂商的事：换条 key 也一样挂，必须全挡。
+    #[test]
+    fn provider_scope_blocks_every_account() {
+        let cd = Cooldowns::new();
+        cd.hit(Scope::Provider, "groq", "acct_a", None, 60_000, "upstream");
+        assert!(matches!(
+            cd.state_for("groq", "acct_b", Some("llama")),
+            BreakerState::Open { .. }
+        ));
+    }
+
+    /// 删凭据之后不该还挂着一把指向不存在 key 的冷却。
+    #[test]
+    fn forgetting_an_account_leaves_other_scopes_alone() {
+        let cd = Cooldowns::new();
+        cd.hit(Scope::Key, "groq", "acct_a", None, 60_000, "rate_limit");
+        cd.hit(Scope::Provider, "groq", "acct_a", None, 60_000, "upstream");
+        cd.forget_account("acct_a");
+
+        // key 级清掉了，但厂商级还在（那是整家的事，不能因为删了一把 key 就解除）
+        assert!(cd
+            .snapshot()
+            .iter()
+            .all(|c| c.key != "k:acct_a"));
+        assert!(cd.snapshot().iter().any(|c| c.key == "p:groq"));
     }
 }

@@ -1,11 +1,18 @@
 //! 上游调用。M1.5 只做 OpenAI 兼容协议；
 //! Anthropic / Gemini 的 wire 转换在 M6 接 Canonical IR。
+//!
+//! 所有出门的请求体都过一遍 [`crate::sanitize`]：剥内部字段 + 抹掉本凭据的
+//! 密钥字面量。上游回显 key 的错误体也在这里就地脱敏——这里是最靠外的
+//! 一环，脱在这一层，日志、界面、返回给客户端的错误体就都干净了。
 
 use std::time::Duration;
 
 use freeport_core::error::parse_retry_after;
 use freeport_core::model::{ModelInfo, Provider};
 use serde::Deserialize;
+
+use crate::cred::Credential;
+use crate::sanitize::{strip_internal, Redactor};
 
 #[derive(Debug, Clone)]
 pub struct UpstreamError {
@@ -63,15 +70,34 @@ fn join(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
-fn headers(p: &Provider, key: &str) -> Vec<(&'static str, String)> {
+/// 拼上游请求头。认证部分交给 [`Credential`]——API key 发 `Bearer`，
+/// web 会话发 `Cookie`，两者**绝不同时出现**（带着 Bearer 访问只认会话的
+/// 端点会直接 401，还会让上游看到一把它根本不认识的 token）。
+fn headers(p: &Provider, cred: &Credential, url: &str) -> Vec<(&'static str, String)> {
     let mut h = vec![
         ("content-type", "application/json".to_string()),
         ("accept", "application/json".to_string()),
-        ("authorization", format!("Bearer {key}")),
     ];
+    match cred {
+        Credential::Bearer(token) => {
+            h.push(("authorization", format!("Bearer {token}")));
+        }
+        Credential::Cookie { .. } => {
+            if let Some(v) = cred.header(url) {
+                h.push(("cookie", v));
+            }
+        }
+    }
     if p.id == "openrouter" {
         h.push(("http-referer", "https://freeport.dev".to_string()));
         h.push(("x-title", "Freeport".to_string()));
+    }
+    // Copilot 的网关会看这几个头，缺了直接 400。它们也是「这是谁在调用」的
+    // 一部分，所以只在 copilot 这个厂商下加，别污染其他上游。
+    if p.id == "copilot" {
+        for (k, v) in freeport_auth::copilot::extra_headers() {
+            h.push((k, v));
+        }
     }
     h
 }
@@ -100,10 +126,12 @@ enum RawModel {
 pub async fn list_models(
     client: &reqwest::Client,
     p: &Provider,
-    key: &str,
+    cred: &Credential,
 ) -> Result<Vec<ModelInfo>, UpstreamError> {
-    let mut req = client.get(join(&p.base_url, "/models"));
-    for (k, v) in headers(p, key) {
+    let url = join(&p.base_url, "/models");
+    let red = Redactor::for_credential(cred);
+    let mut req = client.get(&url);
+    for (k, v) in headers(p, cred, &url) {
         req = req.header(k, v);
     }
     let res = req
@@ -112,7 +140,7 @@ pub async fn list_models(
         .await
         .map_err(|e| UpstreamError {
             status: 0,
-            body: e.to_string(),
+            body: red.redact(&e.to_string()),
             retry_after_ms: 0,
         })?;
 
@@ -127,8 +155,9 @@ pub async fn list_models(
     if !(200..300).contains(&status) {
         return Err(UpstreamError {
             status,
+            // 先算 retry-after 再脱敏：脱敏只影响展示，不该影响配额判定
             retry_after_ms: parse_retry_after(retry_after.as_deref(), &text),
-            body: text.chars().take(800).collect(),
+            body: red.redact(&text).chars().take(800).collect(),
         });
     }
 
@@ -147,6 +176,8 @@ pub async fn list_models(
                 context: None,
                 created: None,
                 free: None,
+                caps: Default::default(),
+                candidate: false,
             }),
             RawModel::Obj {
                 id,
@@ -159,6 +190,8 @@ pub async fn list_models(
                 context: context_length,
                 created,
                 free: None,
+                caps: Default::default(),
+                candidate: false,
             }),
         })
         .filter(|m| !m.id.is_empty())
@@ -169,18 +202,28 @@ pub async fn list_models(
 }
 
 /// 发起一次 chat。只等到响应头返回，body 交给上层流式转发。
+///
+/// 请求体在这里复制一份再清洗（剥内部字段 + 抹掉本凭据的字面量），
+/// 调用方传进来的 payload 不会被改动——接力链里同一个 payload 要发给
+/// 下一跳，改坏了就是二次伤害。
 pub async fn create_chat(
     client: &reqwest::Client,
     p: &Provider,
-    key: &str,
+    cred: &Credential,
     payload: &serde_json::Value,
     timeout: Duration,
 ) -> Result<reqwest::Response, UpstreamError> {
-    let mut req = client.post(join(&p.base_url, "/chat/completions"));
-    for (k, v) in headers(p, key) {
+    let url = join(&p.base_url, "/chat/completions");
+    let red = Redactor::for_credential(cred);
+    let mut body = payload.clone();
+    strip_internal(&mut body);
+    red.redact_value(&mut body);
+
+    let mut req = client.post(&url);
+    for (k, v) in headers(p, cred, &url) {
         req = req.header(k, v);
     }
-    let res = tokio::time::timeout(timeout, req.json(payload).send())
+    let res = tokio::time::timeout(timeout, req.json(&body).send())
         .await
         .map_err(|_| UpstreamError {
             status: 504,
@@ -189,7 +232,7 @@ pub async fn create_chat(
         })?
         .map_err(|e| UpstreamError {
             status: if e.is_timeout() { 504 } else { 0 },
-            body: e.to_string(),
+            body: red.redact(&e.to_string()),
             retry_after_ms: 0,
         })?;
 
@@ -207,6 +250,6 @@ pub async fn create_chat(
     Err(UpstreamError {
         status,
         retry_after_ms: parse_retry_after(retry_after.as_deref(), &body),
-        body,
+        body: red.redact(&body),
     })
 }

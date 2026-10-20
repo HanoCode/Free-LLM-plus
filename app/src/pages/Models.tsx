@@ -1,38 +1,184 @@
 import { useMemo, useState } from 'react';
-import { Search, SlidersHorizontal, RefreshCw, Sparkles } from 'lucide-react';
-import { T } from '../lib/i18n';
-import { models as allModels, type Model } from '../lib/data';
+import { Activity, Search, RefreshCw, Sparkles } from 'lucide-react';
+import { T, tx, useLang } from '../lib/i18n';
 import { Status, Switch, fmt, toast } from '../components/ui';
 import { useApp } from '../lib/store';
+import { useGateway } from '../lib/gateway';
+import type { GwModel, HealthStatus } from '../lib/bridge';
 
-type Filter = 'all' | 'tools' | 'vision' | 'json' | 'cooling';
+type Filter = 'all' | 'free' | 'tools' | 'vision' | 'issues';
+
+/** 一行模型 = 一个 provider × 一个上游模型。虚拟模型（freeport/auto）不在这里。 */
+interface Row {
+  key: string;
+  provider: string;
+  providerName: string;
+  model: string;
+  context?: number;
+  tools: boolean;
+  vision: boolean;
+  json: boolean;
+  probed: boolean;
+  free: boolean;
+  freeTier: boolean;
+  latency?: number;
+  status: HealthStatus;
+  /** feed 新加、还在 canary 里 */
+  candidate: boolean;
+  canary: number;
+}
+
+const toneOf = (s: HealthStatus): 'ok' | 'warn' | 'bad' | 'idle' => {
+  if (s === 'healthy') return 'ok';
+  if (s === 'degraded' || s === 'cooling' || s === 'probing') return 'warn';
+  if (s === 'unavailable' || s === 'error') return 'bad';
+  return 'idle';
+};
+
+const labelOf = (s: HealthStatus) => {
+  switch (s) {
+    case 'healthy':
+      return { zh: '可用', en: 'ready' };
+    case 'degraded':
+      return { zh: '降级', en: 'degraded' };
+    case 'cooling':
+      return { zh: '冷却', en: 'cooling' };
+    case 'unavailable':
+      return { zh: '不可用', en: 'down' };
+    case 'probing':
+      return { zh: '探测中', en: 'probing' };
+    case 'error':
+      return { zh: '异常', en: 'error' };
+    default:
+      return { zh: '未测', en: 'untested' };
+  }
+};
+
+/** 能力徽章：hover 显示含义与实测结论 */
+function CapBadge({
+  k,
+  zh,
+  en,
+  on,
+  lang,
+}: {
+  k: string;
+  zh: string;
+  en: string;
+  on: boolean;
+  lang: 'zh' | 'en';
+}) {
+  return (
+    <i
+      className={on ? 'on' : ''}
+      data-tip={tx(
+        lang,
+        `${zh}（${k}）· ${on ? '支持' : '不支持'}`,
+        `${en} (${k}) · ${on ? 'yes' : 'no'}`,
+      )}
+    >
+      {k}
+    </i>
+  );
+}
 
 export function Models() {
+  const lang = useLang();
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [onlyReady, setOnlyReady] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
   const { setPage } = useApp();
+  const { models, providers, probeFailed, probeModel } = useGateway();
+
+  const rows = useMemo<Row[]>(() => {
+    const names = new Map(providers.map((p) => [p.id, p]));
+    return models
+      .filter((m: GwModel) => m.freeport?.upstreamModel)
+      .map((m) => {
+        const provider = m.freeport?.provider ?? m.owned_by;
+        const p = names.get(provider);
+        const caps = m.freeport?.caps;
+        return {
+          key: m.id,
+          provider,
+          providerName: p?.name ?? provider,
+          model: m.freeport?.upstreamModel ?? m.id,
+          context: m.context_length,
+          tools: caps?.tools === true,
+          vision: caps?.vision === true,
+          json: caps?.json === true,
+          probed: m.freeport?.capsProbed === true,
+          free: m.freeport?.free === true,
+          freeTier: p?.freeTier === true,
+          latency: m.freeport?.latencyMs,
+          status: (m.freeport?.health as HealthStatus) ?? 'unknown',
+          candidate: m.freeport?.candidate === true,
+          canary: m.freeport?.canary ?? 0,
+        };
+      });
+  }, [models, providers]);
 
   const list = useMemo(() => {
-    let r = allModels;
+    let r = rows;
     if (q.trim()) {
       const s = q.toLowerCase();
-      r = r.filter((m) => m.id.toLowerCase().includes(s) || m.provider.includes(s));
+      r = r.filter(
+        (m) =>
+          m.model.toLowerCase().includes(s) ||
+          m.providerName.toLowerCase().includes(s) ||
+          m.provider.includes(s),
+      );
     }
-    if (filter === 'tools') r = r.filter((m) => m.caps.tools);
-    if (filter === 'vision') r = r.filter((m) => m.caps.vision);
-    if (filter === 'json') r = r.filter((m) => m.caps.json);
-    if (filter === 'cooling') r = r.filter((m) => m.status !== 'healthy');
+    if (filter === 'free') r = r.filter((m) => m.free);
+    if (filter === 'tools') r = r.filter((m) => m.tools);
+    if (filter === 'vision') r = r.filter((m) => m.vision);
+    if (filter === 'issues') r = r.filter((m) => !['healthy', 'unknown'].includes(m.status));
     if (onlyReady) r = r.filter((m) => m.status === 'healthy');
-    return r;
-  }, [q, filter, onlyReady]);
+    return [...r].sort((a, b) => {
+      const rank = (m: Row) => (m.status === 'healthy' ? 0 : m.status === 'unknown' ? 1 : 2);
+      return rank(a) - rank(b) || a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model);
+    });
+  }, [rows, q, filter, onlyReady]);
 
   const count = (f: Filter) => {
-    if (f === 'all') return allModels.length;
-    if (f === 'tools') return allModels.filter((m) => m.caps.tools).length;
-    if (f === 'vision') return allModels.filter((m) => m.caps.vision).length;
-    if (f === 'json') return allModels.filter((m) => m.caps.json).length;
-    return allModels.filter((m) => m.status !== 'healthy').length;
+    if (f === 'all') return rows.length;
+    if (f === 'free') return rows.filter((m) => m.free).length;
+    if (f === 'tools') return rows.filter((m) => m.tools).length;
+    if (f === 'vision') return rows.filter((m) => m.vision).length;
+    return rows.filter((m) => !['healthy', 'unknown'].includes(m.status)).length;
+  };
+
+  const reProbe = async () => {
+    setBusy('failed');
+    try {
+      const r = await probeFailed();
+      toast(
+        r.skipped
+          ? `${r.skipped} / ${r.skipped}`
+          : `重探 ${r.ran} 个 · 恢复 ${r.ok} / 仍失败 ${r.failed}`,
+      );
+    } catch (e) {
+      toast(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const probeOne = async (row: Row) => {
+    setBusy(row.key);
+    try {
+      const r = await probeModel(row.provider, row.model, false);
+      toast(
+        r.ok
+          ? `${row.model} · ${r.latencyMs}ms`
+          : `${row.model} 失败：${r.error ?? r.status}`,
+      );
+    } catch (e) {
+      toast(String(e));
+    } finally {
+      setBusy(null);
+    }
   };
 
   return (
@@ -44,13 +190,13 @@ export function Models() {
           </h1>
           <p>
             <T
-              zh="目录里所有模型。能力标签来自实测探针，不是厂商自称。"
-              en="Every model in the catalog. Capability tags come from live probes, not vendor claims."
+              zh="目录里所有可用模型。能力徽章来自实测探针，不是厂商自称。"
+              en="Every model you can route to. Capability badges come from live probes, not vendor claims."
             />
           </p>
         </div>
         <div className="head-actions">
-          <button className="btn ghost" onClick={() => toast('已开始重探 3 个异常模型 / Re-probing 3 models')}>
+          <button className="btn ghost" onClick={reProbe} disabled={busy !== null}>
             <RefreshCw />
             <T zh="重探异常" en="Re-probe" />
           </button>
@@ -74,6 +220,10 @@ export function Models() {
           <T zh="全部" en="All" />
           <span className="n">{count('all')}</span>
         </button>
+        <button className={`filter ${filter === 'free' ? 'on' : ''}`} onClick={() => setFilter('free')}>
+          <T zh="免费" en="Free" />
+          <span className="n">{count('free')}</span>
+        </button>
         <button className={`filter ${filter === 'tools' ? 'on' : ''}`} onClick={() => setFilter('tools')}>
           <T zh="工具" en="Tools" />
           <span className="n">{count('tools')}</span>
@@ -82,50 +232,123 @@ export function Models() {
           <T zh="视觉" en="Vision" />
           <span className="n">{count('vision')}</span>
         </button>
-        <button className={`filter ${filter === 'json' ? 'on' : ''}`} onClick={() => setFilter('json')}>
-          JSON
-          <span className="n">{count('json')}</span>
-        </button>
-        <button className={`filter ${filter === 'cooling' ? 'on' : ''}`} onClick={() => setFilter('cooling')}>
+        <button className={`filter ${filter === 'issues' ? 'on' : ''}`} onClick={() => setFilter('issues')}>
           <T zh="异常" en="Issues" />
-          <span className="n">{count('cooling')}</span>
+          <span className="n">{count('issues')}</span>
         </button>
         <div className="spacer" />
         <Switch on={onlyReady} onChange={setOnlyReady} label={<T zh="只看可用" en="Ready only" />} />
-        <button className="icon-btn" title="列设置">
-          <SlidersHorizontal />
-        </button>
       </div>
 
       <div className="card">
         <table>
           <thead>
             <tr>
-              <th>MODEL</th>
-              <th style={{ width: 120 }}>PROVIDER</th>
+              <th>
+                <T zh="模型" en="MODEL" />
+              </th>
+              <th style={{ width: 120 }}>
+                <T zh="厂商" en="PROVIDER" />
+              </th>
               <th style={{ width: 80 }} className="right">
-                CONTEXT
+                <T zh="上下文" en="CONTEXT" />
               </th>
               <th style={{ width: 92 }}>
                 <T zh="能力" en="CAPS" />
               </th>
               <th style={{ width: 78 }} className="right">
-                TTFB
+                <T zh="首字延迟" en="TTFB" />
               </th>
-              <th style={{ width: 118 }}>
-                <T zh="可靠性" en="RELIABILITY" />
-              </th>
-              <th style={{ width: 86 }}>
-                <T zh="额度" en="QUOTA" />
+              <th style={{ width: 88 }}>
+                <T zh="价格" en="PRICE" />
               </th>
               <th style={{ width: 96 }}>
                 <T zh="状态" en="STATUS" />
+              </th>
+              <th style={{ width: 64 }} className="right">
+                <T zh="操作" en="PROBE" />
               </th>
             </tr>
           </thead>
           <tbody>
             {list.map((m) => (
-              <Row key={m.id} m={m} />
+              <tr key={m.key}>
+                <td>
+                  <div className="t-main">
+                    {m.model}
+                    {m.candidate && (
+                      <span className="badge warn canary-badge" title="feed 新模型：0.3 倍权重，跑满 20 次成功转正">
+                        canary {Math.min(m.canary, 20)}/20
+                      </span>
+                    )}
+                  </div>
+                  <div className="t-sub">
+                    {m.probed ? (
+                      <T zh="能力已实测" en="caps probed" />
+                    ) : (
+                      <T zh="能力来自目录声明" en="caps from catalog" />
+                    )}
+                  </div>
+                </td>
+                <td className="num">{m.providerName}</td>
+                <td className="num right">{m.context ? fmt.ctx(m.context) : '—'}</td>
+                <td>
+                  <div className="cap">
+                    <CapBadge
+                      k="T"
+                      zh="工具调用"
+                      en="Tools"
+                      on={m.tools}
+                      lang={lang}
+                    />
+                    <CapBadge
+                      k="V"
+                      zh="视觉"
+                      en="Vision"
+                      on={m.vision}
+                      lang={lang}
+                    />
+                    <CapBadge
+                      k="J"
+                      zh="JSON 模式"
+                      en="JSON mode"
+                      on={m.json}
+                      lang={lang}
+                    />
+                  </div>
+                </td>
+                <td className="num right">{fmt.ms(m.latency ?? null)}</td>
+                <td>
+                  {m.free ? (
+                    <span className="badge ok">
+                      <T zh="零价" en="free" />
+                    </span>
+                  ) : m.freeTier ? (
+                    <span className="badge accent">
+                      <T zh="额度" en="quota" />
+                    </span>
+                  ) : (
+                    <span className="badge gray">
+                      <T zh="计费" en="paid" />
+                    </span>
+                  )}
+                </td>
+                <td>
+                  <Status tone={toneOf(m.status)}>
+                    <T zh={labelOf(m.status).zh} en={labelOf(m.status).en} />
+                  </Status>
+                </td>
+                <td className="right">
+                  <button
+                    className="icon-btn"
+                    title="探测这一条 / Probe this model"
+                    disabled={busy !== null}
+                    onClick={() => probeOne(m)}
+                  >
+                    {busy === m.key ? <RefreshCw className="spin" /> : <Activity />}
+                  </button>
+                </td>
+              </tr>
             ))}
             {list.length === 0 && (
               <tr>
@@ -133,7 +356,14 @@ export function Models() {
                   <div className="empty">
                     <Search />
                     <p>
-                      <T zh="没有匹配的模型" en="No models match" />
+                      {rows.length === 0 ? (
+                        <T
+                          zh="还没有接入任何厂商。先去「厂商」页填一个 API Key，模型会自动出现。"
+                          en="No providers yet. Add an API key on the Providers page and models show up here."
+                        />
+                      ) : (
+                        <T zh="没有匹配的模型" en="No models match" />
+                      )}
                     </p>
                   </div>
                 </td>
@@ -150,50 +380,5 @@ export function Models() {
         />
       </div>
     </>
-  );
-}
-
-function Row({ m }: { m: Model }) {
-  return (
-    <tr>
-      <td>
-        <div className="t-main">{m.name}</div>
-        <div className="t-sub">
-          {m.meta ?? <T zh="免费额度" en="free tier" />}
-        </div>
-      </td>
-      <td className="num">{m.provider}</td>
-      <td className="num right">{fmt.ctx(m.ctx)}</td>
-      <td>
-        <div className="cap">
-          <i className={m.caps.tools ? 'on' : ''}>T</i>
-          <i className={m.caps.vision ? 'on' : ''}>V</i>
-          <i className={m.caps.json ? 'on' : ''}>J</i>
-        </div>
-      </td>
-      <td className="num right">{fmt.ms(m.latency)}</td>
-      <td>
-        <span className="mini-track">
-          <i
-            className={m.reliability < 0.85 ? 'bad' : m.reliability < 0.92 ? 'warn' : ''}
-            style={{ width: `${m.reliability * 100}%` }}
-          />
-        </span>
-        <span className="num" style={{ marginLeft: 6 }}>
-          {fmt.pct(m.reliability)}
-        </span>
-      </td>
-      <td>
-        <span className="mini-track">
-          <i className={m.quota > 0.7 ? 'warn' : ''} style={{ width: `${m.quota * 100}%` }} />
-        </span>
-        <div className="t-sub">{fmt.pct(m.quota)}</div>
-      </td>
-      <td>
-        {m.status === 'healthy' && <Status tone="ok"><T zh="可用" en="ready" /></Status>}
-        {m.status === 'cooling' && <Status tone="warn"><T zh="冷却" en="cooling" /></Status>}
-        {m.status === 'degraded' && <Status tone="bad"><T zh="降级" en="degraded" /></Status>}
-      </td>
-    </tr>
   );
 }

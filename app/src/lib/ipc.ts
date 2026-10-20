@@ -9,13 +9,30 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 import type {
+  AgentDiffLine,
+  AgentInfo,
   FreeportBridge,
+  GwCatalog,
+  GwFeed,
+  GwKey,
+  GwLoginStart,
+  GwLoginState,
   GwLog,
+  GwLicense,
   GwModel,
+  GwModelProbe,
+  GwPatrol,
   GwProvider,
+  GwQuota,
+  GwRoute,
   GwRouting,
   GwStatus,
+  ImportSummary,
+  KeyCreated,
+  PatrolReport,
+  ProjectInjection,
   ProviderPreset,
+  UpdateCheck,
 } from './bridge';
 
 export function isTauri(): boolean {
@@ -41,6 +58,9 @@ export function installTauriBridge(): boolean {
 
     app: {
       info: () => invoke<Record<string, unknown>>('app_info'),
+      checkUpdate: () => invoke<UpdateCheck>('check_update'),
+      diagnostics: () => invoke<Record<string, unknown>>('gw_diagnostics'),
+      saveDiagnostics: () => invoke<string | null>('gw_save_diagnostics'),
     },
 
     win: {
@@ -52,10 +72,13 @@ export function installTauriBridge(): boolean {
 
     gateway: {
       status: () => invoke<GwStatus>('gw_status'),
+      pause: (paused) => invoke<GwStatus>('gw_pause', { paused }),
       logs: () => invoke<GwLog[]>('gw_logs'),
       providers: () => invoke<GwProvider[]>('gw_providers'),
       models: () => invoke<GwModel[]>('gw_models'),
       routing: () => invoke<GwRouting | null>('gw_routing'),
+      route: (model, session) =>
+        invoke<GwRoute>('gw_route', { model: model ?? 'auto', session: session ?? '' }),
       presets: () => invoke<ProviderPreset[]>('gw_presets'),
 
       addProvider: (payload) =>
@@ -66,9 +89,69 @@ export function installTauriBridge(): boolean {
         invoke<{ ok: boolean; models?: number; latencyMs?: number; error?: string }>('gw_probe', { id }),
       revealKey: (id) => invoke<string>('gw_reveal_key', { id }),
 
+      addAccount: (input) => invoke<GwProvider[]>('gw_add_account', { input }),
+      loginStart: (providerId) => invoke<GwLoginStart>('gw_login_start', { providerId }),
+      loginPoll: (loginId) => invoke<GwLoginState>('gw_login_poll', { loginId }),
+      addCookieAccount: (providerId, name, cookie) =>
+        invoke<GwProvider[]>('gw_add_cookie_account', { providerId, name, cookie }),
+      setAccountCookie: (providerId, accountId, cookie) =>
+        invoke<GwProvider[]>('gw_set_account_cookie', { providerId, accountId, cookie }),
+      removeAccount: (providerId, accountId) =>
+        invoke<GwProvider[]>('gw_remove_account', { providerId, accountId }),
+      patchAccount: (providerId, accountId, patch) =>
+        invoke<GwProvider[]>('gw_patch_account', { providerId, accountId, patch }),
+      probeAccount: (providerId, accountId) =>
+        invoke<{ ok: boolean; models?: number; latencyMs?: number; error?: string }>(
+          'gw_probe_account',
+          { id: providerId, accountId },
+        ),
+
+      exportBundle: (passphrase) => invoke<string>('gw_export_bundle', { passphrase }),
+      exportBundleFile: (passphrase) =>
+        invoke<string | null>('gw_export_bundle_file', { passphrase }),
+      importBundleFile: (passphrase, mode) =>
+        invoke<ImportSummary | null>('gw_import_bundle_file', { passphrase, mode }),
+      importBundle: (blob, passphrase, mode) =>
+        invoke<ImportSummary>('gw_import_bundle', { blob, passphrase, mode }),
+
+      license: () => invoke<GwLicense>('gw_license'),
+      activateLicense: (token) => invoke<GwLicense>('gw_activate_license', { token }),
+      clearLicense: () => invoke<GwLicense>('gw_clear_license'),
+
       setRouting: (patch) => invoke<GwRouting>('gw_set_routing', { patch }),
       clearCooldowns: () => invoke<boolean>('gw_clear_cooldowns'),
       setConfig: (patch) => invoke<GwStatus>('gw_set_config', { patch }),
+
+      catalog: () => invoke<GwCatalog>('gw_catalog'),
+      catalogRefresh: () => invoke<GwCatalog>('gw_catalog_refresh'),
+      probeModel: (provider, model, deep) =>
+        invoke<GwModelProbe>('gw_probe_model', { provider, model, deep: deep ?? false }),
+      probeFailed: () => invoke<PatrolReport>('gw_probe_failed'),
+      patrol: () => invoke<GwPatrol>('gw_patrol'),
+      patrolPass: (all) => invoke<PatrolReport>('gw_patrol_pass', { all: all ?? false }),
+      setPatrol: (patch) => invoke<GwPatrol>('gw_set_patrol', { patch }),
+
+      feed: () => invoke<GwFeed>('gw_feed'),
+      setFeed: (patch) => invoke<GwFeed>('gw_set_feed', { patch }),
+      feedCheck: () => invoke<GwFeed>('gw_feed_check', { manual: true }),
+      feedApply: () => invoke<GwFeed>('gw_feed_apply'),
+
+      quota: () => invoke<GwQuota[]>('gw_quota'),
+      keys: () => invoke<GwKey[]>('gw_keys'),
+      createKey: (input) => invoke<KeyCreated>('gw_create_key', { input }),
+      deleteKey: (id) => invoke<GwKey[]>('gw_delete_key', { id }),
+      toggleKey: (id, enabled) => invoke<GwKey[]>('gw_toggle_key', { id, enabled }),
+
+      agents: () => invoke<AgentInfo[]>('gw_agents'),
+      agentPreview: (id) => invoke<AgentDiffLine[]>('gw_agent_preview', { id }),
+      agentApply: (id) => invoke<AgentInfo>('gw_agent_apply', { id }),
+      agentRevert: (id) => invoke<AgentInfo>('gw_agent_revert', { id }),
+
+      agentProjectList: (root) => invoke<ProjectInjection[]>('gw_agent_project_list', { root }),
+      agentProjectPreview: (id, root) =>
+        invoke<AgentDiffLine[]>('gw_agent_project_preview', { id, root }),
+      agentProjectApply: (id, root) => invoke<AgentInfo>('gw_agent_project_apply', { id, root }),
+      agentProjectRevert: (id, root) => invoke<AgentInfo>('gw_agent_project_revert', { id, root }),
 
       onLog: (cb) => {
         let dispose: (() => void) | null = null;
@@ -92,3 +175,14 @@ export function installTauriBridge(): boolean {
   window.freeport = bridge;
   return true;
 }
+
+/**
+ * 模块加载即装桥，不等调用方。
+ *
+ * 为什么必须自举：`gateway.ts` 的 store 在**模块求值那一刻**就读
+ * `window.freeport` 判断「有没有桌面端」。ESM 的求值顺序跟着 import 走，
+ * 只要有任何模块比安装动作先求值，桌面端就会把自己当成浏览器：
+ * 界面照着兜底数据渲染，网关明明在跑也显示「未启动」。这种错不抛异常，
+ * 只是安静地显示错的东西，最难查。
+ */
+installTauriBridge();

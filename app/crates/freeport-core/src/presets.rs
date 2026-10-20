@@ -32,7 +32,12 @@ const PRESETS: &[(&str, &str, &str, &str, &str, &str)] = &[
     p("cerebras", "Cerebras", "https://api.cerebras.ai/v1", "A", "https://cloud.cerebras.ai", "推理极快，日额度有限"),
     p("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "A", "https://openrouter.ai/keys", "带 :free 后缀的模型价格全 0"),
     p("mistral", "Mistral", "https://api.mistral.ai/v1", "A", "https://console.mistral.ai/api-keys", "免费档含 codestral"),
-    p("nvidia", "NVIDIA NIM", "https://integrate.api.nvidia.com/v1", "A", "https://build.nvidia.com", "免费 1000 credits"),
+    // 不写具体额度数字：额度随时会变，写死在预设里就成了「界面上的假数据」
+    p("nvidia", "NVIDIA NIM", "https://integrate.api.nvidia.com/v1", "A", "https://build.nvidia.com", "有免费额度，具体以官网为准"),
+    // Tier C：不用填 key，点「登录」走设备码授权，凭据就是你自己账号的订阅
+    p("copilot", "GitHub Copilot", "https://api.githubcopilot.com", "C", "https://github.com/features/copilot", "用自己的 GitHub 账号登录，免填 key"),
+    // Cookie 形态的唯一试点：只有它允许「粘贴 web 会话」而不填 key
+    p("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", "C", "https://opencode.ai/auth", "官方免费模型池，可填 key 也可用 web 会话"),
     p("custom", "自定义", "", "C", "", "任意 OpenAI 兼容端点（含本地 chat2api / Ollama 代理）"),
 ];
 

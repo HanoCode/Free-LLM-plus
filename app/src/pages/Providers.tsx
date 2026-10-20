@@ -1,22 +1,21 @@
 import { useState } from 'react';
-import { ExternalLink, Plus, RefreshCw, ShieldAlert, Trash2 } from 'lucide-react';
+import { ExternalLink, Plus, RefreshCw, ShieldAlert, Trash2, Unplug } from 'lucide-react';
 import { T } from '../lib/i18n';
-import { providers as mockProviders, type Provider } from '../lib/data';
-import { Badge, Status, toast } from '../components/ui';
+import { Badge, Empty, Status, toast } from '../components/ui';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
 import type { GwProvider, ProviderPreset } from '../lib/bridge';
 
 export function Providers() {
   const { setPage } = useApp();
-  const desktop = useGateway((s) => s.available);
+  const online = useGateway((s) => s.available);
   const real = useGateway((s) => s.providers);
   const presets = useGateway((s) => s.presets);
   const removeProvider = useGateway((s) => s.removeProvider);
   const probe = useGateway((s) => s.probe);
   const [target, setTarget] = useState<ProviderPreset | null>(null);
 
-  if (!desktop) return <BrowserFallback onDiscover={() => setPage('discover')} />;
+  if (!online) return <NoGateway onDiscover={() => setPage('discover')} />;
 
   const used = new Set(real.map((p) => p.id));
   const available = presets.filter((p) => !used.has(p.id));
@@ -385,8 +384,10 @@ function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: (
   );
 }
 
-/* ── 浏览器预览兜底 ─────────────────────────── */
-function BrowserFallback({ onDiscover }: { onDiscover: () => void }) {
+/* ── 没有网关时：如实说没有 ─────────────────────
+   这里原来摆了一排带延迟数字的假厂商卡片，纯粹为了让浏览器预览好看。
+   代价是用户分不清哪条是真实连接——现在只留空态。 */
+function NoGateway({ onDiscover }: { onDiscover: () => void }) {
   return (
     <>
       <div className="page-head">
@@ -395,52 +396,31 @@ function BrowserFallback({ onDiscover }: { onDiscover: () => void }) {
             <T zh="厂商" en="Providers" />
           </h1>
           <p>
-            <T zh="当前是浏览器预览，接入需在桌面端。" en="Browser preview — connecting requires the desktop app." />
+            <T
+              zh="厂商列表来自本机网关的配置文件与实时探测结果，不在前端存一份。"
+              en="The provider list comes from the local gateway's config and live probes — the UI keeps no copy."
+            />
           </p>
         </div>
-        <div className="head-actions">
+      </div>
+
+      <div className="card">
+        <Empty
+          icon={<Unplug />}
+          title={<T zh="没有连接到网关" en="No gateway connection" />}
+          hint={
+            <T
+              zh="这张列表只显示真实接入的厂商，所以现在一条都没有。桌面版启动时会自动把网关拉起来（127.0.0.1:8787）；如果你是在浏览器里打开的这个页面，那是开发预览，它连不上本机进程。"
+              en="This list only shows providers that are really connected, so it is empty. The desktop build starts the gateway on launch (127.0.0.1:8787); if you opened this page in a browser, that is a dev preview and it cannot reach the local process."
+            />
+          }
+        />
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'center', paddingBottom: 22 }}>
           <button className="btn ghost" onClick={onDiscover}>
-            <RefreshCw />
-            <T zh="发现更多" en="Discover" />
+            <T zh="看目录里有哪些免费厂商" en="Browse free providers" />
           </button>
         </div>
       </div>
-      <div className="pgrid">
-        {mockProviders.map((p) => (
-          <MockCard key={p.id} p={p} />
-        ))}
-      </div>
     </>
-  );
-}
-
-function MockCard({ p }: { p: Provider }) {
-  return (
-    <div className="card pcard">
-      <div className="pcard-top">
-        <div className="plogo">{p.short}</div>
-        <div style={{ minWidth: 0 }}>
-          <h4>{p.name}</h4>
-          <div className="meta">{p.note ?? p.homepage}</div>
-        </div>
-        <span style={{ marginLeft: 'auto' }}>
-          <Badge tone={p.tier === 'A' ? 'ok' : 'warn'}>Tier {p.tier}</Badge>
-        </span>
-      </div>
-      <div className="pcard-stats">
-        <div>
-          <b>{p.models || '—'}</b>
-          <span>MODELS</span>
-        </div>
-        <div>
-          <b>{p.latency ? `${p.latency}ms` : '—'}</b>
-          <span>TTFB</span>
-        </div>
-        <div>
-          <b>KEY</b>
-          <span>AUTH</span>
-        </div>
-      </div>
-    </div>
   );
 }

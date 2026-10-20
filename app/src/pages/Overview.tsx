@@ -1,13 +1,61 @@
-import { Activity, ArrowRight, Gauge, ShieldCheck, Zap } from 'lucide-react';
+import { Activity, ArrowRight, Gauge, Radar, ShieldCheck, Zap } from 'lucide-react';
 import { T } from '../lib/i18n';
 import { useApp } from '../lib/store';
+import { useGateway } from '../lib/gateway';
 import { Badge, CopyBtn, Status, fmt, toast } from '../components/ui';
-import { catalogEvents, logs, quotaWindows, traffic24h } from '../lib/data';
+import { QuotaPanel } from '../components/QuotaPanel';
+
+function hhmm(iso?: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function ago(iso?: string | null): string {
+  if (!iso) return '从未';
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '—';
+  const min = Math.round((Date.now() - t) / 60000);
+  if (min < 1) return '刚刚';
+  if (min < 60) return `${min} 分钟前`;
+  const h = Math.round(min / 60);
+  if (h < 24) return `${h} 小时前`;
+  return `${Math.round(h / 24)} 天前`;
+}
 
 export function Overview() {
   const { setPage } = useApp();
-  const max = Math.max(...traffic24h);
-  const peak = traffic24h.indexOf(max);
+  const { status, providers, models, logs, patrol, quota, runPatrol } = useGateway();
+
+  const connected = providers.filter((p) => p.hasKey);
+  // 凭据是真正的记账单位：同一家两把 key 算两条通道
+  const credentials = providers.reduce(
+    (n, p) => n + p.accounts.filter((a) => a.hasKey).length,
+    0,
+  );
+  const rows = models.filter((m) => m.freeport?.upstreamModel);
+  const ready = rows.filter((m) => m.freeport?.health === 'healthy').length;
+  const addr = `http://${status?.bind ?? '127.0.0.1'}:${status?.port ?? 8787}/v1`;
+
+  const requests = status?.requests24h ?? 0;
+  const tokens = (status?.tokensIn ?? 0) + (status?.tokensOut ?? 0);
+  const errors = status?.errors ?? 0;
+  // 没有任何请求时成功率是「没有数据」，不是 100%——分母为 0 就别编一个好看的数
+  const success = requests > 0 ? 1 - errors / requests : null;
+
+  const probe = async (all: boolean) => {
+    try {
+      const r = await runPatrol(all);
+      toast(
+        r.skipped
+          ? r.skipped
+          : `巡检完成：探了 ${r.ran} 个 · 成功 ${r.ok} · 失败 ${r.failed}`,
+      );
+    } catch (e) {
+      toast(String(e));
+    }
+  };
 
   return (
     <>
@@ -17,36 +65,47 @@ export function Overview() {
         </div>
         <div>
           <h2>
-            <T zh="网关运行中 · 一切正常" en="Gateway healthy" />
+            {status?.running ? (
+              <T zh="网关运行中" en="Gateway running" />
+            ) : (
+              <T zh="网关未运行" en="Gateway stopped" />
+            )}
           </h2>
           <p>
-            <T
-              zh="11 个厂商、14 个模型可用；最近一次全量审计 8 小时前。"
-              en="11 providers, 14 models ready. Last full audit 8h ago."
-            />
+            {connected.length > 0 ? (
+              <T
+                zh={`${connected.length} 个厂商、${credentials} 条凭据、${rows.length} 个模型；上次全量体检 ${ago(patrol?.lastSweepAt)}。`}
+                en={`${connected.length} providers, ${credentials} credentials, ${rows.length} models. Last full audit ${ago(patrol?.lastSweepAt)}.`}
+              />
+            ) : (
+              <T
+                zh="还没有接入厂商。先去「厂商」页填一个 API Key。"
+                en="No providers yet. Add an API key on the Providers page."
+              />
+            )}
           </p>
         </div>
         <div className="addr-pill">
-          <span>http://127.0.0.1:8787/v1</span>
-          <CopyBtn value="http://127.0.0.1:8787/v1" label="" />
+          <span>{addr}</span>
+          <CopyBtn value={addr} label="" />
         </div>
         <div className="hero-stats">
           <div className="hero-stat">
-            <b>14</b>
+            <b>{ready}</b>
             <span>
               <T zh="可用模型" en="MODELS" />
             </span>
           </div>
           <div className="hero-stat">
-            <b>312ms</b>
+            <b>{rows.length}</b>
             <span>
-              <T zh="P50 首字节" en="P50 TTFB" />
+              <T zh="目录模型" en="LISTED" />
             </span>
           </div>
           <div className="hero-stat">
-            <b>4</b>
+            <b>{patrol?.dueNow ?? 0}</b>
             <span>
-              <T zh="已注入 Agent" en="AGENTS" />
+              <T zh="待巡检" en="DUE" />
             </span>
           </div>
         </div>
@@ -56,13 +115,11 @@ export function Overview() {
         <div className="card metric">
           <div className="k">
             <Activity size={12} />
-            <T zh="今日请求" en="Requests today" />
+            <T zh="累计请求" en="Requests" />
           </div>
-          <div className="v">
-            1,284 <span className="delta up">+12%</span>
-          </div>
+          <div className="v">{requests.toLocaleString()}</div>
           <div className="t-sub">
-            <T zh="昨日同期 1,146" en="1,146 yesterday" />
+            <T zh={`失败 ${errors} 次`} en={`${errors} failed`} />
           </div>
         </div>
         <div className="card metric">
@@ -71,141 +128,116 @@ export function Overview() {
             <T zh="Token 消耗" en="Tokens" />
           </div>
           <div className="v">
-            1.84M
+            {tokens > 1_000_000 ? `${(tokens / 1_000_000).toFixed(2)}M` : tokens.toLocaleString()}
             <small>
               <T zh="免费" en="free" />
             </small>
           </div>
           <div className="t-sub">
-            <T zh="折合 API 价约 ¥41" en="≈ $5.7 at list price" />
+            <T
+              zh={`入 ${status?.tokensIn.toLocaleString() ?? 0} · 出 ${status?.tokensOut.toLocaleString() ?? 0}`}
+              en={`in ${status?.tokensIn ?? 0} · out ${status?.tokensOut ?? 0}`}
+            />
           </div>
         </div>
         <div className="card metric">
           <div className="k">
             <Gauge size={12} />
-            <T zh="路由成功率" en="Success rate" />
+            <T zh="成功率" en="Success rate" />
           </div>
-          <div className="v">
-            97.4%
-            <span className="delta up">+0.6</span>
-          </div>
+          <div className="v">{success === null ? '—' : fmt.pct(success)}</div>
           <div className="t-sub">
-            <T zh="relay 2.6% · 主要 429" en="2.6% relayed · mostly 429" />
+            <T
+              zh={`冷却中 ${status?.cooldowns.length ?? 0} 条`}
+              en={`${status?.cooldowns.length ?? 0} cooling`}
+            />
           </div>
         </div>
         <div className="card metric">
           <div className="k">
-            <ArrowRight size={12} />
-            <T zh="平均跳数" en="Avg. hops" />
+            <Radar size={12} />
+            <T zh="探针预算" en="Probe budget" />
           </div>
           <div className="v">
-            1.18
-            <small>
-              <T zh="次/请求" en="per req" />
-            </small>
+            {patrol?.usedToday ?? 0}
+            <small>/ {patrol?.budgetToday ?? 0}</small>
           </div>
           <div className="t-sub">
-            <T zh="接力开销 340ms/日累计" en="340ms/day relay cost" />
+            <T
+              zh={`累计 ${patrol?.probesTotal ?? 0} 次 · 成功 ${patrol?.probesOk ?? 0}`}
+              en={`${patrol?.probesTotal ?? 0} total · ${patrol?.probesOk ?? 0} ok`}
+            />
           </div>
         </div>
       </div>
+
+      <QuotaPanel quota={quota} />
 
       <div className="card" style={{ marginBottom: 14 }}>
         <div className="card-head">
           <h3>
-            <T zh="今日变更" en="Changes today" />
+            <T zh="巡检" en="Patrol" />
           </h3>
           <span className="sub">
-            <T zh="昨天 03:00 审计 · 探针 137 / 300" en="audit 03:00 · probes 137 / 300" />
+            {patrol?.enabled ? (
+              <T
+                zh={`热 ${patrol.hotHours}h / 冷 ${patrol.coldHours}h · 每日 ${patrol.sweepAt} 全量`}
+                en={`hot ${patrol.hotHours}h / cold ${patrol.coldHours}h · full sweep ${patrol.sweepAt}`}
+              />
+            ) : (
+              <T zh="已关闭" en="disabled" />
+            )}
           </span>
           <button
             className="btn ghost sm"
-            style={{ marginLeft: 10 }}
-            onClick={() => toast('已暂停自动应用，等待确认 / Auto-apply paused')}
+            style={{ marginLeft: 'auto' }}
+            onClick={() => void probe(false)}
+            disabled={(patrol?.remaining ?? 0) === 0}
           >
-            <T zh="暂停自动应用" en="Pause auto-apply" />
+            <T zh="立即巡检" en="Run now" />
           </button>
-          <button className="btn ghost sm" onClick={() => setPage('discover')}>
-            <T zh="全部" en="All" />
+          <button className="btn ghost sm" onClick={() => void probe(true)}>
+            <T zh="全量体检" en="Full sweep" />
+          </button>
+          <button className="btn ghost sm" onClick={() => setPage('settings')}>
+            <T zh="设置" en="Settings" />
             <ArrowRight size={12} />
           </button>
         </div>
-        {catalogEvents.map((e, i) => (
-          <div className="ev-row" key={i}>
-            <div className={`ev-ico ${e.kind}`}>
-              {e.kind === 'add' ? '+3' : e.kind === 'del' ? '−1' : e.kind === 'back' ? '↺' : '%'}
-            </div>
-            <div className="ev-body">
-              <div className="ev-t">
-                <T zh={e.label_zh} en={e.label_en} />
-              </div>
-              <div className="ev-s">{e.detail}</div>
-            </div>
-            <Badge tone={e.badge.tone as 'ok'}>
-              <T zh={e.badge.zh} en={e.badge.en} />
+        <div className="src-row">
+          <span className="nm">
+            <T zh="到期队列" en="Queue" />
+          </span>
+          <span className="meta">
+            <T
+              zh={`${patrol?.dueNow ?? 0} 个模型到期，今日还剩 ${patrol?.remaining ?? 0} 次预算`}
+              en={`${patrol?.dueNow ?? 0} models due, ${patrol?.remaining ?? 0} probes left today`}
+            />
+          </span>
+          <span className="right">
+            <Badge tone={(patrol?.remaining ?? 0) > 0 ? 'ok' : 'warn'}>
+              {patrol?.usedToday ?? 0} / {patrol?.budgetToday ?? 0}
             </Badge>
-            <span className="ev-time">{e.time}</span>
-          </div>
-        ))}
-      </div>
-
-      <div className="cols-2">
-        <div className="card">
-          <div className="card-head">
-            <h3>
-              <T zh="请求量 · 最近 24 小时" en="Requests · last 24h" />
-            </h3>
-            <span className="sub">
-              <T zh="峰值 11:00 · 52 次/30min" en="peak 11:00 · 52 per 30m" />
-            </span>
-          </div>
-          <div className="card-body">
-            <div className="chart">
-              {traffic24h.map((v, i) => (
-                <div
-                  key={i}
-                  className={`bar ${i === peak ? 'hi' : ''}`}
-                  style={{ height: `${(v / max) * 100}%` }}
-                  title={`${v} req`}
-                />
-              ))}
-            </div>
-            <div className="chart-x">
-              <span>00:00</span>
-              <span>06:00</span>
-              <span>12:00</span>
-              <span>18:00</span>
-              <span>now</span>
-            </div>
-          </div>
+            <span className="ev-time">{hhmm(patrol?.lastRunAt)}</span>
+          </span>
         </div>
-
-        <div className="card">
-          <div className="card-head">
-            <h3>
-              <T zh="额度余量" en="Quota headroom" />
-            </h3>
-            <span className="sub">
-              <T zh="最低四窗口" en="lowest window" />
-            </span>
-          </div>
-          <div className="card-body">
-            {quotaWindows.map((q) => (
-              <div className="quota-row" key={q.name}>
-                <span className="nm">{q.name}</span>
-                <div className="track">
-                  <i className={q.pct > 0.7 ? 'warn' : ''} style={{ width: `${q.pct * 100}%` }} />
-                </div>
-                <span className="pc">{fmt.pct(q.pct)}</span>
-              </div>
-            ))}
-            <div className="hint-line">
-              <T
-                zh="余量低于 20% 开始线性降权，不会被直接判死。"
-                en="Below 20% a model is down-weighted linearly, never killed."
-              />
-            </div>
-          </div>
+        <div className="src-row">
+          <span className="nm">
+            <T zh="让路规则" en="Yielding" />
+          </span>
+          <span className="meta">
+            <T
+              zh="有真实请求在途时巡检暂停；预算按日配额 1% 计算，下限 60 上限 800"
+              en="Patrol pauses while real requests are in flight; budget is 1% of daily quota, clamped to 60–800"
+            />
+          </span>
+          <span className="right">
+            <Status tone={(patrol?.inflight ?? 0) > 0 ? 'warn' : 'ok'}>
+              {(patrol?.inflight ?? 0) > 0
+                ? `${patrol?.inflight} 个请求在途`
+                : 'idle'}
+            </Status>
+          </span>
         </div>
       </div>
 
@@ -219,6 +251,7 @@ export function Overview() {
           </span>
           <button className="btn ghost sm" style={{ marginLeft: 'auto' }} onClick={() => setPage('logs')}>
             <T zh="查看全部" en="View all" />
+            <ArrowRight size={12} />
           </button>
         </div>
         <table>
@@ -241,29 +274,48 @@ export function Overview() {
             </tr>
           </thead>
           <tbody>
-            {logs.slice(0, 5).map((l) => (
+            {logs.slice(0, 6).map((l) => (
               <tr key={l.id} className="log-row" onClick={() => setPage('logs')}>
-                <td className="num">{l.time}</td>
+                <td className="num">{hhmm(l.at)}</td>
                 <td>
-                  <div className="t-main">{l.model}</div>
+                  <div className="t-main">{l.model ?? l.requestedModel}</div>
                   <div className="t-sub">
-                    {l.hops.length > 1 ? (
-                      <T zh={`${l.hops.length} 跳接力`} en={`${l.hops.length} hops`} />
+                    {l.attempts.length > 1 ? (
+                      <T zh={`${l.attempts.length} 跳接力`} en={`${l.attempts.length} hops`} />
                     ) : (
                       <T zh="直连" en="direct" />
                     )}
                   </div>
                 </td>
-                <td className="num">{l.provider}</td>
+                <td className="num">{l.provider ?? '—'}</td>
                 <td>
-                  {l.status === 'ok' && <Status tone="ok">200</Status>}
-                  {l.status === 'retry' && <Status tone="warn">{l.code}</Status>}
-                  {l.status === 'fail' && <Status tone="bad">{l.code}</Status>}
+                  {l.ok ? (
+                    <Status tone="ok">{l.status}</Status>
+                  ) : (
+                    <Status tone="bad">{l.status || 'ERR'}</Status>
+                  )}
                 </td>
-                <td className="num right">{l.tokens.toLocaleString()}</td>
+                <td className="num right">
+                  {(l.usage?.total_tokens ?? 0).toLocaleString()}
+                </td>
                 <td className="num right">{fmt.ms(l.ms)}</td>
               </tr>
             ))}
+            {logs.length === 0 && (
+              <tr>
+                <td colSpan={6}>
+                  <div className="empty">
+                    <Activity />
+                    <p>
+                      <T
+                        zh="还没有请求。把 Agent 指向上面的地址，或直接 curl 一次。"
+                        en="No requests yet. Point an agent at the address above, or just curl it."
+                      />
+                    </p>
+                  </div>
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>

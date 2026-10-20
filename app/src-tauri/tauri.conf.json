@@ -33,20 +33,32 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "HanoCode",
+    "copyright": "© 2026 HanoCode and Freeport contributors · AGPL-3.0-or-later",
+    "category": "DeveloperTool",
+    "shortDescription": "Local gateway that unifies free LLM providers",
+    "longDescription": "Freeport discovers free model tiers you already have access to, routes requests across them with a three-stage gate, and injects the gateway into the coding agents you already use. Everything runs on 127.0.0.1: credentials are encrypted at rest, logs never leave the machine, and every injected file can be rolled back byte-for-byte.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
+      "icons/icon.ico",
       "icons/icon.png"
     ],
+    "resources": {
+      "../../docs/EULA.md": "EULA.md"
+    },
     "macOS": {
       "minimumSystemVersion": "12.0",
-      "hardenedRuntime": true
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.plist"
     },
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false
       }
     },
     "createUpdaterArtifacts": false

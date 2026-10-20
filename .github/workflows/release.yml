@@ -1,0 +1,234 @@
+name: Release
+
+# 发布流程（人只需要点两次）：
+#   1. 本地把版本号改好，打 tag：git tag v0.1.0 && git push origin v0.1.0
+#   2. 等 CI 产出 draft release → 下载产物在干净机器上装一次 → 手动 publish
+#
+# 签名相关的东西全部走 secrets，缺哪一项就跳过哪一项，绝不假装签名过。
+# 没有配置证书时产出的包是未签名包：mac 会被 Gatekeeper 拦（右键打开可绕过），
+# windows 会出 SmartScreen 提示。release 正文里会如实写清楚。
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（例如 v0.1.0）'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: tag 必须与 Cargo 版本一致
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          ver="${tag#v}"
+          cargo_ver=$(grep -m1 '^version' app/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          pkg_ver=$(node -p "require('./app/package.json').version")
+          echo "tag=$ver cargo=$cargo_ver package=$pkg_ver"
+          [ "$ver" = "$cargo_ver" ] || { echo "::error::tag 与 app/Cargo.toml 版本不一致"; exit 1; }
+          [ "$ver" = "$pkg_ver" ] || { echo "::error::tag 与 app/package.json 版本不一致"; exit 1; }
+
+      - name: 安装前端依赖
+        working-directory: app
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: 发布前必须全绿
+        working-directory: app
+        run: |
+          npm run typecheck
+          cargo test --workspace
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset_glob: 'app/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg'
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset_glob: 'app/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg'
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_glob: 'app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+          key: ${{ matrix.target }}
+
+      - name: 安装前端依赖
+        working-directory: app
+        run: npm ci
+
+      # 只有配了更新公钥才开启升级产物；否则会生成一个谁都验不过的 latest.json
+      - name: 决定是否带更新通道
+        id: updater
+        shell: bash
+        env:
+          PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          args="--target ${{ matrix.target }}"
+          if [ -n "${PUBKEY:-}" ]; then
+            cfg="$RUNNER_TEMP/updater.json"
+            cat > "$cfg" <<EOF
+          {
+            "bundle": { "createUpdaterArtifacts": true },
+            "plugins": {
+              "updater": {
+                "endpoints": ["https://github.com/HanoCode/Free-LLM-plus/releases/latest/download/latest.json"],
+                "pubkey": "${PUBKEY}"
+              }
+            }
+          }
+          EOF
+            args="$args --config $cfg"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 TAURI_UPDATER_PUBKEY，本次不产出自动更新包"
+          fi
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+
+      - name: 构建并挂到 draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS 签名 + 公证（缺任何一项 tauri 就跳过签名，不会产出半签名的包）
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # 自动更新包的签名私钥（minisign），与 TAURI_UPDATER_PUBKEY 配对
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: 'Freeport ${{ inputs.tag || github.ref_name }}'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ steps.updater.outputs.args }}
+          releaseBody: |
+            ### 安装
+
+            - **macOS**：下载 `.dmg`，拖进 Applications。首次打开若提示「无法验证开发者」，
+              在「系统设置 → 隐私与安全性」里点「仍要打开」，或右键 → 打开。
+            - **Windows**：下载 `*-setup.exe`，按提示安装到当前用户目录。
+
+            ### 校验
+
+            每个产物附 `.sha256`。macOS：`shasum -a 256 -c Freeport_*.dmg.sha256`；
+            Windows：`Get-FileHash .\Freeport_*-setup.exe -Algorithm SHA256`。
+
+            ### 这一版改了什么
+
+            <!-- 手写发布说明：这一栏刻意留空，避免自动生成的 changelog 冒充事实 -->
+
+      - name: 生成校验和
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=( ${{ matrix.asset_glob }} )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::没找到构建产物：${{ matrix.asset_glob }}"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              ( cd "$(dirname "$f")" && sha256sum "$(basename "$f")" > "$(basename "$f").sha256" )
+            else
+              ( cd "$(dirname "$f")" && shasum -a 256 "$(basename "$f")" > "$(basename "$f").sha256" )
+            fi
+          done
+
+      - name: 上传校验和
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in ${{ matrix.asset_glob }}.sha256; do
+            gh release upload "${{ inputs.tag || github.ref_name }}" "$f" --clobber
+          done
+
+      - name: 留下构建产物（便于人工复装验证）
+        uses: actions/upload-artifact@v4
+        with:
+          name: freeport-${{ matrix.target }}
+          path: |
+            ${{ matrix.asset_glob }}
+            ${{ matrix.asset_glob }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # Windows 代码签名（Azure Trusted Signing）需要订阅与账号，凭据不在手时保持关闭。
+  # 打开方式：配置 AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET /
+  # AZURE_TS_ENDPOINT / AZURE_TS_ACCOUNT / AZURE_TS_PROFILE 之后取消注释。
+  #
+  # - name: 签名 Windows 安装包
+  #   uses: azure/trusted-signing-action@v0
+  #   with:
+  #     azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  #     azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+  #     azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+  #     endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+  #     trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+  #     certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+  #     files-folder: app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis
+  #     files-folder-filter: exe
+  #     file-digest: SHA256
+  #     timestamp-rfc3161: http://timestamp.acs.microsoft.com
+  #     timestamp-digest: SHA256

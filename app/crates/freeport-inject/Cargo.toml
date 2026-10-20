@@ -1,0 +1,14 @@
+[package]
+name = "freeport-inject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "把本机 Agent 指向 Freeport：只写自己的节点，可预览、可回滚。"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+toml = "0.8"

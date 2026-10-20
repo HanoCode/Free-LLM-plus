@@ -1,0 +1,21 @@
+[package]
+name = "freeport-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freeport 的凭据代理：OAuth 设备码 / PKCE / token 续期。只处理授权，不碰业务请求。"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+rand = "0.8"
+# 设备码要按时休眠，不能靠调用方调度
+tokio = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

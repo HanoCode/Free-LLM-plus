@@ -1,0 +1,16 @@
+[package]
+name = "freeport-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freeport 的探针引擎与巡检调度：liveness / capability / 健康状态机 / 探针预算。"
+
+[dependencies]
+freeport-core = { path = "../freeport-core" }
+freeport-catalog = { path = "../freeport-catalog" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

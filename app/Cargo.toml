@@ -1,5 +1,14 @@
 [workspace]
-members = ["crates/freeport-core", "crates/freeport-gateway", "src-tauri"]
+members = [
+    "crates/freeport-core",
+    "crates/freeport-catalog",
+    "crates/freeport-probe",
+    "crates/freeport-inject",
+    "crates/freeport-auth",
+    "crates/freeport-license",
+    "crates/freeport-gateway",
+    "src-tauri",
+]
 resolver = "2"
 
 [workspace.package]
@@ -23,6 +32,9 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+argon2 = "0.5"
 dirs = "5"
 
 [profile.dev]
