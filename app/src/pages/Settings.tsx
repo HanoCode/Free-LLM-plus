@@ -7,7 +7,7 @@ import { CopyBtn, Switch, toast } from '../components/ui';
 import { ApiKeys } from '../components/ApiKeys';
 import { Transfer } from '../components/Transfer';
 import { License } from '../components/License';
-import type { UpdateCheck } from '../lib/bridge';
+import type { DesktopPrefs, UpdateCheck } from '../lib/bridge';
 
 const REPO = 'https://github.com/HanoCode/Free-LLM-plus';
 
@@ -17,6 +17,8 @@ export function Settings() {
   const gw = useGateway((s) => s.status);
   const setRequireAuth = useGateway((s) => s.setRequireAuth);
   const setBudget = useGateway((s) => s.setBudget);
+  const setCompress = useGateway((s) => s.setCompress);
+  const patchConfig = useGateway((s) => s.patchConfig);
   const clearCooldowns = useGateway((s) => s.clearCooldowns);
   const patrol = useGateway((s) => s.patrol);
   const setPatrol = useGateway((s) => s.setPatrol);
@@ -26,6 +28,16 @@ export function Settings() {
   const [version, setVersion] = useState('—');
   const [checking, setChecking] = useState(false);
   const [update, setUpdate] = useState<UpdateCheck | null>(null);
+  const [prefs, setPrefs] = useState<DesktopPrefs | null>(null);
+  const [autostart, setAutostart] = useState(false);
+
+  useEffect(() => {
+    const api = window.freeport?.app;
+    if (!api) return;
+    void api.prefs().then(setPrefs).catch(() => {});
+    // 自启状态以系统为准：用户在「登录项」里手删过也要如实显示
+    void api.autostart().then(setAutostart).catch(() => {});
+  }, []);
 
   useEffect(() => {
     const known = document.documentElement.dataset.appVersion;
@@ -138,6 +150,169 @@ export function Settings() {
             <div className="set-row">
               <div>
                 <div className="k">
+                  <T zh="工具输出压缩" en="Compress tool output" />
+                </div>
+                <div className="d">
+                  <T
+                    zh="超过阈值的工具输出只留开头与结尾，中间换成一句说明。省 token，但确实会丢信息——所以默认关。"
+                    en="Trim long tool outputs to head + tail with an explicit marker. Saves tokens, loses information — off by default."
+                  />
+                  {desktop && gw && (
+                    <span className="mono" style={{ marginLeft: 6 }}>
+                      {`>${gw.compressMaxToolChars.toLocaleString()} chars`}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="v">
+                {desktop && gw && (
+                  <Switch
+                    on={gw.compress}
+                    onChange={(v) => {
+                      void setCompress(v);
+                      toast(
+                        v
+                          ? '已开启工具输出压缩：超长输出会保留首尾，并写明省略了多少'
+                          : '已关闭工具输出压缩：请求体原样转发',
+                      );
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+            {/* 智能过滤是压缩的子选项：压缩关着时它没有任何作用，
+                所以直接跟着压缩状态禁用，而不是让它看起来能独立生效 */}
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="按内容裁（智能过滤）" en="Structure-aware trimming" />
+                </div>
+                <div className="d">
+                  <T
+                    zh="认出 git diff / grep 结果 / 重复日志后按结构裁：diff 只留改动块和 hunk 头，grep 每个文件留三条，连续重复行折叠。认不出来的形态仍然走首尾截断。"
+                    en="Recognises git diffs, grep output and repeated logs, then trims by structure: keeps hunks and changed lines, three hits per file, collapses runs. Unknown shapes still fall back to head + tail."
+                  />
+                </div>
+              </div>
+              <div className="v">
+                {desktop && gw && (
+                  <Switch
+                    on={gw.compressSmart}
+                    disabled={!gw.compress}
+                    onChange={(v) => {
+                      void patchConfig({ compressSmart: v });
+                      toast(
+                        v
+                          ? '已开启智能过滤：结构化输出按结构裁，省得更多'
+                          : '已关闭智能过滤：统一走首尾截断',
+                      );
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="响应缓存" en="Response cache" />
+                </div>
+                <div className="d">
+                  <T
+                    zh="同一段请求体在有效期内直接复用上次的非流式回答。只缓存正常收尾（无工具调用）的完整响应：带 tool_calls 或 finish_reason 不是 stop 的一律不缓存。"
+                    en="Reuse the previous non-streaming answer for an identical request body within the TTL. Only complete responses with no tool calls are cached; anything with tool_calls or a non-stop finish reason is never stored."
+                  />
+                  {desktop && gw && gw.cache && (
+                    <span className="mono" style={{ marginLeft: 6 }}>
+                      TTL {Math.round(gw.cacheTtlSecs / 60)} min
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="v" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {desktop && gw && (
+                  <>
+                    {gw.cache && (
+                      <select
+                        value={gw.cacheTtlSecs}
+                        onChange={(e) => {
+                          void patchConfig({ cacheTtlSecs: Number(e.target.value) });
+                        }}
+                        style={{
+                          height: 28,
+                          padding: '0 8px',
+                          border: '1px solid var(--line)',
+                          borderRadius: 7,
+                          background: 'var(--panel-2)',
+                          color: 'var(--text)',
+                          fontSize: 11.5,
+                        }}
+                      >
+                        {[60, 300, 600, 1800, 3600].map((v) => (
+                          <option key={v} value={v}>
+                            {v < 60 ? `${v}s` : tx(lang, `${v / 60} 分钟`, `${v / 60} min`)}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <Switch
+                      on={gw.cache}
+                      onChange={(v) => {
+                        void patchConfig({ cache: v });
+                        toast(
+                          v
+                            ? '已开启响应缓存：完全相同的请求直接复用，不消耗上游额度'
+                            : '已关闭响应缓存：每个请求都会真的发出去',
+                        );
+                      }}
+                    />
+                  </>
+                )}
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="单来源限速" en="Per-source rate limit" />
+                </div>
+                <div className="d">
+                  <T
+                    zh="同一个 x-freeport-identifier 每分钟最多这么多次，超了直接 429 并带上 retry-after。填 0 表示不限。这是防「一个脚本把额度瞬间打光」的闸，不是安全边界——它只按请求头算。"
+                    en="Max requests per minute for the same x-freeport-identifier; over that returns 429 with retry-after. 0 disables it. This throttles runaway scripts — it is keyed on a header, not a security boundary."
+                  />
+                </div>
+              </div>
+              <div className="v">
+                {desktop && gw && (
+                  <input
+                    type="number"
+                    min={0}
+                    max={10000}
+                    defaultValue={gw.identifierLimit}
+                    key={`ident-${gw.identifierLimit}`}
+                    onBlur={(e) => {
+                      const v = Math.max(0, Math.min(10000, Number(e.target.value) || 0));
+                      if (v === gw.identifierLimit) return;
+                      void patchConfig({ identifierLimit: v });
+                      toast(v === 0 ? '已取消单来源限速' : `单来源限速已设为 ${v} 次/分钟`);
+                    }}
+                    style={{
+                      width: 90,
+                      height: 28,
+                      padding: '0 8px',
+                      border: '1px solid var(--line)',
+                      borderRadius: 7,
+                      background: 'var(--panel-2)',
+                      color: 'var(--text)',
+                      fontFamily: 'var(--mono)',
+                      fontSize: 11.5,
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
                   <T zh="冷却中的候选" en="Cooling candidates" />
                 </div>
                 <div className="d">
@@ -187,10 +362,68 @@ export function Settings() {
           <div className="card">
             <div className="card-head">
               <h3>
+                <T zh="MCP 服务器" en="MCP server" />
+              </h3>
+              <span className="sub">
+                <T zh="让 agent 自省「能用什么、刚才为什么挂」· 只读" en="read-only introspection for agents" />
+              </span>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="同一个可执行文件，加 --mcp" en="same binary, with --mcp" />
+                </div>
+                <div className="d">
+                  <T
+                    zh="走 stdio 协议，不起网关、不转发流量。给 Claude Desktop / Codex 这类客户端当自省通道。"
+                    en="speaks the stdio protocol; starts no gateway and forwards no traffic."
+                  />
+                </div>
+              </div>
+              <div className="v">
+                <span className="badge gray">
+                  <T zh="只读" en="read-only" />
+                </span>
+              </div>
+            </div>
+            {/* 卡片直接子元素没有 .set-row 的内边距，这里统一包一层 */}
+            <div style={{ padding: '4px 16px 16px' }}>
+              <div
+                className="mono"
+                style={{
+                  fontSize: 11,
+                  lineHeight: 1.6,
+                  padding: '10px 12px',
+                  borderRadius: 8,
+                  background: 'var(--bg-2)',
+                  border: '1px solid var(--line)',
+                  overflowX: 'auto',
+                  userSelect: 'all',
+                }}
+              >{`{
+  "mcpServers": {
+    "freeport": {
+      "command": "/Applications/Freeport.app/Contents/MacOS/Freeport",
+      "args": ["--mcp"]
+    }
+  }
+}`}</div>
+              <div className="t-sub" style={{ marginTop: 8 }}>
+                <T
+                  zh="六个工具：网关状态、可用模型、链路预演、额度余量、今日摘要、最近失败。改配置仍然只能在界面里做——MCP 的调用方是一个语言模型。"
+                  en="Six tools: status, available models, route preview, quota, daily digest, recent failures. Configuration stays in the app — the MCP caller is a language model."
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-head">
+              <h3>
                 <T zh="启动与退出" en="Startup" />
               </h3>
               <span className="sub">
-                <T zh="这三项还没接上后端，先如实标注" en="not wired to the backend yet" />
+                <T zh="改完立即生效，不用重启" en="takes effect immediately" />
               </span>
             </div>
             <div className="set-row">
@@ -199,13 +432,31 @@ export function Settings() {
                   <T zh="开机自启" en="Launch at login" />
                 </div>
                 <div className="d">
-                  <T zh="需要 autostart 插件，v1.1 接入" en="needs the autostart plugin, v1.1" />
+                  <T
+                    zh="登录后自动启动，网关与注入保持可用；状态直接读系统登录项"
+                    en="starts on login so the gateway stays reachable; state is read from the OS login items"
+                  />
                 </div>
               </div>
               <div className="v">
-                <span className="badge gray">
-                  <T zh="未接入" en="pending" />
-                </span>
+                {desktop && (
+                  <Switch
+                    on={autostart}
+                    onChange={(v) => {
+                      void window.freeport?.app
+                        .setAutostart(v)
+                        .then((on) => {
+                          setAutostart(on);
+                          toast(
+                            on
+                              ? tx(lang, '已加入登录项', 'Added to login items')
+                              : tx(lang, '已从登录项移除', 'Removed from login items'),
+                          );
+                        })
+                        .catch((e) => toast(String(e)));
+                    }}
+                  />
+                )}
               </div>
             </div>
             <div className="set-row">
@@ -214,13 +465,24 @@ export function Settings() {
                   <T zh="启动时最小化" en="Start minimized" />
                 </div>
                 <div className="d">
-                  <T zh="当前固定行为：启动即显示主窗口" en="current behaviour: window shows on launch" />
+                  <T
+                    zh="启动后只驻留托盘，网关照常服务；点托盘图标再开窗"
+                    en="stays in the tray after launch, gateway keeps serving; click the tray icon to open"
+                  />
                 </div>
               </div>
               <div className="v">
-                <span className="badge gray">
-                  <T zh="固定" en="fixed" />
-                </span>
+                {desktop && (
+                  <Switch
+                    on={prefs?.startMinimized ?? false}
+                    onChange={(v) => {
+                      void window.freeport?.app
+                        .setPrefs({ startMinimized: v })
+                        .then(setPrefs)
+                        .catch((e) => toast(String(e)));
+                    }}
+                  />
+                )}
               </div>
             </div>
             <div className="set-row">
@@ -229,13 +491,24 @@ export function Settings() {
                   <T zh="退出时清理注入" en="Clean up on quit" />
                 </div>
                 <div className="d">
-                  <T zh="现在是手动：注入页逐项回滚" en="manual for now: revert per agent" />
+                  <T
+                    zh="退出前把已注入的 Agent 配置回滚到注入前（用户级）；只动 Freeport 自己写过的那几处，没注入过的客户端不受影响。项目级注入请在各仓库页面回滚。默认关——它会改你客户端的配置。"
+                    en="Reverts user-level injected agent configs before quitting; only touches what Freeport wrote. Project-level injections are reverted per repo. Off by default — it edits your client configs."
+                  />
                 </div>
               </div>
               <div className="v">
-                <span className="badge gray">
-                  <T zh="手动" en="manual" />
-                </span>
+                {desktop && (
+                  <Switch
+                    on={prefs?.cleanupOnQuit ?? false}
+                    onChange={(v) => {
+                      void window.freeport?.app
+                        .setPrefs({ cleanupOnQuit: v })
+                        .then(setPrefs)
+                        .catch((e) => toast(String(e)));
+                    }}
+                  />
+                )}
               </div>
             </div>
           </div>
@@ -341,9 +614,15 @@ export function Settings() {
                     );
                   }}
                 >
-                  <option value="auto">auto</option>
-                  <option value="notify">notify</option>
-                  <option value="pinned">pinned</option>
+                  <option value="auto">
+                    <T zh="自动（灰度后应用）" en="auto (canary then apply)" />
+                  </option>
+                  <option value="notify">
+                    <T zh="仅提示（先问再应用）" en="notify (ask first)" />
+                  </option>
+                  <option value="pinned">
+                    <T zh="锁定（不接收更新）" en="pinned (no updates)" />
+                  </option>
                 </select>
               </div>
             </div>
@@ -368,8 +647,12 @@ export function Settings() {
                     );
                   }}
                 >
-                  <option value="stable">stable</option>
-                  <option value="beta">beta</option>
+                  <option value="stable">
+                    <T zh="稳定" en="stable" />
+                  </option>
+                  <option value="beta">
+                    <T zh="测试（beta）" en="beta" />
+                  </option>
                 </select>
               </div>
             </div>
@@ -387,6 +670,35 @@ export function Settings() {
               <div className="v">
                 <span className={`badge ${feed?.hasPubkey ? 'ok' : 'warn'}`}>
                   {feed?.seq ? `seq ${feed.seq}` : tx(lang, '未启用', 'off')}
+                </span>
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="本次下发" en="This delivery" />
+                </div>
+                <div className="d">
+                  {feed?.servedFeats?.length
+                    ? feed.servedFeats.join(' · ')
+                    : tx(
+                        lang,
+                        '没有按能力单独下发的字段（公共目录 / 许可证未激活）',
+                        'no feature packs in this delivery (public catalog / not activated)',
+                      )}
+                  {feed?.featsSkipped?.length ? `　·　${tx(lang, '跳过：', 'skipped: ')}${feed.featsSkipped.join('、')}` : ''}
+                </div>
+              </div>
+              <div className="v">
+                <span
+                  className={`badge ${feed?.servedTier === 'pro' ? 'ok' : 'gray'}`}
+                  title={tx(
+                    lang,
+                    '服务端按许可证的 feat 名单挑了哪几项；本机不据此拦功能',
+                    'server picked packs from the license feat list; the client never gates on this',
+                  )}
+                >
+                  {feed?.servedTier === 'pro' ? 'pro' : tx(lang, '公共目录', 'public')}
                 </span>
               </div>
             </div>

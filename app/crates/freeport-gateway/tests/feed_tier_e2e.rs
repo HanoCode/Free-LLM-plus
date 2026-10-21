@@ -44,6 +44,7 @@ fn manifest_bytes(seq: u64, snap: &[u8], tier: Option<&str>, snap_url: &str) -> 
         url: snap_url.into(),
         tier: tier.map(str::to_string),
         notes: None,
+        feat: Vec::new(),
         patches: Vec::new(),
     };
     let payload = freeport_catalog::jcs::canonical(&m.signing_payload()).unwrap();

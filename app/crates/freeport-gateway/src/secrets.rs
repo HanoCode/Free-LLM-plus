@@ -307,6 +307,7 @@ pub fn migrate_accounts(data: &mut AppData) -> bool {
             added_at: p.added_at.clone(),
             quota: p.quota.take(),
             health: None,
+            purposes: Vec::new(),
         });
         changed = true;
     }
@@ -325,6 +326,9 @@ mod tests {
     use super::*;
 
     fn with_temp_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        // 和 exts 的用例共用一把锁：两边改的是同一个进程级变量，
+        // 模块私有的锁彼此看不见——不同步就会互相把目录改到别处
+        let _env = crate::store::env_lock();
         let dir = std::env::temp_dir().join(format!("freeport-secrets-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         std::env::set_var("FREEPORT_DATA_DIR", &dir);

@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { ExternalLink, Plus, RefreshCw, ShieldAlert, Trash2, Unplug } from 'lucide-react';
-import { T } from '../lib/i18n';
-import { Badge, Empty, Status, toast } from '../components/ui';
+import { ExternalLink, Network, Plus, RefreshCw, ShieldAlert, Trash2, Unplug } from 'lucide-react';
+import { T, tierLabel } from '../lib/i18n';
+import { Empty, Status, TierBadge, toast } from '../components/ui';
+import { BrandLogo } from '../components/BrandLogo';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
 import type { GwProvider, ProviderPreset } from '../lib/bridge';
@@ -13,13 +14,21 @@ export function Providers() {
   const presets = useGateway((s) => s.presets);
   const removeProvider = useGateway((s) => s.removeProvider);
   const probe = useGateway((s) => s.probe);
+  const setProviderProxy = useGateway((s) => s.setProviderProxy);
   const [target, setTarget] = useState<ProviderPreset | null>(null);
+  /* 档位筛选：同一组控件作用于「已接入」与「可接入」两张列表 */
+  const [tier, setTier] = useState<'all' | 'A' | 'B' | 'C'>('all');
 
   if (!online) return <NoGateway onDiscover={() => setPage('discover')} />;
 
   const used = new Set(real.map((p) => p.id));
   const available = presets.filter((p) => !used.has(p.id));
   const totalModels = real.reduce((n, p) => n + p.models, 0);
+
+  const match = (t: string) => tier === 'all' || t === tier;
+  const realShown = real.filter((p) => match(p.tier));
+  const availShown = available.filter((p) => match(p.tier));
+  const countOf = (t: 'A' | 'B' | 'C') => available.filter((p) => p.tier === t).length;
 
   return (
     <>
@@ -50,8 +59,32 @@ export function Providers() {
         </div>
       </div>
 
+      <div className="tier-filter">
+        <div className="seg">
+          <button className={tier === 'all' ? 'on' : ''} onClick={() => setTier('all')}>
+            <T zh="全部" en="All" />
+            <span className="cnt">{available.length}</span>
+          </button>
+          {(['A', 'B', 'C'] as const).map((t) => (
+            <button key={t} className={tier === t ? 'on' : ''} onClick={() => setTier(t)}>
+              <T zh={tierLabel(t, 'zh')} en={tierLabel(t, 'en')} />
+              <span className="cnt">{countOf(t)}</span>
+            </button>
+          ))}
+        </div>
+        <span className="sub">
+          <T
+            zh="免费额度＝官方免费档；匿名端点＝无需 key；订阅付费＝走订阅或余额"
+            en="Free tier = official free plan; anonymous = no key; subscription = your own plan or credits"
+          />
+        </span>
+      </div>
+
       <div className="group-title">
-        <T zh={`已接入 · ${real.length}`} en={`Connected · ${real.length}`} />
+        <T
+          zh={`已接入 · ${realShown.length}${tier === 'all' ? '' : ` / ${real.length}`}`}
+          en={`Connected · ${realShown.length}${tier === 'all' ? '' : ` / ${real.length}`}`}
+        />
         <span className="line" />
         {real.length > 0 && (
           <span className="badge gray">
@@ -72,12 +105,24 @@ export function Providers() {
             />
           </div>
         </div>
+      ) : realShown.length === 0 ? (
+        <div className="hint-line" style={{ marginTop: 0 }}>
+          <T zh="当前档位下没有已接入的厂商" en="Nothing connected under this tier" />
+        </div>
       ) : (
         <div className="pgrid">
-          {real.map((p) => (
+          {realShown.map((p) => (
             <RealCard
               key={p.id}
               p={p}
+              onProxy={async (proxy) => {
+                try {
+                  await setProviderProxy(p.id, proxy);
+                  toast(proxy.trim() ? '代理已保存' : '代理已清除，回落到系统代理');
+                } catch (e) {
+                  toast(String(e));
+                }
+              }}
               onProbe={async () => {
                 const r = await probe(p.id);
                 toast(
@@ -96,14 +141,26 @@ export function Providers() {
       )}
 
       <div className="group-title">
-        <T zh="可接入 · 官方免费额度" en="Available · official free tier" />
+        <T zh={`可接入 · ${availShown.length}`} en={`Available · ${availShown.length}`} />
         <span className="line" />
       </div>
-      <div className="pgrid">
-        {available.map((p) => (
-          <PresetCard key={p.id} p={p} onConnect={() => setTarget(p)} />
-        ))}
-      </div>
+      {availShown.length === 0 ? (
+        <Empty
+          title={<T zh="这个档位没有可接入的厂商" en="Nothing available under this tier" />}
+          hint={
+            <T
+              zh="换个筛选，或者到「发现更多」按目录找。"
+              en="Try another tier, or browse the catalog from Discover."
+            />
+          }
+        />
+      ) : (
+        <div className="pgrid">
+          {availShown.map((p) => (
+            <PresetCard key={p.id} p={p} onConnect={() => setTarget(p)} />
+          ))}
+        </div>
+      )}
 
       <div className="risk-note">
         <ShieldAlert />
@@ -132,19 +189,25 @@ function RealCard({
   p,
   onProbe,
   onRemove,
+  onProxy,
 }: {
   p: GwProvider;
   onProbe: () => Promise<void>;
   onRemove: () => Promise<void>;
+  onProxy: (proxy: string) => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
-  const tone = p.tier === 'A' ? 'ok' : p.tier === 'B' ? 'accent' : 'warn';
+  // 代理是「网络环境」不是「每次都要看的字段」：默认收起，点开才填
+  const [editProxy, setEditProxy] = useState(false);
+  const [proxy, setProxy] = useState(p.proxy ?? '');
   const healthy = p.health.status === 'healthy';
 
   return (
     <div className="card pcard">
       <div className="pcard-top">
-        <div className="plogo">{p.name.slice(0, 2).toUpperCase()}</div>
+        <div className="plogo">
+          <BrandLogo id={p.id} name={p.name} size={17} />
+        </div>
         <div style={{ minWidth: 0 }}>
           <h4>{p.name}</h4>
           <div className="meta mono" style={{ fontSize: 10.5 }}>
@@ -152,7 +215,7 @@ function RealCard({
           </div>
         </div>
         <span style={{ marginLeft: 'auto' }}>
-          <Badge tone={tone}>Tier {p.tier}</Badge>
+          <TierBadge tier={p.tier} />
         </span>
       </div>
 
@@ -207,6 +270,10 @@ function RealCard({
             <RefreshCw size={11} className={busy ? 'spin' : undefined} />
             <T zh="探测" en="Probe" />
           </button>
+          <button className="btn ghost sm" onClick={() => setEditProxy((v) => !v)}>
+            <Network size={11} />
+            <T zh="代理" en="Proxy" />
+          </button>
           <button
             className="btn ghost sm"
             onClick={async () => {
@@ -219,6 +286,40 @@ function RealCard({
         </span>
       </div>
 
+      {editProxy && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+          <input
+            className="input"
+            style={{ flex: 1 }}
+            placeholder="http://127.0.0.1:7890"
+            value={proxy}
+            onChange={(e) => setProxy(e.target.value)}
+          />
+          <button
+            className="btn primary sm"
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await onProxy(proxy);
+                setEditProxy(false);
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            <T zh="保存" en="Save" />
+          </button>
+        </div>
+      )}
+      {editProxy && (
+        <div className="t-sub" style={{ marginTop: 6 }}>
+          <T
+            zh="只影响这一家的上游请求（聊天 / 拉模型 / 探针）；留空则跟随系统代理，本机回环永远直连。"
+            en="Applies only to this provider's upstream calls (chat / models / probes). Empty = inherit the system proxy; loopback always connects directly."
+          />
+        </div>
+      )}
+
       {p.health.error && (
         <div className="modal-err" style={{ marginTop: 10, marginBottom: 0 }}>
           {p.health.error}
@@ -230,17 +331,18 @@ function RealCard({
 
 /* ── 可接入卡片 ─────────────────────────────── */
 function PresetCard({ p, onConnect }: { p: ProviderPreset; onConnect: () => void }) {
-  const tone = p.tier === 'A' ? 'ok' : p.tier === 'B' ? 'accent' : 'warn';
   return (
     <div className="card pcard">
       <div className="pcard-top">
-        <div className="plogo">{p.name.slice(0, 2).toUpperCase()}</div>
+        <div className="plogo">
+          <BrandLogo id={p.id} name={p.name} size={17} />
+        </div>
         <div style={{ minWidth: 0 }}>
           <h4>{p.name}</h4>
           <div className="meta">{p.note || p.baseUrl}</div>
         </div>
         <span style={{ marginLeft: 'auto' }}>
-          <Badge tone={tone}>Tier {p.tier}</Badge>
+          <TierBadge tier={p.tier} />
         </span>
       </div>
 
@@ -289,6 +391,14 @@ function PresetCard({ p, onConnect }: { p: ProviderPreset; onConnect: () => void
 }
 
 /* ── 接入弹窗 ───────────────────────────────── */
+
+/**
+ * 订阅类预设：接入时**没有 key 可填**，凭据要在下一步「登录」时才产生。
+ * 单独列出来是为了把表单从「粘贴 key」换成「说明下一步做什么」——
+ * 留着输入框只会让人以为这里必须填点什么。
+ */
+const LOGIN_ONLY = new Set(['claude-sub', 'codex-sub']);
+
 function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: () => void }) {
   const addProvider = useGateway((s) => s.addProvider);
   const [apiKey, setApiKey] = useState('');
@@ -297,10 +407,11 @@ function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: (
   const [err, setErr] = useState('');
 
   const isCustom = preset.id === 'custom';
+  const loginOnly = LOGIN_ONLY.has(preset.id);
 
   const submit = async () => {
     setErr('');
-    if (!apiKey.trim()) return setErr('请填入 API Key');
+    if (!loginOnly && !apiKey.trim()) return setErr('请填入 API Key');
     if (!baseUrl.trim()) return setErr('请填入 baseUrl');
 
     let id = preset.id;
@@ -321,7 +432,11 @@ function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: (
         apiKey: apiKey.trim(),
         tier: preset.tier,
       });
-      toast(`已接入，校验通过：${res.modelCount} 个模型 / connected`);
+      toast(
+        loginOnly
+          ? `已接入 ${preset.name}。现在去「凭据」页点「登录」完成授权，凭据才会生效。`
+          : `已接入，校验通过：${res.modelCount} 个模型 / connected`,
+      );
       onClose();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -347,17 +462,36 @@ function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: (
           <label>BASE URL</label>
           <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} disabled={!isCustom} />
         </div>
-        <div className="field">
-          <label>API KEY</label>
-          <input
-            type="password"
-            autoFocus
-            value={apiKey}
-            placeholder={preset.id === 'groq' ? 'gsk_...' : 'sk-...'}
-            onChange={(e) => setApiKey(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && !busy && void submit()}
-          />
-        </div>
+        {loginOnly ? (
+          /* 订阅号不填 key：额度来自你自己的订阅，凭据由登录产生 */
+          <div className="field">
+            <label>凭据</label>
+            <p className="modal-note">
+              <T
+                zh="这一项不用填 Key。接入之后到「凭据」页点「登录」，用你自己的订阅账号授权即可。"
+                en="No key needed. After connecting, open the Credentials page and click Sign in to authorize with your own subscription."
+              />
+            </p>
+            <p className="modal-note" style={{ color: 'var(--warn)' }}>
+              <T
+                zh="注意：用订阅额度驱动第三方客户端可能不符合厂商的服务条款，账号风险由你自己承担。"
+                en="Note: driving third-party clients with subscription quota may violate the vendor's terms. The account risk is yours."
+              />
+            </p>
+          </div>
+        ) : (
+          <div className="field">
+            <label>API KEY</label>
+            <input
+              type="password"
+              autoFocus
+              value={apiKey}
+              placeholder={preset.id === 'groq' ? 'gsk_...' : 'sk-...'}
+              onChange={(e) => setApiKey(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && !busy && void submit()}
+            />
+          </div>
+        )}
 
         {err && <div className="modal-err">{err}</div>}
 

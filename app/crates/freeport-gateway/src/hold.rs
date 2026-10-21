@@ -39,7 +39,11 @@ enum Scan {
     Error(&'static str, String),
 }
 
-pub async fn wait_commit(resp: reqwest::Response, cfg: &HoldCfg) -> HoldOutcome {
+pub async fn wait_commit(
+    resp: reqwest::Response,
+    cfg: &HoldCfg,
+    wire: crate::upwire::Wire,
+) -> HoldOutcome {
     let is_sse = resp
         .headers()
         .get("content-type")
@@ -72,7 +76,7 @@ pub async fn wait_commit(resp: reqwest::Response, cfg: &HoldCfg) -> HoldOutcome 
             }
             Ok(None) => {
                 // 流正常结束但从未提交
-                return match scan(&buf, is_sse) {
+                return match scan(&buf, is_sse, wire) {
                     Scan::Error(kind, detail) => HoldOutcome::Rejected { kind, detail },
                     _ => HoldOutcome::Rejected {
                         kind: "empty_stream",
@@ -91,7 +95,7 @@ pub async fn wait_commit(resp: reqwest::Response, cfg: &HoldCfg) -> HoldOutcome 
                 head.push(bytes.clone());
                 buf.push_str(&String::from_utf8_lossy(&bytes));
 
-                match scan(&buf, is_sse) {
+                match scan(&buf, is_sse, wire) {
                     Scan::Commit => {
                         return HoldOutcome::Committed { head, rest: stream }
                     }
@@ -110,7 +114,12 @@ pub async fn wait_commit(resp: reqwest::Response, cfg: &HoldCfg) -> HoldOutcome 
     }
 }
 
-fn scan(buf: &str, is_sse: bool) -> Scan {
+fn scan(buf: &str, is_sse: bool, wire: crate::upwire::Wire) -> Scan {
+    // 上游讲原生协议时不能按 OpenAI 的字段去认内容，否则永远认不出来，
+    // 每一单都要等到 hold 超时才提交——那是纯粹的延迟税。
+    if !wire.is_openai() {
+        return scan_native(buf, wire);
+    }
     if !is_sse {
         let t = buf.trim();
         if !t.starts_with('{') {
@@ -150,6 +159,65 @@ fn scan(buf: &str, is_sse: bool) -> Scan {
             return Scan::Error("upstream_body", first_message(&v));
         }
         if has_content(&v) {
+            return Scan::Commit;
+        }
+    }
+    Scan::Wait
+}
+
+/// 原生协议只认两件事：出错了、出内容了。
+///
+/// 刻意不在这里做完整解析：那是 [`crate::upwire`] 的活，而且多解析一遍
+/// 就等于把「什么时候算提交」这个判断分散到两处，迟早对不上。
+fn scan_native(buf: &str, wire: crate::upwire::Wire) -> Scan {
+    for line in buf.split('\n') {
+        let line = line.trim();
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if ty.contains("error") || ty.ends_with(".failed") {
+            return Scan::Error("upstream_body", first_message(&v));
+        }
+        let hit = match wire {
+            crate::upwire::Wire::Anthropic => match ty {
+                // message_start 只是开场白，不含内容，不能当提交
+                "content_block_delta" => v
+                    .pointer("/delta/text")
+                    .or_else(|| v.pointer("/delta/thinking"))
+                    .or_else(|| v.pointer("/delta/partial_json"))
+                    .and_then(|x| x.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+                "content_block_start" => {
+                    v.pointer("/content_block/type").and_then(|x| x.as_str())
+                        == Some("tool_use")
+                }
+                _ => false,
+            },
+            crate::upwire::Wire::Responses => match ty {
+                "response.output_text.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.function_call_arguments.delta" => v
+                    .get("delta")
+                    .and_then(|x| x.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+                "response.output_item.added" => {
+                    v.pointer("/item/type").and_then(|x| x.as_str()) == Some("function_call")
+                }
+                _ => false,
+            },
+            crate::upwire::Wire::Openai => false,
+        };
+        if hit {
             return Scan::Commit;
         }
     }
@@ -215,36 +283,36 @@ mod tests {
     #[test]
     fn role_only_delta_is_not_a_commit() {
         let s = r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#;
-        assert!(matches!(scan(s, true), Scan::Wait));
+        assert!(matches!(scan(s, true, crate::upwire::Wire::Openai), Scan::Wait));
     }
 
     #[test]
     fn text_delta_commits() {
         let s = "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}";
-        assert!(matches!(scan(s, true), Scan::Commit));
+        assert!(matches!(scan(s, true, crate::upwire::Wire::Openai), Scan::Commit));
     }
 
     #[test]
     fn reasoning_delta_commits() {
         let s = r#"data: {"choices":[{"delta":{"reasoning_content":"think"}}]}"#;
-        assert!(matches!(scan(s, true), Scan::Commit));
+        assert!(matches!(scan(s, true, crate::upwire::Wire::Openai), Scan::Commit));
     }
 
     #[test]
     fn tool_call_delta_commits() {
         let s = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}"#;
-        assert!(matches!(scan(s, true), Scan::Commit));
+        assert!(matches!(scan(s, true, crate::upwire::Wire::Openai), Scan::Commit));
     }
 
     #[test]
     fn error_event_is_rejected() {
         let s = r#"data: {"error":{"message":"free tier exhausted"}}"#;
-        assert!(matches!(scan(s, true), Scan::Error("upstream_body", _)));
+        assert!(matches!(scan(s, true, crate::upwire::Wire::Openai), Scan::Error("upstream_body", _)));
     }
 
     #[test]
     fn partial_line_waits_for_more() {
         let s = r#"data: {"choices":[{"delta":{"cont"#;
-        assert!(matches!(scan(s, true), Scan::Wait));
+        assert!(matches!(scan(s, true, crate::upwire::Wire::Openai), Scan::Wait));
     }
 }

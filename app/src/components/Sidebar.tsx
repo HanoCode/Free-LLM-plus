@@ -1,6 +1,7 @@
 import {
   Boxes,
   Compass,
+  FlaskConical,
   LayoutDashboard,
   Plug,
   Puzzle,
@@ -26,6 +27,12 @@ interface NavDef {
   accent?: boolean;
 }
 
+/** 宽限期剩余天数（向上取整）。宽限内能力完整，但 `daysLeft` 已是负数，得另算。 */
+function graceDays(until?: number): number {
+  if (!until) return 0;
+  return Math.max(0, Math.ceil((until - Date.now() / 1000) / 86400));
+}
+
 const groups: { zh: string; en: string; items: NavDef[] }[] = [
   {
     zh: '网关',
@@ -36,6 +43,7 @@ const groups: { zh: string; en: string; items: NavDef[] }[] = [
       { id: 'providers', label_zh: '厂商', label_en: 'Providers', icon: Server },
       { id: 'accounts', label_zh: '账号', label_en: 'Accounts', icon: Users },
       { id: 'discover', label_zh: '发现', label_en: 'Discover', icon: Compass, accent: true },
+      { id: 'playground', label_zh: '试验场', label_en: 'Playground', icon: FlaskConical },
     ],
   },
   {
@@ -58,7 +66,7 @@ const groups: { zh: string; en: string; items: NavDef[] }[] = [
 ];
 
 export function Sidebar() {
-  const { page, setPage } = useApp();
+  const { page, setPage, setLicenseDialog } = useApp();
   const gw = useGateway((s) => s.status);
   const providers = useGateway((s) => s.providers);
   const agents = useGateway((s) => s.agents);
@@ -91,7 +99,15 @@ export function Sidebar() {
           <Sparkles />
         </div>
         <div>
-          <div className="brand-name">Freeport</div>
+          <div className="brand-name" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Freeport
+            {/* 档位徽标跟着许可证走：宽限期仍是 Pro，但用警示色提示续费 */}
+            {license?.pro && (
+              <span className={`brand-pro ${license.status === 'grace' ? 'warn' : ''}`}>
+                PRO
+              </span>
+            )}
+          </div>
           <div className="brand-tag">自由港</div>
         </div>
       </div>
@@ -155,27 +171,44 @@ export function Sidebar() {
           </div>
         </div>
 
-        <div className="pro-card">
+        <div className={`pro-card ${license?.pro ? 'active' : ''}`}>
           <b>
             <T zh="Freeport Pro" en="Freeport Pro" />
           </b>
-          <p>
-            {license?.pro ? (
-              <T
-                zh={`已激活 · ${license.subject ?? 'Pro'}，还剩 ${license.daysLeft ?? 0} 天。`}
-                en={`Active · ${license.subject ?? 'Pro'}, ${license.daysLeft ?? 0} days left.`}
-              />
-            ) : (
-              <T
-                zh="实时目录 · 额度情报 · 多机同步。免费版功能完整，只是目录 7 天更新一次。"
-                en="Live catalog, quota intel, multi-device sync. Free tier keeps every feature, catalog refreshes weekly."
-              />
-            )}
-          </p>
-          <button onClick={() => setPage('settings')}>
-            <T zh={license?.pro ? '管理许可证' : '了解 Pro'} en={license?.pro ? 'Manage' : 'See Pro'} />
-            <ArrowUpRight size={11} />
-          </button>
+          {license?.pro ? (
+            <>
+              <p>
+                {license.status === 'grace' ? (
+                  <T
+                    zh={`宽限期：${license.subject ?? 'Pro'} 已过期，完全能力还保留 ${graceDays(license.graceUntil)} 天。`}
+                    en={`Grace: ${license.subject ?? 'Pro'} expired, full features for ${graceDays(license.graceUntil)} more days.`}
+                  />
+                ) : (
+                  <T
+                    zh={`已激活 · ${license.subject ?? 'Pro'} · 还剩 ${license.daysLeft ?? 0} 天。`}
+                    en={`Active · ${license.subject ?? 'Pro'} · ${license.daysLeft ?? 0} days left.`}
+                  />
+                )}
+              </p>
+              <button onClick={() => setPage('settings')}>
+                <T zh="管理许可证" en="Manage license" />
+                <ArrowUpRight size={11} />
+              </button>
+            </>
+          ) : (
+            <>
+              <p>
+                <T
+                  zh="实时目录 · 额度情报 · 多机同步。免费版功能完整，只是目录 7 天更新一次。"
+                  en="Live catalog, quota intel, multi-device sync. Free tier keeps every feature, catalog refreshes weekly."
+                />
+              </p>
+              <button onClick={() => setLicenseDialog(true)}>
+                <T zh="输入激活码" en="Enter license key" />
+                <ArrowUpRight size={11} />
+              </button>
+            </>
+          )}
         </div>
       </div>
     </aside>

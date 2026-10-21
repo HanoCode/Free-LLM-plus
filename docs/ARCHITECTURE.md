@@ -2,6 +2,16 @@
 
 > Freeport（自由港）：本机常驻的「大模型额度聚合网关」桌面应用。自动发现可用厂商/模型（含订阅额度与 Cookie 会话）→ 统一 OpenAI / Anthropic / Gemini 协议 → 一键注入已安装的 Agent。
 
+> **v1.8 变更（2026-10-20）**：路由预演 (`/v1/route`) 增加 `pool` 段，直接回答「这条 coding 请求现在会落在谁身上、余量够不够」（§3.8.2）。三件事以前得靠人拼：池里有几条凭据接这个用途（`accounts`，区分「池是空的」与「有号但全被拦」）、这个池近 24h 的战绩（`recent`，复用 Digest 的统计，不另算一份）、第一跳装不装得下这单（`cost`/`fits`/`shortfall`——Gate 只判窗口耗尽，剩 300 token 时 8k 的请求仍会放行然后撞 429）。结论以 `verdict` 码下发，措辞留给 GUI（双语）与 MCP（一句中文）。**预演只报告不改道**。
+>
+> **v1.7 变更（2026-10-20）**：**账号按用途分池**落地（`chat` / `coding` / `vision` / `probe`，见 §3.8.2）。语义是**收窄不是切分**：不打标签的凭据仍然什么活都接，打了才限定；判定顺序为「显式 header → 图片 → 已注入 Agent 身份 → chat 兜底」，其中 Agent 身份靠注入时写的 `agent:<id>` key **零配置**识别。巡检也遵守标签，`coding-only` 的号不再被探针烧额度。日志随条目记下 `purpose` 与 `purposeSource`，池过滤因此可事后复盘；摘要（Digest）再按池聚合出近期成败，MCP 的 `freeport_digest` 因此能直接回答「我的 coding 号是不是挂了」（见 §3.5.1）。
+>
+> **v1.6 变更（2026-10-20）**：① 新增 `GET /v1/freeport/inspect` —— MCP 现在能看到网关**内存里的**实时日志与冷却（回环 + `control.key` 双闸，与数据面凭据互不通用，见 §4.3）；② 工具输出压缩落地（默认关，只动 `tool` 输出，见 §3.6.12）。
+>
+> **v1.5 变更（2026-10-20）**：新增 **MCP server**（`--mcp` 形态，六个只读工具，见 §4.3）——把「为什么失败 / 现在还能用什么」从界面里解放出来交给 agent。
+>
+> **v1.4 变更（2026-10-20，文档↔代码对齐）**：补 `Retired` 健康状态、hedge 跳内切片、`Idempotency-Key` 响应缓存、每日 Digest、厂商级代理；冷却口径改为与实现一致的「类别基准 × 指数翻倍」；新增 §4.3「实现状态」表，把推迟项与触发条件写死。
+>
 > **v1.3 变更（M1.5 已落地）**：Tauri 2 + Rust 迁移完成，**Electron 代码已从仓库删除**。网关拆为 `freeport-core`（模型/错误/冷却/路由/DTO）与 `freeport-gateway`（store/providers/axum server）两个 lib crate，`src-tauri` 只做宿主；同一二进制支持 GUI 与 `--headless` 双形态。前端页面零改动，仅替换 `src/lib/ipc.ts` 门面。完整论证见 [`ADR-001-runtime.md`](./ADR-001-runtime.md)。
 
 ## 决策记录（2026-10-19）
@@ -422,6 +432,8 @@ discovered → probing → accepted
 
 **每日全量审计**：本地时间 03:00 ±90min 抖动（避免所有用户同时打上游），只跑 liveness，超预算即停。休眠或断网恢复后补跑一次，不重复跑。
 
+抖动的实现（`probe/src/patrol.rs::sweep_jitter_min`）：由本机 `install_id` 哈希到 `[-90, +90)` 分钟，**同一台机器天天同一时刻**，重启不变。用随机数会让「昨天 3 点今天 4 点」，用户按经验等的那次体检就不见了。
+
 **预算模型**
 
 ```
@@ -442,10 +454,14 @@ unknown → healthy → degraded → cooling → unavailable → retired
 | 状态 | 判定 | 路由行为 |
 |---|---|---|
 | `healthy` | liveness 通过 + 最近 20 次真实请求错误率 < 5% | 正常参与 |
-| `degraded` | liveness 通过但 P1/P2 失败 | 只进 chat-only 路由 |
+| `degraded` | liveness 通过但 P1/P2 失败，或成功率慢于 10s | 只进 chat-only 路由 |
 | `cooling` | 429 / 5xx 触发冷却 | 冷却期内排除 |
 | `unavailable` | **连续 2 次** liveness 失败 | 排除，30 分钟后复检 |
-| `retired` | 连续 7 天 unavailable，或目录标记下线 | 移出路由，保留历史 |
+| `retired` | 连续 **7 天** unavailable，或目录标记下线 | 移出路由**与巡检队列**，保留历史 |
+
+**已落地（2026-10-20）**：`HealthStatus::Retired` 在 `freeport-core/src/model.rs`，判定与转换在 `freeport-probe/src/health.rs`（`unavailable_since` 记住第一次死亡时刻、连续失败不刷新起点；`retire_if_dead` 满 7 天转 retired；`mark_retired` 给目录下线用）。`patrol::retire_pass` 在每轮巡检前跑一次，`due()` 直接跳过 retired——退役的模型不再烧探针预算。唤醒靠两条路：手动「重新探测」（`apply_ok` 会把状态拉回 healthy）或目录热更新。
+
+> 「恢复」也要留痕：`apply_ok` 从 `unavailable` / `retired` 爬回来时写 `recovered_at`，每日 Digest 才有「N 个恢复」可写——只看当前 status 的话，昨天挂了今天好了等于没发生过。
 
 防抖参数直接采用 chatgpt2api 跑过真实规模的值：新账号 **10 分钟**宽限不判死、无效判定需 **30 秒**内二次确认、刷新失败退避 **5 分钟**。**单次失败绝不改状态**——免费厂商偶发 502 是常态，一次就判死会让整个池子每天抖动。
 
@@ -456,6 +472,27 @@ unknown → healthy → degraded → cooling → unavailable → retired
 ```
 今日：新增 3 个模型 · 1 个下线 · 2 个恢复；探针 137/300 次预算，无异常。
 ```
+
+**已落地（2026-10-20）**：`freeport-core/src/digest.rs`（纯函数，`build_with_logs(&AppData, now_ms, &logs)`，不发任何上游请求）+ `gw_digest` 命令 + 概览页「今日摘要」卡片。字段来源如实对应：
+
+| 字段 | 来源 | 不这么做的后果 |
+|---|---|---|
+| 新增 / 下线 | `feed.events` 中 24h 内的事件 | 目录没变也报「新增」，等于编数字 |
+| 恢复 | `model_health[*].recovered_at` | 只看 status 的话，「昨天挂了今天好了」留不下痕迹 |
+| 探针消耗 | `patrol.used_today / budget_today` | 用累计数会显示成「探针 1200 次」，用户以为预算爆了 |
+| 需要处理 | feed 被拦原因、不可用/退役计数、全部失效的凭据、**失败过半的用途池** | 只报喜不报忧，用户不知道点哪儿 |
+| 用途池战绩 `pools` | 内存日志环（≤300 条）按 `LogEntry.purpose` 聚合 | 用户只能翻日志一条条数「我的 coding 号是不是挂了」 |
+
+**池战绩的样本边界要写清楚**：`pools` 不是 24h 全量，而是**内存日志环**里的条目，`logScanned` 就是实际看过的条数，界面标成「最近 N 条请求」。原因是日志只在内存（不落盘），拿它当全天总量会得出一个看起来精确、实际偏差很大的比例。
+
+两个刻意的取舍：
+
+- **没有请求的池不输出**，而不是输出 `okRate: 0`。零请求和全挂是两件事，用 0 表示前者会让界面显示「0% 成功率」——一个从未被使用的池看起来像故障。
+- **失败过半且样本 ≥3 才进 `attention`**。一单失败是常态；阈值太松会让「需要处理」变成狼来了，几次之后用户就不看了。
+
+MCP 的 `freeport_digest` 同样调这份数据，但它的进程里没有网关：日志环空的时候会先向**活着的那个网关**要日志（`/v1/freeport/inspect`），拿不到才退回本地。两种情况都会在输出里说清——`logScanned: 0` 时补一句 `poolHint`「空 ≠ 各池正常」。
+
+每日全量体检结束时，那一行结论会写进日志（`daily digest`），翻日志能对上「今天变了吗」。
 
 ### 3.5.2 目录运营：让「发布即到」真正成立
 
@@ -572,6 +609,16 @@ Ingress ──▶ ① Resolve  ──▶ ② Gate ──▶ ③ Rank ──▶ �
 | L1 | 请求显式指定 `provider/model` | 用户点了名，pin 到队首（但仍受硬门禁约束） |
 | L2 | 激活的 Profile（`coding` / `long-context` / `cheap`） | 不同场景用不同链 |
 | L3 | 全局链（`auto` 别名解析） | 兜底 |
+
+> **v1.11 起（模型组）**：L2/L3 只对 `auto` / `auto:<chain>` 生效。显式点名——
+> `provider:model` 或裸模型名——**不**补别的模型兜底：把别的模型补在后面，
+> 会让一次点名请求安静地落到另一个模型上（客户端只看得到响应里的 `model` 变了）。
+> 点名无路可走时回 503，错误信息说清是「未接入 / 已下架 / 凭据不可用 / 额度耗尽」。
+> 裸模型名是**模型组**：声明了这个 id 的每一家（含各自全部凭据）都入链，
+> 一家冷却自动落到另一家——不是只取第一个声明它的那家。
+> 对外别名随之分两种：只在一家的模型保留 `claude-freeport-provider:model`；
+> ≥2 家的收敛成 `claude-freeport-model`（组），`/v1/models` 的行内
+> `freeport.group/providers` 与模型列表的 `alsoOn` 让「N 家都能跑」可核实。
 
 合并后依次做**四类剔除**（剔除不是判死，只是本轮不考虑）：
 
@@ -742,14 +789,20 @@ sort key = (match_tier ASC, score DESC, priority ASC)
 2. **`HedgeAbortError` / 客户端断开不算 provider 失败**：不冷却、不惩罚、不学限额。把它记成失败会让健康的模型被冤枉。
 3. **模型级 bench**：15 分钟内跨 key 累计 3 次可重试失败 → 该模型在**所有 key** 上 bench 10 分钟。一次成功即清空窗口。
 
-**冷却阶梯（按 `model+key` 计，滚动 24h）**
+**冷却时长：基准由错误类别决定，连续命中按指数翻倍（按 `model+key` 计）**
 
-| 第 N 次 | 时长 |
-|---|---|
-| 1 | 2 min |
-| 2 | 10 min |
-| 3 | 1 h |
-| 4+ | 24 h |
+> v1.3 修订：早期文档写的是固定阶梯 2m / 10m / 1h / 24h。实现在 `freeport-core/src/cooldown.rs` 与 `error.rs` 里走的是「**类别基准 × 2^(hits-1)，封顶 24h**」——固定阶梯表达不了「分钟级限流 90 秒就够、额度耗尽该等一天」这种量级差异，而按 2 的幂翻倍在连续失败时增长曲线与阶梯等价。
+
+| 错误类别 | 基准时长 | 备注 |
+|---|---|---|
+| `rate_limit`（429 分钟级） | 90 s | 不计阶梯，恢复即用 |
+| `no_free_tier`（`limit: 0`） | 24 h | 稳定事实，一次到位 |
+| `quota_exhausted`（日额度） | 15 min 起，等 `Retry-After` / 零点 | 重惩罚 |
+| `auth` / `credit` / `tier` | 5 min / 24 h / 24 h | 见 §3.6.7 矩阵 |
+| `upstream`（5xx / 超时） | 90 s 起 | 阶梯翻倍 |
+
+- 第 N 次连续失败：`min(基准 × 2^(N-1), 24h)`
+- 冷却来源分四类：`heuristic`（可探针提前恢复）/ `authoritative` / `credit` / `tier`
 
 - 上游给了 `Retry-After` 且大于我们的估计 → 用上游的，并标 `authoritative`（不再探测）。
 - 未声明限额的平台（只有「免费」没有任何 rpm/rpd 数字）：1 小时内 2 次 429 判为「事实上的日耗尽」，但冷却**封顶 10 分钟**，避免 90 秒循环打一整天。
@@ -779,6 +832,7 @@ attempt ≥ 2        检查 elapsed >= budget → 停止，返回 timedOut
 ```
 
 - 每次尝试武装一个 `hedgeTimer`，到点直接 `AbortController.abort()` 掐掉在途请求。
+  **已落地（2026-10-20）**：Rust 侧用「切片」实现——还有下家时这一跳只拿到 `剩余预算 / 剩余跳数`，夹在 `[8s, 20s]`；最后一跳拿满剩余预算（后面没人了，掐掉只是白等）。另外 `reqwest` 的 timeout 只覆盖到响应头，所以非流式的**响应体读取**单独再套一层 `tokio::time::timeout`——「头回来了、体不发」是最常见的挂死形态。e2e 见 `tests/hedge_e2e.rs`：上游挂 60s，3s 预算内必须切到第二家。
 - **首个有效语义块到手才 `disarmHedge()`**：模型名/用量等元数据块不算数——免费厂商最常见的失败形态是「200 + 正常 SSE + 只发 role delta + 空 content」。判定点必须右移到 `text` / `reasoning` / `tool_call` 任一出现，且此时代理尚未向客户端提交响应头，仍可换家。
 - 缓冲有上限（64 KiB）：能疯狂输出说明上游是活的，超限直接放行，不为了「可能失败」把用户堵住。
 - **最后一跳不 Hold**：后面没有候选时缓冲只是白等，直接放行。
@@ -796,9 +850,17 @@ attempt ≥ 2        检查 elapsed >= budget → 停止，返回 timedOut
 #### 3.6.10 结算与学习
 
 - **租约（lease）**：选 key 时写入「预估 token 占用」，请求结束在 `finally` 释放。没有租约，10 个并发请求会同时读到「还有余量」，然后一起打爆限额——这是 check-then-act 竞态，必须用租约关掉。
+  **实现说明（v1.3）**：没有单独的 `Lease` 对象，语义由 `Ledger::reserve_now` / `settle_now` 承担——预扣先落账、结算回吐差额，全部在 `data.write()` 写锁内完成（写锁本身就是串行点，读-改-写不会交错）。区别在于「租约」能在请求 panic 时自动释放，而预扣依赖 `settle` 被调用；当前每条退出路径（成功 / 失败 / hedge 掐断 / 客户端断开）都显式结算，若将来引入会 panic 的路径，应先补一个 drop guard 再上线。
 - **记账时机**：请求前按 `输入估算 + max_tokens` 预扣（并发不超卖），拿到 `usage` 后 `settle` 回吐差额。失败时分两种情况：`status == 0`（没连上，上游没计费）全退 token；上游已受理则退到只算输入。**请求数一律不回滚**——上游确实收了这一次。
 - **巡检单列**：账本每个窗口分 `used_user` 与 `used_probe`。RPD 耗尽时不能服务用户，但一条 3 token 的 liveness 仍值得跑；混记就做不出这个区分，也解释不了「我只发了 3 次请求，额度怎么没了」。
 - **学限额**：上游报错里带 `Limit 30000, Requested 33476` 这类信息时，**只收紧不放宽**地写回模型限额。学到之后，下一次请求在本地就被拦住，不用再吃一次 413。
+- **模型级窗口（v1.11）**：429 文案点名了模型（Groq / OpenAI 系的
+  `Rate limit reached for model \`x\` on tokens per minute (TPM): Limit 6000`）时，
+  限额记进 **`account|model`** 的窗口，不是账号级——同一条 key 上的其它模型不受影响。
+  这张表**没有配置入口**：目录只有厂商级限额，先造配置字段等于造一张没人填的表；
+  数据只来自上游明说的事实，语义与账号级学习相同（只收紧、点名的模型与请求不一致时不记）。
+  Gate 在账号级检查之后追加模型级检查；记账 / 结算 / 探针三处同步写 `account|model` 窗口，
+  没学过的窗口零成本（连槽位都不建）。凭据删除时模型窗口一并清（键前缀 `account|`）。
 - **惩罚衰减**：429 惩罚值每 5 分钟衰减 1，最低 0。恢复靠时间，不靠人工重置。
 
 #### 3.6.11 契约：响应头与幂等
@@ -813,7 +875,43 @@ attempt ≥ 2        检查 elapsed >= budget → 停止，返回 timedOut
 
 `Idempotency-Key`：SHA-256(key) + 请求指纹（model + messages + temperature + tools）→ 24h 内重放同一响应；指纹不一致返回 409。**流式不缓存**，`finish_reason=length` 不缓存（截断的答案重放没有意义）。
 
-#### 3.6.12 主循环伪代码（实现时的唯一真相）
+**已落地（2026-10-20）**：`crates/freeport-gateway/src/idem.rs`（进程内、上限 512 条、最早写入淘汰）。四条实现选择：
+
+| 决定 | 理由 |
+|---|---|
+| 键存 `sha256(客户端 key)`，不存原文 | 用户可能把它当 secret 复用；摘要足够定位 |
+| 重放发生在虚拟 key 记账**之前** | 重试一次不该再扣一遍用户配额 |
+| 响应带 `x-freeport-idempotent-replay: 1` | 排查时分得清「缓存」还是「又生成了一次」 |
+| 不落盘 | 重启后重放一次上游，好过把响应体（含用户 prompt 的产物）写到磁盘上 |
+
+e2e 见 `tests/idempotency_e2e.rs`：同键同体重放零上游命中、同键异体 409、同键流式两次就是两次真实生成。
+
+#### 3.6.12 工具输出压缩（可选，默认关）
+
+单独立一节的理由：这个功能会**改用户发出去的请求**。任何「帮你优化一下」的改动，只要
+悄悄生效，就会把答错的原因从「模型不行」变成「你其实没让它看到全部输入」——排查成本极高。
+所以它的每一处都必须可解释、可关闭、可见。
+
+**只压这两类**：OpenAI `role: "tool" | "function"` 的 `content`；Anthropic `tool_result`
+块（`content` 是字符串或 `[{type:"text"}]`）。用户说的话、模型的回答、`system`——一个字不动。
+
+| 规则 | 值 | 理由 |
+|---|---|---|
+| 默认 | 关 | 会丢信息，不该是默认行为 |
+| 触发阈值 | `compress.maxToolChars`，默认 8000 字符 | 低于这个数模型读得完，压它是纯损失 |
+| 保留 | 头 30% + 尾 15% | 命令与参数在头，报错栈与退出码在尾，中间才是噪音 |
+| 省不到 20% 不压 | 算上说明文字 | 只短一点点 = 白丢信息，还多付一段说明 |
+| 幂等 | 已含标记就跳过 | 多跳重试不能把尾巴越吃越短 |
+| 可观测 | 响应头 `x-freeport-compressed: <省掉的字符数>` + 一条 `tracing::info` | 账单变小、或者模型说「没看到中间那截」，都得能立刻对上原因 |
+
+替换文字里有一句必须存在：「**不要根据这段摘要臆测被省略的部分**」。没有这句，模型会把
+「中间省略」读成「中间没有」，然后一本正经地编。
+
+配置 `gateway.compress = { enabled, maxToolChars, keepHead, keepTail }`；设置页只有一个开关，
+阈值改动时头尾按 30% / 15% 自动换算（用户只填一个数）。e2e 在 `tests/compress_e2e.rs`：
+桩上游抓请求体，验「关着时一个字符都不改」与「开着时头尾都在、标记可见、响应头如实报数」。
+
+#### 3.6.13 主循环伪代码（实现时的唯一真相）
 
 ```ts
 const state = { skipKeys: new Set(), skipModels: new Set(), skipPlatforms: new Set() }
@@ -874,6 +972,8 @@ return exhausted('retries_exhausted', lastError)                      // 按「�
 | 入口 | 路径 | 覆盖客户端 |
 |---|---|---|
 | OpenAI Chat | `POST /v1/chat/completions` | Cline, Continue, Aider, OpenCode, Roo, Kilo, Crush, 绝大多数 SDK |
+| OpenAI 旧版补全 | `POST /v1/completions` | 老 SDK、脚本、批量评测工具 |
+| OpenAI Embeddings | `POST /v1/embeddings` | 检索 / RAG 管线、langchain |
 | OpenAI Responses | `POST /v1/responses` | Codex CLI (`wire_api = "responses"`) |
 | Anthropic Messages | `POST /v1/messages`（含 `count_tokens`） | Claude Code, Anthropic SDK |
 | Gemini | `POST /v1beta/models/{m}:generateContent` / `:streamGenerateContent` | Gemini CLI, Google SDK |
@@ -896,6 +996,8 @@ return exhausted('retries_exhausted', lastError)                      // 按「�
 | 入口 | 状态 | 位置 |
 |---|---|---|
 | OpenAI Chat | 已实现 | `server.rs::chat` |
+| OpenAI 旧版补全 | 已实现（`prompt` → 单条 user 消息；`choices[].text` 与 `text` 流式块） | `completions.rs` + `server.rs::completions_entry` |
+| OpenAI Embeddings | 已实现（原样转发 + usage 记账；只走 OpenAI 兼容线） | `providers.rs::create_embeddings` + `server.rs::embeddings_entry` |
 | OpenAI Responses | 已实现（`input` 摊平、`output` 组装、语义化 SSE 事件） | `responses.rs` + `server.rs::responses_entry` |
 | Anthropic Messages | 已实现（含 `count_tokens`） | `anthropic.rs` + `server.rs::messages` |
 | Gemini generateContent / streamGenerateContent / countTokens | 已实现 | `gemini.rs` + `server.rs::gemini` |
@@ -903,11 +1005,15 @@ return exhausted('retries_exhausted', lastError)                      // 按「�
 
 Responses 入口的三条边界：**不实现 `previous_response_id`**（无状态网关，Codex 每轮把完整历史塞进 `input`）、**丢弃 hosted tools**（`web_search` / `file_search` 没有 `name`，透传会让 Gemini 这类严格校验的厂商直接 400）、**不落 `store`**。另外 `reasoning.effort` / `parallel_tool_calls` 也不透传——严格校验的兼容端点会因为多一个键直接 400。注入给 Codex 的默认仍是 `wire_api = "chat"`——那条链路已实机验证过，Responses 入口先给手动配置的用户，等实机跑通再改默认。
 
-四个协议入口都汇到 `chat()`，日志里的 `path` 由各 adapter 用内部头 `x-freeport-path` 标注，所以「请求日志」页能看出这次是从哪个协议进来的。同一条日志还带 `account_id` / `account_name`（名字是**当次快照**，凭据以后被删这条记录仍读得懂），每一次失败尝试的 `attempt.account` 也会写明是哪条 key 挂的。
+五个协议入口（Chat / 旧版补全 / Responses / Anthropic / Gemini）都汇到 `chat()`，日志里的 `path` 由各 adapter 用内部头 `x-freeport-path` 标注，所以「请求日志」页能看出这次是从哪个协议进来的。同一条日志还带 `account_id` / `account_name`（名字是**当次快照**，凭据以后被删这条记录仍读得懂），每一次失败尝试的 `attempt.account` 也会写明是哪条 key 挂的。Embeddings 是唯一的例外：它没有「消息」可转，走自己的接力循环，日志与诊断字段同款。
 
 Gemini 入口的三个坑已按上表处理：`contents` 相邻同角色合并、`functionResponse` 按函数名回填 `tool_call_id`、流式在收尾一次性发完整 `functionCall`（Gemini 不接受分片 `args`）。
 
 Ollama 入口的关键差异：**流式是 NDJSON 不是 SSE**（一行一个 JSON，无 `data:` 前缀），结束靠 `done: true`，且 `stream` **默认 true**（与 OpenAI 相反）。`/api/tags` 直接复用 `/v1/models` 的聚合结果，所以注入给 Zed 的模型名就是 `provider:model`，能原样喂回路由。
+
+旧版补全入口（`/v1/completions`）的边界：`prompt` 只接受**单条**字符串（多条等于批量补全，chat 接口没有这个语义）、**不接受 token id 数组**（还原不成上游认识的文本）、**不接受 `suffix`**（中间填充要上游原生 FIM）。三种都返回 400 而不是猜——猜出来的答案看起来是正常的，代价是用户拿它当真。`echo` 在本地实现（拼回 `text` 前面），不透给上游；工具调用收尾降级成 `stop`，因为旧协议的读者不认识工具。
+
+Embeddings 入口（`/v1/embeddings`）的边界：**不走 chat() 的接力链**（没有消息、没有流），只复用 Gate、账本与失败分类；**只转发给讲 OpenAI 兼容线的厂商**，订阅号的原生端点没有 embeddings——这类候选记 `no_embeddings_endpoint` 直接跳过，一次上游调用都不发；**不代选模型**——目录没把 embedding 单列，`auto` 挑一个等于猜错也能跑通，点名无路可走时如实 503。`input` 只收非空字符串或字符串 / token id 数组，其余形状 400；上游体只带 `model` / `input` / `dimensions` / `encoding_format`，多一个键就是一次 400 换家。usage 拿到真值就结算，token 预扣按输入 ÷3 估。
 
 **建议**：先只做「OpenAI 入口 + 全 adapter」，Anthropic/Gemini 入口在 P1。因为 90% 的 agent 能说 OpenAI，而 Claude Code 必须 Anthropic。
 
@@ -1119,15 +1225,74 @@ provider ─┬─ account A (api_key)  ─┐
 - 每条凭据有自己的 `health`：校验第二把 key 失败不会把第一把刷红；厂商级 `health` 是「只要还有一条好的就算好」的汇总
 - 账号可手动「启用 / 停用」，停用的不进入候选链
 
-**尚未实现（原计划的 Pool 概念，推迟到 Tier C）**
+**账号用途分池（v1.7 已落地）**
 
-- 账号按「用途」分池（coding / chat / vision），路由时只在该池内选
-- 账号优先级 / 「仅低优先级使用」；跨池的预算分配
-- `kind` 维度（api_key / oauth / cookie）——目前只有 api_key，OAuth 与 Cookie 属 Tier C 凭据形态
+```
+provider ─┬─ account A (purposes: [])          ─▶ 什么活都接
+          ├─ account B (purposes: [coding])    ─▶ 只接已注入 Agent 的流量
+          └─ account C (purposes: [vision])    ─▶ 只接带图的请求
+```
 
-> 为什么不先做 Pool：v1 的痛点是「免费额度被单 key 打满」，补第二把 key 就解决了；
-> 分池要等 Tier C 的多形态凭据（订阅态与免费态额度语义完全不同）才有意义，
-> 提前引入只会让 `plan()` 多一层没人用的过滤。
+分池要解决的是**「某一类流量烧掉不该烧的额度」**，不是「把额度切开」。三块常见诉求：
+给 Claude Code 的那把 key 不许被随手 curl 用掉；带图的请求只走测过视觉的那家；
+巡检别碰主力号。所以语义定成**准入限制**：
+
+| 规则 | 实现 |
+|---|---|
+| `Account.purposes` 为**空** = 不限用途 | `Account::admits()`：`purposes.is_empty() \|\| contains(purpose)` |
+| 这一条是**兼容性红线** | 存量配置没有这个字段，空列表若读成「什么都不能干」，升级那一刻所有人断网 |
+| 只过滤「谁能接」，不改权重与顺序 | 过滤在 Gate 层，SWRR / 粘性完全不知道池的存在 |
+| 全池被挡时光链 + 明确原因 | `Rejected.kind = "purpose"`；503 文案点名「N 条凭据因用途标签被排除」，而不是含糊地说「都在冷却」 |
+
+**请求侧怎么判定**（顺序即优先级，`Purpose::infer`）：
+
+| 顺位 | 信号 | 为什么在这个位置 |
+|---|---|---|
+| 1 | `x-freeport-purpose: chat\|coding\|vision\|probe` | 调用方的明确声明，给需要精确控制的脚本；写错的值只告警不失败 |
+| 2 | 请求里含图片（`Needs::vision`） | 客观属性，比「谁发的」更贴近它需要什么。**没有显式声明时**，带图的 coding 请求算 vision —— 用户标 vision 池就是为了让图片走特定号 |
+| 3 | 来自已注入的 Agent（`api_keys.name` 前缀 `agent:`） | 这是整套机制真正的价值：注入时每个 Agent 已经有一把独立 key，**零配置**就把「IDE 里的 Agent」和「随手 curl」分开了 |
+| 4 | 其余 | `chat`。绝大多数未标注的请求确实是普通对话 |
+
+**巡检遵守标签**：`patrol::collect` 在**入队前**就跳过「整家都没有 `admits(Probe)` 账号」的厂商。
+不能等到发请求时再 `continue` —— 那样它每次都被挑中、发现没账号、跳过，而 `overdue` 只增不减，
+永远排最前，把真正该测的模型饿死。代价是：被标成 `coding-only` 的号其模型健康度会停在 `unknown`，
+这是用户明确选择的后果，界面在勾选时已提示。
+
+**日志可复盘**：`LogEntry.purpose` 记这条请求进了哪个池，`purposeSource` 记依据
+（`header` / `image` / `agent-key` / `default`）。
+池过滤是**静默的**——不记这两项，「为什么另一把更宽裕的 key 没被选中」事后只能靠猜。
+两个字段由同一次 `Purpose::infer_with_source` 产出，不允许调用方各判一遍：
+两处实现迟早会漂，然后日志上写的依据和实际过滤用的池对不上，那比不记更坏。
+界面只给非 `chat` 的请求挂池标签（chat 是默认值，每行都标一枚反而不显眼），点开行看依据。
+`X-Freeport-Trail` 同样只在非 chat 时加 `[coding:agent-key]` 前缀——终端排障时不必回界面就能确认这次按哪个池走的。
+
+**已知边界**：`/v1/models` 与别名表**不按池过滤**（模型目录是能力声明，不是「当前谁的额度可用」）。
+点名一个只存在于别的池里的模型，会得到 503 + 池原因，而不是 404。
+
+**预演要回答「会落在谁身上、够不够」（v1.8）**
+
+`GET /v1/route`（以及 GUI 路由页、MCP `freeport_route`）返回的 `pool` 段是链路的补充，不是重复：
+`chain` 给顺序，`pool` 给一句人话。
+
+| 字段 | 回答什么 | 为什么不能从链上推出来 |
+|---|---|---|
+| `accounts.{total,admits,blocked}` | 这个用途有几个号接着 | 链路为空有两种原因：池里根本没有号，或池里有号但这一轮被额度/冷却全挡了。前者要去改标签，后者等着就行——混成一句「没有可用候选」等于没说 |
+| `recent.{requests,errors,okRate}` | 这个池最近是不是一直在挂 | 复用 `digest::pool_stat`，和摘要同一份统计。两处各算一遍，迟早出现「摘要说 78%、预演说 100%」，而用户没法判断该信哪个 |
+| `landsOn` | 这一单会落在谁身上 | `chain[0]` 的摘录，给只要一句话的场景（MCP / 终端） |
+| `tightest` | 链上最紧的一跳是哪个窗口见底 | hedge 与失败换家会用到后面的跳；只盯第一跳会漏掉「换过去正好是最满的那个号」 |
+| `cost` / `fits` / `shortfall` | 这一单装不装得下 | Gate 只判「窗口有没有耗尽」。日窗口还剩 300 token 时一条 8k 的请求照样放行，然后撞 429——这是「账面上有、实际没有」 |
+
+`verdict` 是结论码，措辞留在各端（GUI 要中英双语，MCP 只要一句中文）：
+`empty-pool`（没有号接）→ `no-candidate`（有号但全被拦）→ `too-big`（第一跳装不下）→
+`pool-failing`（近期失败过半）→ `tight`（首跳余量低于 15%）→ `ok`。
+
+**预演只报告，不改链路**。`?tokens=` 判出的 `too-big` 不会让这一单改道：把 token 预估引入 Gate
+是另一个复杂度量级，估错了会把好端端的一单推给更差的模型。它只负责在还来得及换的时候说一声。
+同理，没传 `tokens` 时 `fits` 是 `null` 而不是 `true`——猜一个数字去报红比不报更糟。
+
+> 账号级代理仍然不做（同一凭据换出口 IP 属于风控规避）。
+> `kind` 维度（api_key / oauth / cookie）由 `Credential::load` 的优先级处理，不进池维度：
+> 同一个号换凭据形态不该改变它接什么活。
 
 ### 3.8.3 迁移与多机同步（v1：加密迁移码）
 
@@ -1185,13 +1350,14 @@ provider ─┬─ account A (api_key)  ─┐
 | 鉴权 | 本地随机 token（32B），`Authorization: Bearer`；可选「回环免鉴权」 |
 | 来源 | 带 `Origin` 头的请求一律 403（端口不给浏览器用），防 DNS rebinding / 网页探测 |
 | 密钥存储 | 本机密钥库：`vault.key`（32B，0600）为根密钥，`secrets.json` 存 AES-256-GCM 密文；DB 只存条目名与掩码；导出需二次确认 |
+| 配置落盘 | 原子写（tmp + `fsync` + rename，0600）。**写入目标永远是实例加载时那个目录**（`load_from(dir)` → `save_here`），不是进程级 `data_dir()`：否则用自定义目录载入的实例（测试、便携/多配置档）在配额记账、统计、健康度回写时会把配置写进真实用户目录，而且不报错——保存成功，只是存错了地方 |
 | 会话 Cookie | 加密 jar（AES-256-GCM，根密钥同本机密钥库），按 provider 隔离 partition，退出可一键清除全部会话 |
 | 登录窗口 | 独立 `BrowserWindow`，禁用 devtools、禁用外部导航白名单之外跳转，登录完立即销毁 |
 | 凭证可见性 | UI 只显示后 4 位；复制需点击且 30s 后自动清剪贴板（可选） |
 | 日志 | 正则脱敏（`sk-*`, `gsk_*`, `AIza*`, `hf_*`, `xai-*`）；请求体默认不落盘，仅元数据 |
 | 注入文件 | 0600；备份同样 0600 |
 | 更新 | 签名校验 + 可选关闭 |
-| 网络 | 系统代理支持（HTTP/HTTPS），可选 per-provider 代理 |
+| 网络 | 系统代理（环境变量）+ **厂商级代理**（`Provider.proxy`，厂商页「代理」按钮）。优先级：厂商级 > 环境变量；本机回环永远直连（否则 chat2api 这类 127.0.0.1 上游会被代理掐断）。账号级代理未做——同一凭据换出口 IP 属于风控规避范畴，按红线不提供 |
 
 ### 3.10 数据模型（SQLite, WAL）
 
@@ -1298,6 +1464,8 @@ free-llm-plus/
 |---|---|---|---|
 | **v1（现在）** | 已支持「自定义 OpenAI 兼容端点」。用户自行 `docker run` chatgpt2api，把 `127.0.0.1:3000/v1` + auth-key 填进 Freeport | 0（现有能力） | 立刻可用，产品不承担任何责任 |
 | **v1.5** | **Extension Host**：可选安装 sidecar，Freeport 负责下载 / 校验 / 启动 / 健康检查 / 端口分配 / 卸载 | 2–3 周 | 一键装、统一日志、可建扩展目录 |
+
+> **状态（2026-10-20）**：宿主本身已落地（`crates/freeport-ext`），`/v1/images/generations` 与 `/v1/audio/transcriptions` 已可用，两个第一方扩展随包分发。**未做**的是「从网络安装第三方扩展」——`install::installed()` 只扫描本地已落盘的 manifest，UI 没有安装入口。这一步卡在「签名公钥与作者体系」上，不是卡在代码。
 | **v2** | 扩展市场 + 签名分发 + 权限模型 | 4 周 | 生态 |
 
 **Extension Host 最小协议**
@@ -1364,8 +1532,8 @@ free-llm-plus/
 | **P2** | 应用自动更新 + feed 双通道（stable/beta） | 免发版修复客户端 |
 | **P2** | **Extension Host + chat2api 集成（v1.5）** | 图片等非 chat 能力的唯一合理载体 |
 | **P2** | 维护者 Admin：feed diff 审阅 / 事件撤回 / 强制下架 | 没有它，「发布即到」=「事故即到」 |
-| **P2** | MCP server（让 agent 自省可用模型） | 差异化 |
-| **P2** | prompt/工具输出压缩（RTK 类） | 省 token |
+| **P2** | MCP server（让 agent 自省可用模型） | 差异化；**已落地**，见 §4.3 |
+| **P2** | prompt/工具输出压缩（RTK 类） | 省 token；**已落地**（只做工具输出，见 §3.6.12） |
 | **P2** | 导入导出、i18n、崩溃上报（opt-in） | 发行需要 |
 
 ### 4.2 关键用户流程
@@ -1399,6 +1567,105 @@ free-llm-plus/
                     为什么没选 B（不支持 tools）
                     最终用了 C（延迟 840ms）
 ```
+
+### 4.3 MCP server（2026-10-20 落地）
+
+自由港的差异化不在于多接了几家厂商，而在于**它站在所有厂商前面，所以知道为什么失败**。
+这份认知以前只活在界面里：agent 只看得见「调用失败」这一个事实，看不见「谁还能接」，
+于是把 502 原样转给用户，然后开始编原因。
+
+**形态**：同一个可执行文件加 `--mcp`，走 stdio JSON-RPC 2.0，**不起网关、不转发流量**。
+MCP 只回答问题；起网关会多占一个端口、多开一份巡检，而客户端本来就连着用户的网关
+（或者没有，那不关 MCP 的事）。
+
+**六个只读工具**
+
+| 工具 | 回答的问题 | 数据来源 |
+|---|---|---|
+| `freeport_status` | 网关在不在跑、是否暂停、24h 请求/错误计数、当前冷却 | `Gateway::status` + 配置端口 TCP 探活 |
+| `freeport_models` | 此刻**真的**能用什么（已排除 cooling / unavailable / retired）、支持什么能力 | `aggregate_models`（与 `/v1/models` 同一份事实） |
+| `freeport_route` | 这一单会走谁、每个候选的权重与被排除原因；`pool` 段另答「这个池有几个号、近期战绩、第一跳够不够」 | `explain_route_cost`（纯预演，无副作用；`tokens` 可选） |
+| `freeport_quota` | 每条凭据四个窗口的余量与恢复时刻 | `Gateway::quota` |
+| `freeport_digest` | 过去 24h 的新增 / 下线 / 恢复 / 探针消耗 | `core::digest` |
+| `freeport_recent_errors` | 最近的失败，含每一跳的厂商 / 凭据 / 状态码 / 作用域 | 进程内日志 |
+
+**三条硬约束**
+
+1. **没有写操作**。MCP 的调用方是一个语言模型：把「删凭据」「改路由」挂上去，
+   等于把用户的额度交给一段可能被 prompt 注入的文本。改配置只能由用户在界面里做。
+2. **不吐密钥**。`status` 只给 `baseUrl` 与是否需要鉴权，从不返回 `authToken`；
+   e2e 里有一条断言把这件事锁死（`status_never_leaks_the_gateway_token`）。
+3. **stdout 只有 JSON-RPC**。日志在 `--mcp` 分支改道 stderr——混进一行日志，客户端会在
+   半行日志上解析失败，表现成「服务器连不上」，而不是「日志打错地方了」。这条最容易在
+   重构日志初始化时被破坏，所以入口处单独写了注释。
+
+**能力判定沿用三态**：`Some(false)` 明确不支持，`None` 是未知——**未知不算支持**。
+否则 agent 会挑一个没测过 tools 的模型去跑工具调用，然后在「模型不听话」上浪费半天。
+
+**实时视图（2026-10-20 落地）**：MCP 是**独立进程**，读磁盘快照只能拿到落过盘的东西
+（`model_health`、账本、统计），拿不到实时日志、内存里的冷却、在途数。所以加了
+`GET /v1/freeport/inspect`：
+
+| 闸 | 规则 | 为什么两道都要 |
+|---|---|---|
+| 来源 | 只接受回环地址（`ConnectInfo` 的 peer） | 本机任何网页都能打 `127.0.0.1`；CORS 只挡读响应，挡不住请求 |
+| 凭据 | `x-freeport-control` == 数据目录 `control.key` 里的值（0600，32 字节随机） | 「本机就放行」等于没有凭据，DNS rebinding 就能读空 |
+
+**为什么不用 `authToken`**：那把能发 `/v1/chat/completions`，能烧额度。为了看日志把
+「花钱」的能力交出去不划算。两套凭据互不承认——控制凭据当 `Bearer` 发业务请求必须 401，
+e2e 里钉死了这条（`tests/inspect_e2e.rs`）。
+
+MCP 侧的行为变成：能连上就报 `source: "gateway"`（`paused`、`inflight`、`logs`、
+`cooldowns` 全是内存里的真值）；连不上就退回磁盘快照并报 `source: "disk"`，
+文案明说「连不上网关，这些数字是最后一次保存时的值」。
+`paused` 只在内存里、磁盘上根本没有——它能被 MCP 读到，就是实时视图活着的证明
+（`mcp_e2e.rs::a_second_instance_sees_the_live_memory_state_of_the_running_gateway`）。
+
+已知边界：**控制凭据只在本机有效**，MCP 与网关必须同一用户、同一数据目录；
+换数据目录（`FREEPORT_DATA_DIR`）就是另一个信任域，读不到对方的状态——这是设计，不是缺陷。
+
+配置示例（Claude Desktop / Codex 通用，设置页也有同一份）：
+
+```json
+{
+  "mcpServers": {
+    "freeport": {
+      "command": "/Applications/Freeport.app/Contents/MacOS/Freeport",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+### 4.4 实现状态（2026-10-20 逐项核对代码）
+
+这张表是「文档写的」与「代码里真的有的」对齐后的结果。标 ❌ 的不是忘记做，是**有意推迟**，每条都写清触发条件——避免下一个人重新讨论一遍。
+
+| 项 | 状态 | 位置 / 说明 |
+|---|---|---|
+| 六类协议入口（OpenAI / Responses / Anthropic / Gemini / Ollama / models） | ✅ | `server.rs` 路由表 + 各自 adapter |
+| 三层路由（Gate / SWRR / Pick）+ affinity + 429 三分法 | ✅ | `core/src/{route,affinity,error}.rs` |
+| 四窗口账本（used_user / used_probe）+ reserve/settle | ✅ | `core/src/quota.rs` |
+| 冷却阶梯（类别基准 × 指数、封顶 24h） | ✅ | `core/src/cooldown.rs`；文档已同步改口径 |
+| hedge（跳内切片 + body 读取超时） | ✅ | `server.rs` `attempt_ms` + `HEDGE_MIN/MAX_MS`，`tests/hedge_e2e.rs` |
+| Idempotency-Key 响应缓存 | ✅ | `gateway/src/idem.rs`，`tests/idempotency_e2e.rs` |
+| 每日 Digest | ✅ | `core/src/digest.rs` + `gw_digest` + 概览页卡片；含按用途池聚合的近期成败（样本 = 内存日志环，`logScanned` 标明条数） |
+| 健康状态机（含 Retired） | ✅ | `probe/src/health.rs`、`patrol::retire_pass` |
+| 厂商级代理 | ✅ | `Provider.proxy` + `providers::client_of`（连接池缓存）|
+| 注入 18 个适配器 + 项目级 scope | ✅ | `inject/src/spec.rs`，e2e 覆盖闸 |
+| 签名 feed + RFC 6902 补丁链 + canary | ✅ | `catalog/src/feed.rs` |
+| Auth Broker（设备码 / Cookie / 续期） | ✅ | `auth/`、`gateway/src/{tokens,cred}.rs` |
+| 迁移码 / `.fpk` | ✅ | `gateway/src/transfer.rs` |
+| License（EdDSA JWT + 7 天宽限） | ✅ | `license/src/lib.rs` |
+| 自动更新（下载 + 替换） | ❌ 阻塞 | 只做了「检查更新」（读 GitHub Releases）。`tauri-plugin-updater` 需要 minisign 密钥对，密钥未就位前接线等于发一个验不过的升级包 |
+| Extension Host | ✅ 部分 | `crates/freeport-ext`（`manifest` 权限校验 / `sig` Ed25519 验签 / `host` 子进程 / `runtime` 动态端口 / `install` 落盘）。**只开放第一方内置扩展**（ASR、图片）；第三方安装入口未开，`Extensions` 页「开发者模式」如实提示后续版本 |
+| `/v1/images/generations`、`/v1/audio/transcriptions` | ✅ | `gateway/src/exts.rs`；走扩展子进程，不占 chat 的账本与故障域 |
+| MCP server | ✅ | `crates/freeport-mcp` + `--mcp` 形态；六个只读工具，e2e 11 条。设计见 §4.3 |
+| 实时自省接口 `/v1/freeport/inspect` | ✅ | 回环 + `control.key` 双闸；给 MCP 提供实时日志 / 内存冷却 / 在途数，`tests/inspect_e2e.rs` |
+| 工具输出压缩 | ✅ | `gateway/src/compress.rs`；默认关、只动 tool 输出、留头留尾 + 显式标记，`tests/compress_e2e.rs`。设计见 §3.6.12 |
+| chat2api 集成 | ❌ 推迟 | v1 的路径是「自定义 OpenAI 兼容端点」，用户自己 `docker run`；产品不承担逆向链路的责任 |
+| 账号按用途分池（chat / coding / vision / probe） | ✅ | `Account.purposes` + Gate 过滤 + `Purpose::infer` 四顺位判定；巡检同样遵守，`tests/purpose_e2e.rs` 四个场景；日志记 `purpose` / `purposeSource`。设计见 §3.8.2 |
+| 账号级代理 | ❌ 不做 | 同一凭据换出口 IP 属于风控规避，按红线不提供 |
 
 ---
 
@@ -1808,8 +2075,16 @@ freellmapi 已经跑通了一条很干净的商业化路径，值得直接借鉴
 | **Pro** | ¥29/月 或 ¥199/年 | ① 实时目录（5–15 分钟级）② 社区额度情报（哪家此刻还能用、哪家在维护）③ 多机配置加密同步 ④ 云端并发探针（比本地快 10 倍发现新模型）⑤ 日志保留 90 天 | license = 签名 JWT（Ed25519），公钥内置，**离线可验**，7 天宽限期 |
 | **Team**（后续） | 按席位 | 策略模板下发、团队共享的 Routing Profile、统一注入清单 | **只同步策略，不同步 key**——共享 key 会变成额度分销，法律与风控都不成立 |
 
-**硬性约束（写进代码，不靠自觉）**
+**已落地（2026-10-21）**：`crates/freeport-catalogd` 是目录服务端——按 Bearer 验签决定发
+`live.json` 还是 `monthly.json`，`tier` 与快照摘要一起进签名，`?since=` 命中回 304，
+补丁只下发「下一环」。客户端 `FeedState::due_for` 按档位定轮询节奏（Free ≥30min / Pro ≥1min），
+但那只是礼貌值，真正的时效差在服务端。
+`feat` 也已落地为**字段包**：`manifest.feat[]` 列出这次下发的哪几项情报（名字+摘要进签名），
+服务端只按令牌的 `feat` 名单挑，`/v1/feat/{name}` 与 `/v1/snapshot/live.json` 都要验令牌；
+客户端先确认「自己认识这个包」再拉，不认识的记进 `featsSkipped`。首发能力是 `quota.intel`。
+完整设计见 `docs/PRO-DESIGN.md`。
 
+**硬性约束（写进代码，不靠自觉）**
 - 目录请求带 `Authorization: Bearer <license>`，服务端只返回对应 tier；**客户端不判断 tier**，只应用服务端给的数据 —— 避免「本地改个 flag 就解锁」。
 - 校验失败/超时/无网：继续用最近一次成功同步的目录，UI 显示「目录已 N 天未更新」，**绝不阻断路由**。
 - 不做：卖 key、转售额度、按 token 计费、代注册账号。这四条任何一条都会把产品从「工具」变成「灰产中间商」。
@@ -1900,6 +2175,8 @@ cargo run -p freeport-license --example check -- "<token>"
 | M8 注入全覆盖 ✅ | 19 个适配器（9 个真写文件 / 10 个引导式）+ 项目级 scope | 每个会写文件的适配器都有 e2e（临时 HOME + 语义快照比对 + 幂等 + 回滚），并有一道「新增适配器必须补 e2e」的覆盖闸 |
 | M9 发行 🚧 | 双架构 CI + 签名/公证注入点 + 更新检查 + 崩溃落盘 + EULA | 干净机器安装即用；升级不丢数据；卸载无残留；签名与公证待证书就位 |
 | M10 扩展（v1.5） | Extension Host + chat2api 样板 | 可选安装后 `/v1/images/generations` 可用；扩展崩溃不影响 chat；卸载无残留 |
+
+> 2026-10-20 核对：M1–M8 的 ✅ 与代码一致；M9 仍卡在签名与更新密钥（不阻塞功能）；M10 部分落地——扩展宿主 + 两个第一方扩展（ASR / 图片）已可用，第三方安装入口未开。逐项状态见 §4.4。
 
 ---
 

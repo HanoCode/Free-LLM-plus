@@ -26,12 +26,14 @@ interface Row {
   /** feed 新加、还在 canary 里 */
   candidate: boolean;
   canary: number;
+  /** 模型组：同名模型还有哪几家也能跑 */
+  alsoOn?: string[];
 }
 
 const toneOf = (s: HealthStatus): 'ok' | 'warn' | 'bad' | 'idle' => {
   if (s === 'healthy') return 'ok';
   if (s === 'degraded' || s === 'cooling' || s === 'probing') return 'warn';
-  if (s === 'unavailable' || s === 'error') return 'bad';
+  if (s === 'unavailable' || s === 'error' || s === 'retired') return 'bad';
   return 'idle';
 };
 
@@ -45,6 +47,8 @@ const labelOf = (s: HealthStatus) => {
       return { zh: '冷却', en: 'cooling' };
     case 'unavailable':
       return { zh: '不可用', en: 'down' };
+    case 'retired':
+      return { zh: '已退役', en: 'retired' };
     case 'probing':
       return { zh: '探测中', en: 'probing' };
     case 'error':
@@ -87,9 +91,16 @@ export function Models() {
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [onlyReady, setOnlyReady] = useState(false);
+  // 只看免费：默认开（本产品的核心就是免费额度），用户关掉后记住选择
+  const [freeOnly, setFreeOnly] = useState(() => localStorage.getItem('freeport.models.freeOnly') !== '0');
   const [busy, setBusy] = useState<string | null>(null);
   const { setPage } = useApp();
   const { models, providers, probeFailed, probeModel } = useGateway();
+
+  const toggleFreeOnly = (on: boolean) => {
+    setFreeOnly(on);
+    localStorage.setItem('freeport.models.freeOnly', on ? '1' : '0');
+  };
 
   const rows = useMemo<Row[]>(() => {
     const names = new Map(providers.map((p) => [p.id, p]));
@@ -115,6 +126,7 @@ export function Models() {
           status: (m.freeport?.health as HealthStatus) ?? 'unknown',
           candidate: m.freeport?.candidate === true,
           canary: m.freeport?.canary ?? 0,
+          alsoOn: m.freeport?.alsoOn,
         };
       });
   }, [models, providers]);
@@ -135,11 +147,13 @@ export function Models() {
     if (filter === 'vision') r = r.filter((m) => m.vision);
     if (filter === 'issues') r = r.filter((m) => !['healthy', 'unknown'].includes(m.status));
     if (onlyReady) r = r.filter((m) => m.status === 'healthy');
+    // 只看免费 = 只留真正零价的模型（「额度」徽标仅代表厂商有免费档，不算免费）
+    if (freeOnly) r = r.filter((m) => m.free);
     return [...r].sort((a, b) => {
       const rank = (m: Row) => (m.status === 'healthy' ? 0 : m.status === 'unknown' ? 1 : 2);
       return rank(a) - rank(b) || a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model);
     });
-  }, [rows, q, filter, onlyReady]);
+  }, [rows, q, filter, onlyReady, freeOnly]);
 
   const count = (f: Filter) => {
     if (f === 'all') return rows.length;
@@ -237,6 +251,7 @@ export function Models() {
           <span className="n">{count('issues')}</span>
         </button>
         <div className="spacer" />
+        <Switch on={freeOnly} onChange={toggleFreeOnly} label={<T zh="只看免费" en="Free only" />} />
         <Switch on={onlyReady} onChange={setOnlyReady} label={<T zh="只看可用" en="Ready only" />} />
       </div>
 
@@ -279,6 +294,17 @@ export function Models() {
                     {m.candidate && (
                       <span className="badge warn canary-badge" title="feed 新模型：0.3 倍权重，跑满 20 次成功转正">
                         canary {Math.min(m.canary, 20)}/20
+                      </span>
+                    )}
+                    {m.alsoOn && m.alsoOn.length > 0 && (
+                      <span
+                        className="badge info canary-badge"
+                        title={`${m.alsoOn.join(' / ')} 也提供这个模型；裸模型名按组路由，任一家限流会自动换下一家`}
+                      >
+                        <T
+                          zh={`${m.alsoOn.length + 1} 家`}
+                          en={`${m.alsoOn.length + 1} providers`}
+                        />
                       </span>
                     )}
                   </div>

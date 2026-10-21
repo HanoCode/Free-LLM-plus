@@ -1,11 +1,22 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Check, Copy } from 'lucide-react';
+import { Check, Copy, X } from 'lucide-react';
+import { tierLabel, useLang } from '../lib/i18n';
 
 /* ── Badge ──────────────────────────────── */
 export type Tone = 'gray' | 'accent' | 'ok' | 'warn' | 'bad' | 'info';
 
 export function Badge({ tone = 'gray', children }: { tone?: Tone; children: ReactNode }) {
   return <span className={`badge ${tone}`}>{children}</span>;
+}
+
+/**
+ * 档位徽标：文案本地化（Tier A/B/C 不直接暴露给用户）。
+ * tone 可覆盖——各页对档位有各自的配色习惯，这里只统一文案，不动既有观感。
+ */
+export function TierBadge({ tier, tone }: { tier: string; tone?: Tone }) {
+  const lang = useLang();
+  const t: Tone = tone ?? (tier === 'A' ? 'ok' : tier === 'B' ? 'accent' : 'warn');
+  return <Badge tone={t}>{tierLabel(tier, lang)}</Badge>;
 }
 
 export function Status({
@@ -53,13 +64,24 @@ export function Switch({
   on,
   onChange,
   label,
+  disabled,
 }: {
   on: boolean;
   onChange: (v: boolean) => void;
   label?: ReactNode;
+  /**
+   * 禁用态。子选项用得上：父开关关着时子开关自己切了也没效果，
+   * 让它看起来可点是更糟的谎话。
+   */
+  disabled?: boolean;
 }) {
   return (
-    <button className={`switch ${on ? 'on' : ''}`} onClick={() => onChange(!on)}>
+    <button
+      className={`switch ${on ? 'on' : ''}`}
+      disabled={disabled}
+      aria-disabled={disabled || undefined}
+      onClick={() => !disabled && onChange(!on)}
+    >
       <span className="tg" />
       {label}
     </button>
@@ -85,6 +107,53 @@ export function CopyBtn({ value, label }: { value: string; label?: string }) {
       {done ? <Check size={11} /> : <Copy size={11} />}
       {label ?? (done ? '已复制' : '复制')}
     </button>
+  );
+}
+
+/* ── Modal ────────────────────────────────
+   全站唯一弹窗骨架：遮罩点击与 ESC 都关，内容自定。
+   不做「点遮罩不关」的变体——需要防误关的表单先在自己的按钮上做确认。 */
+export function Modal({
+  title,
+  subtitle,
+  onClose,
+  children,
+  width = 440,
+}: {
+  title: ReactNode;
+  subtitle?: ReactNode;
+  onClose: () => void;
+  children: ReactNode;
+  width?: number;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="modal-overlay"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="modal" style={{ width }} role="dialog" aria-modal="true">
+        <div className="modal-head">
+          <div>
+            <h3>{title}</h3>
+            {subtitle && <div className="sub">{subtitle}</div>}
+          </div>
+          <button className="icon-btn" onClick={onClose} aria-label="close">
+            <X size={13} />
+          </button>
+        </div>
+        <div className="modal-body">{children}</div>
+      </div>
+    </div>
   );
 }
 

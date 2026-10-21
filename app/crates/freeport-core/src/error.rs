@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::cooldown::Source;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
@@ -33,6 +35,10 @@ pub struct ErrorClass {
     pub scope: Scope,
     pub cooldown_ms: u64,
     pub kind: String,
+    /// 这次冷却的来源。只有 `heuristic` 允许被探针提前解除——
+    /// 上游给了 `Retry-After` 就是事实，探针验不出「充值了没有」。
+    #[serde(default = "default_source")]
+    pub source: Source,
     /// 能力缺口，例如 "tools"；由 M2 的探针与门禁消费
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
@@ -40,6 +46,10 @@ pub struct ErrorClass {
     /// 不写进配置、不持久化，交给账本在本次运行期内用。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub learned: Option<QuotaSignal>,
+}
+
+fn default_source() -> Source {
+    Source::Heuristic
 }
 
 /// 429 到底在说什么。三者混为一谈，代价是两个方向都贵：
@@ -58,6 +68,14 @@ pub struct QuotaSignal {
     /// 厂商自己说的日请求上限（能回填账本，不用手工猜）
     pub daily_limit: Option<u32>,
     pub minute_limit: Option<u32>,
+    /// 厂商自己说的分钟 token 上限（Groq / OpenAI 系 `(TPM): Limit N`）
+    pub token_minute_limit: Option<u32>,
+    /// 厂商自己说的日 token 上限（`(TPD): Limit N`）
+    pub token_day_limit: Option<u32>,
+    /// 429 文案点名的模型（`Rate limit reached for model \`x\``）。
+    /// 有它 = 这条限额是**模型级**的：记进 `account|model` 的窗口，
+    /// 同一凭据上的其它模型不受影响。None = 账号级。
+    pub model: Option<String>,
     /// 上游给的恢复等待（相对毫秒）
     pub reset_in_ms: Option<u64>,
 }
@@ -65,7 +83,11 @@ pub struct QuotaSignal {
 impl QuotaSignal {
     /// 有可用的额度事实才值得往下传
     fn is_worth_learning(&self) -> bool {
-        self.no_free_tier || self.daily_limit.is_some() || self.minute_limit.is_some()
+        self.no_free_tier
+            || self.daily_limit.is_some()
+            || self.minute_limit.is_some()
+            || self.token_minute_limit.is_some()
+            || self.token_day_limit.is_some()
     }
 }
 
@@ -75,9 +97,15 @@ impl ErrorClass {
             scope,
             cooldown_ms,
             kind: kind.to_string(),
+            source: Source::Heuristic,
             capability: None,
             learned: None,
         }
+    }
+
+    fn with_source(mut self, s: Source) -> Self {
+        self.source = s;
+        self
     }
 
     fn with_learned(mut self, sig: QuotaSignal) -> Self {
@@ -189,6 +217,19 @@ fn numbers_after(s: &str, needle: &str) -> Vec<f64> {
     out
 }
 
+/// 取 `for model` 后面点名的模型名（反引号可选）。
+/// 只认模型 id 的常见字符集，遇到别的东西就停——认不出比认错便宜。
+fn model_named_after(s: &str) -> Option<String> {
+    let i = s.find("for model")? + "for model".len();
+    let rest = s[i..].trim_start();
+    let rest = rest.strip_prefix('`').unwrap_or(rest);
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/')))
+        .unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 fn num_of(v: &serde_json::Value) -> Option<f64> {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
@@ -255,6 +296,36 @@ pub fn parse_quota_signal(body: &str) -> Option<QuotaSignal> {
         }
     }
 
+    // ① b) OpenAI / Groq 系：`Rate limit reached for model \`x\` on tokens
+    //    per minute (TPM): Limit 6000, Used 5992, Requested 500.`
+    //    文案点名了模型 = **模型级**限额：同一条 key 上的其它模型不受影响，
+    //    记进 `account|model` 的窗口。窗口看括号里的缩写，认不出就不猜窗口。
+    if t.contains("rate limit reached for model") {
+        if let Some(m) = model_named_after(&t) {
+            sig.model = Some(m);
+            let limits = numbers_after(&t, "limit");
+            let max = limits.iter().copied().filter(|n| *n > 0.0).fold(0.0_f64, f64::max);
+            let capped = (1.0..1e9).contains(&max);
+            let round = || (max.round() as u32).max(1);
+            if capped {
+                found = true;
+                if t.contains("(tpm)") || t.contains("tokens per minute") {
+                    sig.token_minute_limit = Some(round());
+                } else if t.contains("(rpd)") || t.contains("requests per day") {
+                    sig.daily_limit = Some(round());
+                } else if t.contains("(tpd)") || t.contains("tokens per day") {
+                    sig.token_day_limit = Some(round());
+                } else if t.contains("(rpm)") || t.contains("requests per minute") {
+                    sig.minute_limit = Some(round());
+                } else {
+                    // 点名了模型却说不清窗口：不猜窗口 = 不学限额，
+                    // found 留 false，让后面的分支再试试别的形状
+                    found = false;
+                }
+            }
+        }
+    }
+
     // ② 结构化 `limit` / `remaining`
     if !found {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
@@ -297,23 +368,36 @@ pub fn parse_quota_signal(body: &str) -> Option<QuotaSignal> {
 
 /// 文本规则。命中返回分类，未命中返回 `None` 交给状态码处理。
 fn text_rule(t: &str, retry_after_ms: u64) -> Option<ErrorClass> {
+    // 上游给了等待时长就算事实，否则是我们猜的
+    let stated = |c: ErrorClass| {
+        c.with_source(if retry_after_ms > 0 {
+            Source::Authoritative
+        } else {
+            Source::Heuristic
+        })
+    };
     if hit_any(t, BALANCE_HINTS) {
-        // 30 分钟：用户可能刚充值，但也不该一分钟试一次
-        return Some(ErrorClass::new(Scope::Key, 30 * MIN, "no_balance"));
+        // 30 分钟：用户可能刚充值，但也不该一分钟试一次。
+        // 欠费是账户事实，探针验 key 有效也证明不了余额。
+        return Some(ErrorClass::new(Scope::Key, 30 * MIN, "no_balance").with_source(Source::Credit));
     }
     if hit_any(t, PLAN_HINTS) {
-        return Some(ErrorClass::new(Scope::Model, HOUR, "not_in_plan"));
+        return Some(ErrorClass::new(Scope::Model, HOUR, "not_in_plan").with_source(Source::Tier));
     }
     if hit_any(t, FILTER_HINTS) {
         // 安全拒答不是故障：谁都不停，只换下一跳
         return Some(ErrorClass::new(Scope::Model, 0, "content_filter"));
     }
     if hit_any(t, RATE_HINTS) {
-        return Some(ErrorClass::new(Scope::Key, retry_after_ms.max(MIN), "rate_limit"));
+        return Some(stated(ErrorClass::new(
+            Scope::Key,
+            retry_after_ms.max(MIN),
+            "rate_limit",
+        )));
     }
     if hit_any(t, QUOTA_HINTS) {
         // 不知道窗口何时重置，先歇 15 分钟；巡检成功可提前解除
-        return Some(ErrorClass::new(Scope::Key, 15 * MIN, "quota_exhausted"));
+        return Some(stated(ErrorClass::new(Scope::Key, 15 * MIN, "quota_exhausted")));
     }
     None
 }
@@ -341,31 +425,53 @@ pub fn classify(status: u16, body: &str, retry_after_ms: u64) -> ErrorClass {
 
     match status {
         401 => ErrorClass::new(Scope::Key, 5 * MIN, "invalid_key"),
-        402 => ErrorClass::new(Scope::Key, 30 * MIN, "no_balance"),
-        403 => ErrorClass::new(Scope::Model, HOUR, "forbidden"),
+        402 => ErrorClass::new(Scope::Key, 30 * MIN, "no_balance").with_source(Source::Credit),
+        403 => ErrorClass::new(Scope::Model, HOUR, "forbidden").with_source(Source::Tier),
         429 => {
             // 429 是三种完全不同的失败被挤进同一个状态码，先拆开再决定歇多久。
             let sig = parse_quota_signal(body);
+            // 上游写明了 reset 时刻就是事实，没写就是我们猜的
+            let src = |s: &QuotaSignal| {
+                if s.reset_in_ms.is_some() {
+                    Source::Authoritative
+                } else {
+                    Source::Heuristic
+                }
+            };
             match sig {
                 Some(s) if s.no_free_tier => {
                     // 摘的是「这个模型在此账号上没有免费档」，不是整家厂商
-                    ErrorClass::new(Scope::Model, DAY, "no_free_tier").with_learned(s)
+                    ErrorClass::new(Scope::Model, DAY, "no_free_tier")
+                        .with_source(Source::Tier)
+                        .with_learned(s)
                 }
                 Some(s) if s.window.as_deref() == Some("day") => {
                     // 日额度：歇到上游说的重置时刻；没说就 30 分钟。
                     // 下限 5 分钟，避免上游的 retryDelay 把日额度当分钟限流。
                     let cd = s.reset_in_ms.unwrap_or(30 * MIN).max(5 * MIN);
-                    ErrorClass::new(Scope::Key, cd, "quota_exhausted").with_learned(s)
+                    let source = src(&s);
+                    ErrorClass::new(Scope::Key, cd, "quota_exhausted")
+                        .with_source(source)
+                        .with_learned(s)
                 }
                 Some(s) => {
                     // 分钟级限流：按 Retry-After，下限 90 秒
                     let cd = s.reset_in_ms.unwrap_or(retry_after_ms).max(90_000);
-                    ErrorClass::new(Scope::Key, cd, "rate_limit").with_learned(s)
+                    let source = src(&s);
+                    ErrorClass::new(Scope::Key, cd, "rate_limit")
+                        .with_source(source)
+                        .with_learned(s)
                 }
-                None => ErrorClass::new(Scope::Key, retry_after_ms.max(90_000), "rate_limit"),
+                None => ErrorClass::new(Scope::Key, retry_after_ms.max(90_000), "rate_limit")
+                    .with_source(if retry_after_ms > 0 {
+                        Source::Authoritative
+                    } else {
+                        Source::Heuristic
+                    }),
             }
         }
-        404 | 410 => ErrorClass::new(Scope::Model, DAY, "not_found"),
+        // 模型不存在是事实：探一下也不会变出来，别让探针白烧额度
+        404 | 410 => ErrorClass::new(Scope::Model, DAY, "not_found").with_source(Source::Authoritative),
         413 => ErrorClass::new(Scope::Model, 0, "context"),
         400 => {
             if t.contains("context")
@@ -446,6 +552,69 @@ pub fn is_empty_completion(body: &str) -> bool {
         return true;
     }
     false
+}
+
+/// 200 但下游拿不到东西：区分「连推理都没有」和「只有推理、正文被截断」。
+///
+/// 后者是 reasoning 模型的常见形态（思考链吃满了 `max_tokens`），
+/// 值得再试一次同模型，但不该按「模型坏了」处理——所以调用方要按 streak 计数，
+/// 连续三次才升级成冷却。
+pub fn empty_completion(json: &serde_json::Value) -> Option<&'static str> {
+    let choice = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())?;
+    let msg = choice.get("message").unwrap_or(choice);
+    let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let has_tools = msg
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if has_tools || !text.trim().is_empty() {
+        return None;
+    }
+    let reasoning = msg
+        .get("reasoning_content")
+        .or_else(|| msg.get("reasoning"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    if reasoning.trim().is_empty() {
+        Some("empty_completion")
+    } else {
+        Some("empty_reasoning")
+    }
+}
+
+/// 请求要了 JSON，回来的却不是 JSON。
+///
+/// 只有「明确要求 `response_format`」时才判：普通回答里出现几段代码块
+/// 不该被当成违约，否则一半的编程对话都会被误杀。
+pub fn format_ignored(json: &serde_json::Value, wanted_json: bool) -> bool {
+    if !wanted_json {
+        return false;
+    }
+    let Some(choice) = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+    else {
+        return false;
+    };
+    let msg = choice.get("message").unwrap_or(choice);
+    if msg
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
+    if text.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(text).is_err()
 }
 
 /// 由上游 `Retry-After` 头或 429 文案推出等待时间。
@@ -601,6 +770,9 @@ mod tests {
 
     const GEMINI_DAILY: &str = r#"{"error":{"code":429,"message":"Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 250, model: gemini-2.0-flash","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}"#;
 
+    /// 同上，但上游写明了何时重置：这就从「猜」变成「事实」
+    const GEMINI_DAILY_WITH_RESET: &str = r#"{"error":{"code":429,"message":"Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 250, model: gemini-2.0-flash","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"x","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"600s"}]}}"#;
+
     #[test]
     fn zero_limit_means_no_free_tier_and_is_retired_for_a_day() {
         let c = classify(429, GEMINI_ZERO, 0);
@@ -630,6 +802,30 @@ mod tests {
         assert!(!sig.no_free_tier);
     }
 
+    /// Groq / OpenAI 系：文案点名了模型 = **模型级**限额。
+    /// 记进 `account|model` 的窗口，同一条 key 上的其它模型不受影响。
+    #[test]
+    fn model_named_rate_limit_is_scoped_to_that_model() {
+        let body = r#"{"error":{"message":"Rate limit reached for model `llama-3.3-70b` on tokens per minute (TPM): Limit 6000, Used 5992, Requested 500. Please try again in 4.5885s."}}"#;
+        let sig = parse_quota_signal(body).expect("should parse");
+        assert_eq!(sig.model.as_deref(), Some("llama-3.3-70b"));
+        assert_eq!(sig.token_minute_limit, Some(6000));
+        assert!(sig.daily_limit.is_none(), "TPM 不是日请求额度，不能混记");
+
+        // RPD 变体：日请求上限，同样是模型级
+        let day = r#"Rate limit reached for model `llama-3.3-70b` on requests per day (RPD): Limit 14400, Used 14400."#;
+        let sig = parse_quota_signal(day).expect("should parse");
+        assert_eq!(sig.model.as_deref(), Some("llama-3.3-70b"));
+        assert_eq!(sig.daily_limit, Some(14400));
+        assert!(sig.token_minute_limit.is_none());
+
+        // 点名了模型却说不清窗口：不猜窗口 = 没有额度事实可学。
+        // 整体返回 None，429 落到普通 rate_limit（短冷却），不回填账本。
+        let unclear = r#"Rate limit reached for model `llama-3.3-70b`, please slow down."#;
+        let sig = parse_quota_signal(unclear);
+        assert!(sig.is_none(), "认不出窗口就不该产出半截事实");
+    }
+
     #[test]
     fn plain_429_stays_a_short_rate_limit() {
         let c = classify(429, r#"{"error":{"message":"Too many requests"}}"#, 5_000);
@@ -644,5 +840,57 @@ mod tests {
         let sig = parse_quota_signal(r#"{"error":{"message":"free tier exhausted for today"}}"#);
         assert!(sig.is_none());
         assert_ne!(classify(429, "free tier exhausted", 0).kind, "no_free_tier");
+    }
+
+    /// 上游明说 reset 时刻的，探针不能推翻；没说的才是猜测。
+    #[test]
+    fn cooldown_source_follows_whether_upstream_stated_it() {
+        assert_eq!(classify(503, "boom", 0).source, Source::Heuristic);
+        assert_eq!(classify(402, "", 0).source, Source::Credit);
+        assert_eq!(classify(403, "", 0).source, Source::Tier);
+        assert_eq!(classify(404, "", 0).source, Source::Authoritative);
+
+        let stated = classify(429, GEMINI_DAILY_WITH_RESET, 0);
+        assert_eq!(stated.source, Source::Authoritative, "Gemini 给了 retryDelay");
+
+        let guessed = classify(429, r#"{"error":{"message":"quota exceeded"}}"#, 0);
+        assert_eq!(guessed.source, Source::Heuristic, "没说何时恢复就是猜的");
+    }
+
+    #[test]
+    fn empty_completion_distinguishes_reasoning_truncation() {
+        let blank = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": "" } }]
+        });
+        assert_eq!(empty_completion(&blank), Some("empty_completion"));
+
+        let reasoning_only = serde_json::json!({
+            "choices": [{ "message": { "content": "", "reasoning_content": "想了很久" } }]
+        });
+        assert_eq!(empty_completion(&reasoning_only), Some("empty_reasoning"));
+
+        let tools = serde_json::json!({
+            "choices": [{ "message": { "content": "", "tool_calls": [{ "id": "1" }] } }]
+        });
+        assert!(empty_completion(&tools).is_none(), "只有 tool_call 也是有效回答");
+
+        let normal = serde_json::json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        });
+        assert!(empty_completion(&normal).is_none());
+    }
+
+    #[test]
+    fn format_violation_only_when_json_was_requested() {
+        let prose = serde_json::json!({
+            "choices": [{ "message": { "content": "这不是 JSON" } }]
+        });
+        assert!(format_ignored(&prose, true));
+        assert!(!format_ignored(&prose, false), "没要求 JSON 就不算违约");
+
+        let ok = serde_json::json!({
+            "choices": [{ "message": { "content": "{\"a\":1}" } }]
+        });
+        assert!(!format_ignored(&ok, true));
     }
 }

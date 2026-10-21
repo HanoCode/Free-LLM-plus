@@ -14,13 +14,17 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 freeport-core = { path = "../crates/freeport-core" }
+freeport-ext = { path = "../crates/freeport-ext" }
 freeport-gateway = { path = "../crates/freeport-gateway" }
 freeport-inject = { path = "../crates/freeport-inject" }
+freeport-mcp = { path = "../crates/freeport-mcp" }
 tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+dirs = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

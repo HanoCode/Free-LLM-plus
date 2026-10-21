@@ -1,0 +1,17 @@
+{
+  "id": "rerank",
+  "name": "Rerank",
+  "version": "1.0.0",
+  "kind": "rerank",
+  "entry": "self",
+  "author": "freeport",
+  "permissions": {
+    "domains": [
+      "api.jina.ai",
+      "api.cohere.com",
+      "api.voyageai.com"
+    ],
+    "paths": []
+  },
+  "sig": "yXCaZh63Sb5ulVIFfnJ8ExhTC7EGUbzCuQsOcp3Q/gtipmbwiFjPhdr+T/a/RqiWQYQ9/LosvP6ubtEiJ10BCQ=="
+}

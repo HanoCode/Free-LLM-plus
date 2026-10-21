@@ -9,21 +9,24 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Local;
 use freeport_catalog::{self as catalog, Catalog};
+use crate::cache;
+use crate::idem;
 use freeport_core::cooldown::Cooldowns;
 use freeport_core::dto::*;
 use freeport_core::error::{body_error, classify, ErrorClass};
 use freeport_core::model::*;
 use freeport_core::quota;
-use freeport_core::{affinity, presets, Affinity, Plan, Swrr};
+use freeport_core::{affinity, presets, Affinity, Plan, Strategy, Swrr};
 use freeport_core::route::{cap_factor, plan_with, stick_to_front_if, Needs};
 use freeport_auth::device::{self as device_flow, DeviceStart, DeviceStep};
+use freeport_auth::sub;
 use freeport_auth::copilot;
 use freeport_auth::cookie::CookieJar;
 use freeport_probe::patrol as patrol_calc;
@@ -46,6 +49,7 @@ use crate::responses;
 use crate::sanitize::Redactor;
 use crate::secrets;
 use crate::store;
+use crate::upwire;
 use crate::tokens::{Broker, Endpoints, OAuthBlob};
 use crate::transfer;
 
@@ -57,10 +61,19 @@ const PATROL_TICK: Duration = Duration::from_secs(300);
 const PATROL_WARMUP: Duration = Duration::from_secs(120);
 /// 单轮巡检最多探这么多，避免长时间占着上游
 const PATROL_BATCH: usize = 40;
+/// hedge 切片下限：再短就只是在给上游制造重试噪声（TLS 握手都不够）
+const HEDGE_MIN_MS: u64 = 8_000;
+/// hedge 切片上限：慢模型也有 20s 把首个语义块吐出来
+const HEDGE_MAX_MS: u64 = 20_000;
 /// feed 的检查节拍。真正是否发网络请求由 `checkMinutes` 决定，这里只是「到点看一眼」。
 const FEED_TICK: Duration = Duration::from_secs(60);
 /// 让目录先同步完，别和第一次 models.dev 拉取抢带宽
 const FEED_WARMUP: Duration = Duration::from_secs(150);
+/// 余量低于这个比例就值得在预演里点出来。
+///
+/// 比粘性解粘线（`affinity::UNSTICK_RATIO` = 0.10）高一档：解粘是「已经
+/// 确实要换家了」，而预演是提醒「再跑几单就要换家」，得留出提前量。
+const TIGHT_HEADROOM: f64 = 0.15;
 
 pub type LogSink = Arc<dyn Fn(LogEntry) + Send + Sync>;
 
@@ -80,7 +93,7 @@ pub(crate) struct State_ {
     /// 内存态，不落盘——重启就是恢复，避免「上次暂停了这次忘了开」。
     paused: AtomicBool,
     /// 在途真实请求数：巡检看到非 0 就让路
-    inflight: AtomicUsize,
+    pub(crate) inflight: AtomicUsize,
     /// 上次落盘时间（毫秒）：模型健康每次请求都会变，不能每个请求都写盘
     last_save_ms: AtomicI64,
     on_log: RwLock<Option<LogSink>>,
@@ -90,12 +103,112 @@ pub(crate) struct State_ {
     /// 进行中的设备码登录。用户点「登录」到浏览器里点完，中间隔了几十秒，
     /// 状态只能放这里。
     logins: Mutex<HashMap<String, PendingLogin>>,
+    /// `Idempotency-Key` 响应缓存。内存态：重启后重放一次上游，好过把响应体落盘。
+    idem: idem::IdemStore,
+    /// 这次加载用的数据目录。MCP 是独立进程，得靠它找到 `control.key`。
+    ///
+    /// 用 std 的锁而不是 tokio 的：落盘（`save_here`）是同步调用，
+    /// 而它恰恰在最热的路径上（每次请求的配额/统计都会写一次）。
+    dir: std::sync::RwLock<std::path::PathBuf>,
+    /// 本地控制凭据（`/v1/freeport/inspect`）。启动时生成，与数据面 key 完全分开。
+    control_token: RwLock<String>,
+    /// 按调用方标识的分钟窗口：`identifier -> (unix 分钟, 本分钟已用)`。
+    /// 内存态即可：它限的是「刷得太快」，重启清零不会造成实际损失。
+    idents: Mutex<HashMap<String, (i64, u32)>>,
+    /// 精确匹配响应缓存。与 `idem` 分开：一个管重试，一个管省钱。
+    resp_cache: Mutex<cache::ResponseCache>,
+    /// 同一目标连续「200 但没内容」的次数。前三次不算故障（reasoning 模型吃满
+    /// max_tokens 是常态），第四次才开始冷却；成功一次就清零。
+    empty_streak: Mutex<HashMap<String, u32>>,
+    /// 每个凭据当前在途请求数，配合 `gateway.maxInflightPerAccount` 用。
+    /// 0 表示不限，默认不限——单机场景限并发只会让用户以为软件卡了。
+    acct_inflight: Mutex<HashMap<String, usize>>,
 }
 
-struct PendingLogin {
-    provider: String,
-    start: DeviceStart,
-    at: i64,
+/// 进行中的登录。两条路子的状态完全不通，只能分开存——
+/// 硬塞进一个结构会让「哪个字段对哪条路有意义」变成靠注释维持的约定。
+enum PendingLogin {
+    /// 设备码：等用户在浏览器里输码，我们轮询
+    Device {
+        provider: String,
+        start: DeviceStart,
+        at: i64,
+    },
+    /// 授权码：等浏览器跳回本地回环，或用户把回调地址粘回来
+    Sub {
+        provider: String,
+        flow: sub::LoginStart,
+        at: i64,
+    },
+}
+
+impl PendingLogin {
+    /// 取出授权码流程的状态。设备码流程返回 `None`——
+    /// 用 `Option` 而不是造一个假 flow，这样「走错接口」和「已经完成」
+    /// 在类型上就分得开。
+    fn sub_flow(&self) -> Option<(String, sub::LoginStart, i64)> {
+        match self {
+            PendingLogin::Sub {
+                provider, flow, at, ..
+            } => Some((provider.clone(), flow.clone(), *at)),
+            PendingLogin::Device { .. } => None,
+        }
+    }
+
+    fn expired(&self, now: i64) -> bool {
+        match self {
+            PendingLogin::Device { start, at, .. } => now - at >= start.expires_in as i64,
+            // 授权码十分钟内必须用完：留太久等于给了一条长期有效的偷渡链接
+            PendingLogin::Sub { at, .. } => now - at >= SUB_LOGIN_TTL,
+        }
+    }
+}
+
+/// 授权码的有效期。上游通常给 5 分钟，我们给 10 分钟余量让人慢慢登录。
+const SUB_LOGIN_TTL: i64 = 600;
+
+/// 设备码 → 界面 DTO。构造放在这里而不是 core：`DeviceStart` 是 auth crate 的
+/// 类型，而 core 是「纯逻辑、无 IO」的内核，不该被拖进来。
+fn device_start_dto(login_id: String, start: &DeviceStart) -> GwLoginStart {
+    GwLoginStart {
+        kind: "device".into(),
+        login_id,
+        expires_in: start.expires_in,
+        instruction: start.instruction(),
+        user_code: Some(start.user_code.clone()),
+        verification_uri: Some(start.verification_uri.clone()),
+        verification_uri_complete: start.verification_uri_complete.clone(),
+        interval: Some(start.interval),
+        url: None,
+        redirect_uri: None,
+        auto: true,
+    }
+}
+
+/// 授权码 → 界面 DTO。`auto=false` 时文案要换成「手工粘贴」，
+/// 因为那时浏览器跳回本地端口必然是打不开的，让用户以为失败了最糟。
+fn pkce_start_dto(login_id: String, flow: &sub::LoginStart) -> GwLoginStart {
+    let instruction = if flow.auto {
+        "已在浏览器里打开授权页。登录并确认后会自动完成，不用回来点任何东西。".to_string()
+    } else {
+        format!(
+            "请在浏览器打开授权页并登录。完成后浏览器会跳到 {}（打不开是正常的），按提示把地址栏那一整条地址复制回来。",
+            flow.redirect_uri
+        )
+    };
+    GwLoginStart {
+        kind: "pkce".into(),
+        login_id,
+        expires_in: SUB_LOGIN_TTL as u64,
+        instruction,
+        user_code: None,
+        verification_uri: None,
+        verification_uri_complete: None,
+        interval: None,
+        url: Some(flow.url.clone()),
+        redirect_uri: Some(flow.redirect_uri.clone()),
+        auto: flow.auto,
+    }
 }
 
 /// 发请求要用的凭据：OAuth 账号取 token（过期先续期），其余取 API key。
@@ -104,7 +217,19 @@ struct PendingLogin {
 async fn credential(st: &Arc<State_>, account_id: &str) -> Option<Credential> {
     if secrets::has_oauth(account_id) {
         match st.broker.token(account_id).await {
-            Ok(ts) => return Some(Credential::bearer(ts.access_token)),
+            Ok(live) => {
+                let mut cred = Credential::bearer(live.tokens.access_token.clone());
+                // 有些厂商把「哪个工作区的额度」编进 token，请求里必须一起带上。
+                // 头名是登录时写进凭据的，不在这里按厂商硬编码。
+                if let (Some(name), Some(value)) =
+                    (live.account_header.as_deref(), live.tokens.account_id.as_deref())
+                {
+                    if !value.is_empty() {
+                        cred = cred.with_extra(name, value);
+                    }
+                }
+                return Some(cred);
+            }
             Err(e) => {
                 // 续期失败不静默：这条凭据这轮就是不可用，要让日志说清楚
                 tracing::warn!(account = %account_id, "OAuth 凭据不可用：{e}");
@@ -162,6 +287,13 @@ impl Gateway {
                 on_log: RwLock::new(None),
                 shutdown: Notify::new(),
                 logins: Mutex::new(HashMap::new()),
+                idem: idem::IdemStore::new(),
+                dir: std::sync::RwLock::new(store::data_dir()),
+                control_token: RwLock::new(String::new()),
+                idents: Mutex::new(HashMap::new()),
+                resp_cache: Mutex::new(cache::ResponseCache::new()),
+                empty_streak: Mutex::new(HashMap::new()),
+                acct_inflight: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -174,7 +306,11 @@ impl Gateway {
      * 用户在自己的浏览器里登录自己的账号，我们只拿授权结果。
      * 不内嵌 client_secret，不伪造 UA，不读系统浏览器 Cookie。 */
 
-    /// 发起一次登录：返回要展示给用户的设备码。
+    /// 发起一次登录。按厂商分两条路：
+    ///
+    /// - **订阅厂商**（`claude-sub` / `codex-sub`）走授权码 + PKCE，
+    ///   回环端口能绑就自动收回调，绑不上就转人工粘贴。
+    /// - **其余**走设备码：给一个短码，用户在浏览器里输。
     pub async fn login_start(&self, provider_id: &str) -> Result<GwLoginStart, String> {
         let (exists, base_url) = {
             let d = self.st.data.read().await;
@@ -187,20 +323,45 @@ impl Gateway {
             return Err("请先添加这个厂商，再登录".into());
         }
 
+        let login_id = uuid::Uuid::new_v4().simple().to_string();
+        let now = chrono::Utc::now().timestamp();
+
+        if let Some(vendor) = sub::Vendor::parse(provider_id) {
+            let (port, auto) = sub::pick_port(vendor).await;
+            let flow = sub::begin(&self.st.broker.endpoints().sub_cfg(vendor), port, auto);
+            let dto = pkce_start_dto(login_id.clone(), &flow);
+            {
+                let mut map = self.st.logins.lock().unwrap_or_else(|e| e.into_inner());
+                map.retain(|_, v| !v.expired(now));
+                map.insert(
+                    login_id,
+                    PendingLogin::Sub {
+                        provider: provider_id.to_string(),
+                        flow,
+                        at: now,
+                    },
+                );
+            }
+            tracing::info!(
+                provider = provider_id,
+                base = %base_url,
+                port,
+                auto,
+                "已发起订阅授权（授权码 + PKCE）"
+            );
+            return Ok(dto);
+        }
+
         let cfg = self.device_cfg();
         let start = device_flow::start(&self.st.client, &cfg)
             .await
             .map_err(|e| e.to_string())?;
-
-        let login_id = uuid::Uuid::new_v4().simple().to_string();
         {
             let mut map = self.st.logins.lock().unwrap_or_else(|e| e.into_inner());
-            // 顺手清掉过期的，别让这张表随着时间长大
-            let now = chrono::Utc::now().timestamp();
-            map.retain(|_, v| now - v.at < v.start.expires_in as i64);
+            map.retain(|_, v| !v.expired(now));
             map.insert(
                 login_id.clone(),
-                PendingLogin {
+                PendingLogin::Device {
                     provider: provider_id.to_string(),
                     start: start.clone(),
                     at: now,
@@ -208,27 +369,29 @@ impl Gateway {
             );
         }
         tracing::info!(provider = provider_id, base = %base_url, "已发起设备码登录");
-
-        Ok(GwLoginStart {
-            login_id,
-            user_code: start.user_code.clone(),
-            verification_uri: start.verification_uri.clone(),
-            verification_uri_complete: start.verification_uri_complete.clone(),
-            interval: start.interval,
-            expires_in: start.expires_in,
-            instruction: start.instruction(),
-        })
+        Ok(device_start_dto(login_id, &start))
     }
 
-    /// 轮询一次登录状态。界面每 `interval` 秒调一次，直到不是 `pending`。
+    /// 轮询一次登录状态（**只对设备码有意义**）。
+    ///
+    /// 授权码流程没有可轮询的东西——回调是一次性的，用 [`Self::login_wait`]。
     pub async fn login_poll(&self, login_id: &str) -> GwLoginState {
+        // 三层 Option：外层「有没有这条登录」、内层「是不是设备码那条路」。
+        // 用 `return` 从闭包里出去是错的——那只会跳出闭包，不会跳出函数。
         let pending = {
             let map = self.st.logins.lock().unwrap_or_else(|e| e.into_inner());
-            map.get(login_id)
-                .map(|p| (p.provider.clone(), p.start.clone(), p.at))
+            map.get(login_id).map(|p| match p {
+                PendingLogin::Device {
+                    provider, start, at, ..
+                } => Some((provider.clone(), start.clone(), *at)),
+                PendingLogin::Sub { .. } => None,
+            })
         };
-        let Some((provider_id, start, at)) = pending else {
-            return GwLoginState::error("这次登录已失效，请重新发起");
+        let (provider_id, start, at) = match pending {
+            None => return GwLoginState::error("这次登录已失效，请重新发起"),
+            // 轮询接口问到授权码流程：说实话「还在等」，别假装失败
+            Some(None) => return GwLoginState::pending(),
+            Some(Some(x)) => x,
         };
 
         let now = chrono::Utc::now().timestamp();
@@ -274,15 +437,155 @@ impl Gateway {
                     login: None,
                 }
             }
-            DeviceStep::Ready(github) => {
-                match self.finish_login(&provider_id, github).await {
-                    Ok(state) => {
-                        self.forget_login(login_id);
-                        state
-                    }
-                    Err(e) => GwLoginState::error(e),
+            DeviceStep::Ready(github) => match self.finish_login(&provider_id, github).await {
+                Ok(state) => {
+                    self.forget_login(login_id);
+                    state
                 }
+                Err(e) => GwLoginState::error(e),
+            },
+        }
+    }
+
+    /// 等授权码流程的回调，等到就立刻换 token 建凭据。
+    ///
+    /// 一条命令把「监听 → 收回调 → 换 token → 落盘」串完，因为它中间
+    /// 任何一步拆出去都得把 verifier 再传一遍，多一次泄露机会。
+    /// `wait_secs` 是**这一次调用**最多阻塞多久，超时返回 pending，
+    /// 界面可以再调一次（监听会重新绑同一个端口）。
+    pub async fn login_wait(&self, login_id: &str, wait_secs: u64) -> GwLoginState {
+        let (provider_id, flow, at) = match self.peek_sub(login_id) {
+            Ok(x) => x,
+            Err(state) => return state,
+        };
+        let _ = at;
+        if !flow.auto {
+            return GwLoginState {
+                status: "manual".into(),
+                message: Some("本机端口不可用，请把浏览器地址栏里的回调地址粘贴回来".into()),
+                account_id: None,
+                login: None,
+            };
+        }
+
+        let cb = match sub::wait_callback(flow.port, flow.vendor.callback_path(), wait_secs).await {
+            Ok(cb) => cb,
+            // 超时不是错误：用户可能还没登录完，界面接着等就是了
+            Err(freeport_auth::AuthError::Expired) => return GwLoginState::pending(),
+            Err(e) => return GwLoginState::error(e.to_string()),
+        };
+
+        let cfg = self.st.broker.endpoints().sub_cfg(flow.vendor);
+        let input = match &cb.state {
+            Some(st) => format!("{}#{}", cb.code, st),
+            None => cb.code.clone(),
+        };
+        self.complete_sub_login(login_id, &provider_id, &cfg, &flow, &input)
+            .await
+    }
+
+    /// 人工粘贴的回调地址（或 `code#state`、或裸 code）。
+    pub async fn login_complete(&self, login_id: &str, input: &str) -> GwLoginState {
+        let (provider_id, flow, _) = match self.peek_sub(login_id) {
+            Ok(x) => x,
+            Err(state) => return state,
+        };
+        let cfg = self.st.broker.endpoints().sub_cfg(flow.vendor);
+        self.complete_sub_login(login_id, &provider_id, &cfg, &flow, input)
+            .await
+    }
+
+    /// 取一条授权码登录的进行中状态，顺手把「不存在 / 走错接口 / 已超时」
+    /// 这三种失败都翻译成界面能直接显示的 `GwLoginState`。
+    fn peek_sub(
+        &self,
+        login_id: &str,
+    ) -> Result<(String, sub::LoginStart, i64), GwLoginState> {
+        let found = {
+            let map = self.st.logins.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(login_id).map(|p| p.sub_flow())
+        };
+        let Some(found) = found else {
+            return Err(GwLoginState::error("这次登录已失效，请重新发起"));
+        };
+        let Some((provider, flow, at)) = found else {
+            return Err(GwLoginState::error("这条登录要走设备码，请用轮询接口"));
+        };
+        if chrono::Utc::now().timestamp() - at >= SUB_LOGIN_TTL {
+            self.forget_login(login_id);
+            return Err(GwLoginState {
+                status: "expired".into(),
+                message: Some("授权超时，请重新发起登录".into()),
+                account_id: None,
+                login: None,
+            });
+        }
+        Ok((provider, flow, at))
+    }
+
+    async fn complete_sub_login(
+        &self,
+        login_id: &str,
+        provider_id: &str,
+        cfg: &sub::SubCfg,
+        flow: &sub::LoginStart,
+        input: &str,
+    ) -> GwLoginState {
+        let now = chrono::Utc::now().timestamp();
+        let mut tokens = match sub::exchange_code(&self.st.client, cfg, flow, input, now).await {
+            Ok(t) => t,
+            Err(freeport_auth::AuthError::Denied) => {
+                self.forget_login(login_id);
+                return GwLoginState {
+                    status: "denied".into(),
+                    message: Some("你在授权页取消了授权".into()),
+                    account_id: None,
+                    login: None,
+                };
             }
+            Err(e) => return GwLoginState::error(e.to_string()),
+        };
+
+        // 换 token 的响应不一定带身份。Claude 一般给 account.email_address，
+        // 但企业号/新版流程里可能没有——那界面上就只剩「claude」这个笼统名字，
+        // 多个号分不清。补一次 profile 查询，失败就算了，不影响能不能用。
+        if tokens.account.is_none() && flow.vendor == sub::Vendor::Claude {
+            tokens.account = sub::whoami_at(
+                &self.st.client,
+                flow.vendor.as_str(),
+                &self.st.broker.endpoints().claude_profile_url,
+                &tokens.access_token,
+            )
+            .await;
+        }
+
+        let account_header = match flow.vendor {
+            // Codex 的每个请求都要带工作区 id，缺了上游直接 400
+            sub::Vendor::Codex => Some("chatgpt-account-id".to_string()),
+            // Claude 的 account id 只是给界面看的，不该出现在请求里
+            sub::Vendor::Claude => None,
+        };
+        let blob = OAuthBlob {
+            kind: flow.vendor.as_str().to_string(),
+            token_url: Some(cfg.token_url.clone()),
+            client_id: Some(cfg.client_id.clone()),
+            login: tokens.account.clone(),
+            account_header,
+            tokens: tokens.clone(),
+        };
+        let key_mask = match flow.vendor {
+            sub::Vendor::Claude => "cc-oauth",
+            sub::Vendor::Codex => "cx-oauth",
+        };
+        match self
+            .install_oauth_account(provider_id, tokens, blob, key_mask, flow.vendor.as_str())
+            .await
+        {
+            Ok(state) => {
+                self.forget_login(login_id);
+                state
+            }
+            Err(e) => GwLoginState::error(e),
         }
     }
 
@@ -310,25 +613,43 @@ impl Gateway {
         .map_err(|e| e.to_string())?;
         tokens.account = login.clone();
 
+        let blob = OAuthBlob {
+            kind: "copilot".into(),
+            token_url: None,
+            client_id: None,
+            login: login.clone(),
+            // Copilot 的 token 里没有「工作区」概念，不用发额外头
+            account_header: None,
+            tokens: tokens.clone(),
+        };
+        self.install_oauth_account(provider_id, tokens, blob, "gh-oauth", "github")
+            .await
+    }
+
+    /// 登录成功之后共用的收尾：建凭据、存 token、拉一次模型列表。
+    ///
+    /// 做成一个函数是因为三条路（设备码 / Copilot / 订阅）收尾完全一样，
+    /// 分开写迟早有一处忘了 `save_here`，然后就变成「登录成功了但重启就没了」。
+    async fn install_oauth_account(
+        &self,
+        provider_id: &str,
+        tokens: freeport_auth::TokenSet,
+        blob: OAuthBlob,
+        key_mask: &str,
+        name_hint: &str,
+    ) -> Result<GwLoginState, String> {
+        let login = tokens.account.clone().or(blob.login.clone());
         let acc = Account {
             id: format!("acct_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
-            name: login.clone().unwrap_or_else(|| "github".into()),
-            key_mask: "gh-oauth".into(),
+            name: login.clone().unwrap_or_else(|| name_hint.into()),
+            key_mask: key_mask.into(),
             enabled: true,
             added_at: chrono::Utc::now().to_rfc3339(),
             quota: None,
             health: None,
+            purposes: Vec::new(),
         };
-        Broker::save(
-            &acc.id,
-            &OAuthBlob {
-                kind: "copilot".into(),
-                token_url: None,
-                client_id: None,
-                login: login.clone(),
-                tokens: tokens.clone(),
-            },
-        )?;
+        Broker::save(&acc.id, &blob)?;
 
         // 登录成功立刻拉一次模型列表：拉不到不影响「已登录」，但要留痕
         let provider_snapshot = {
@@ -337,37 +658,33 @@ impl Gateway {
         };
         let mut models = Vec::new();
         if let Some(p) = provider_snapshot {
-            let base = if p.base_url.trim().is_empty() {
-                copilot::API_BASE.to_string()
-            } else {
-                p.base_url.clone()
-            };
-            let probe_provider = Provider {
-                base_url: base.clone(),
-                ..p.clone()
-            };
-            match providers::list_models(
-                &self.st.client,
-                &probe_provider,
-                &Credential::bearer(tokens.access_token.clone()),
-            )
-            .await
-            {
+            // 附加认证头（Codex 的工作区 id）必须一起带上，否则拉列表就被拒。
+            // 用 blob 里记下的头名而不是按厂商猜：Claude 的 token 里也有 account_id
+            // （那是它自己的账号 uuid），当成工作区头发出去等于给上游塞垃圾。
+            let mut cred = Credential::bearer(tokens.access_token.clone());
+            if let (Some(name), Some(value)) = (
+                blob.account_header.as_deref(),
+                tokens.account_id.as_deref().filter(|s| !s.is_empty()),
+            ) {
+                cred = cred.with_extra(name, value);
+            }
+            match providers::list_models(&self.st.client, &p, &cred).await {
                 Ok(m) => models = m,
-                Err(e) => tracing::warn!("登录成功但拉模型失败：{}", e.body.chars().take(160).collect::<String>()),
+                Err(e) => tracing::warn!(
+                    provider = provider_id,
+                    "登录成功但拉模型失败：{}",
+                    e.body.chars().take(160).collect::<String>()
+                ),
             }
 
             let mut d = self.st.data.write().await;
             if let Some(p) = d.providers.iter_mut().find(|p| p.id == provider_id) {
-                if p.base_url.trim().is_empty() {
-                    p.base_url = base;
-                }
                 p.accounts.push(acc.clone());
                 if !models.is_empty() {
                     p.models = models;
                 }
             }
-            store::save(&d);
+            save_here(&self.st, &d);
         }
 
         tracing::info!(provider = provider_id, account = %acc.id, login = ?login, "OAuth 登录完成");
@@ -402,7 +719,14 @@ impl Gateway {
 
     /// 载入磁盘配置与目录。宿主启动时调一次。
     pub async fn load(&self) {
-        let mut data = store::load();
+        self.load_from(&store::data_dir()).await;
+    }
+
+    /// 从指定目录载入。抽出来是为了让 MCP / 单测能拿一份受控的配置，
+    /// 而不必去动进程级的 `FREEPORT_DATA_DIR`（那会让同进程的测试互相踩）。
+    pub async fn load_from(&self, dir: &std::path::Path) {
+        *self.st.dir.write().unwrap_or_else(|e| e.into_inner()) = dir.to_path_buf();
+        let mut data = store::load_from(dir);
         let cat = catalog::load();
 
         // 目录摘要回写到配置，UI 才能显示「上次同步」
@@ -415,18 +739,41 @@ impl Gateway {
 
         // 老版本只有一个 authToken：迁成 name="default" 的一条，老客户端不用改配置
         if keys::migrate_legacy(&mut data) {
-            store::save(&data);
+            store::save_to(dir, &data);
             tracing::info!("已把全局 authToken 迁移为虚拟 key `default`");
         }
 
         // 「一厂商一 key」→「一厂商多凭据」。老凭据沿用 provider id，密钥不用搬家。
         if secrets::migrate_accounts(&mut data) {
-            store::save(&data);
+            store::save_to(dir, &data);
             tracing::info!("已把厂商密钥升级为凭据视图");
         }
 
         *self.st.data.write().await = data;
         *self.st.catalog.write().await = cat;
+    }
+
+    /// 改监听地址。**只给无界面宿主用**（容器里必须绑 `0.0.0.0` 才能被
+    /// publish 出去，再靠外层 `-p 127.0.0.1:8787:8787` 收回来）。
+    ///
+    /// 刻意不放进 `ConfigPatch`：那会让界面上多出一个「绑到哪」的输入框，
+    /// 而「网关只对内」是这条产品线的边界，不该变成一个可点错的开关。
+    /// 谁能调这个方法，谁就负责判断地址合不合适。
+    pub async fn set_bind(&self, host: &str, port: u16) {
+        let mut d = self.st.data.write().await;
+        if !host.trim().is_empty() {
+            d.gateway.host = host.trim().to_string();
+        }
+        if port > 0 {
+            d.gateway.port = port;
+        }
+        save_here(&self.st, &d);
+    }
+
+    /// 当前配置里的监听地址（`host`, `port`）。start 之前也能问。
+    pub async fn bind_of(&self) -> (String, u16) {
+        let d = self.st.data.read().await;
+        (d.gateway.host.clone(), d.gateway.port)
     }
 
     pub async fn start(&self) -> Result<u16, String> {
@@ -442,11 +789,19 @@ impl Gateway {
 
         let app = Router::new()
             .route("/health", get(health))
+            .route("/v1/freeport/inspect", get(inspect))
             .route("/v1/models", get(list_models))
             .route("/v1/models/:id", get(get_model))
             .route("/v1/route", get(route_debug))
             .route("/v1/chat/completions", post(chat))
+            .route("/v1/completions", post(completions_entry))
+            .route("/v1/embeddings", post(embeddings_entry))
             .route("/v1/responses", post(responses_entry))
+            .route("/v1/audio/transcriptions", post(crate::exts::asr_entry))
+            .route("/v1/audio/speech", post(crate::exts::speech_entry))
+            .route("/v1/images/generations", post(crate::exts::image_entry))
+            .route("/v1/videos/generations", post(crate::exts::video_entry))
+            .route("/v1/rerank", post(crate::exts::rerank_entry))
             .route("/v1/messages", post(messages))
             .route("/v1/messages/count_tokens", post(count_tokens))
             .route("/v1beta/models", get(gemini_models))
@@ -466,11 +821,15 @@ impl Gateway {
         self.st.bound_port.store(actual, Ordering::SeqCst);
         self.st.running.store(true, Ordering::SeqCst);
         *self.st.started_at.write().await = Some(Instant::now());
+        // 控制凭据：只在真正起服务时准备。MCP 进程只读这份文件，不自己生成——
+        // 否则两个进程各写一把，谁都不认对方，表现为「MCP 永远连不上」。
+        let dir = self.st.dir.read().unwrap_or_else(|e| e.into_inner()).clone();
+        *self.st.control_token.write().await = crate::control::ensure_token(&dir);
 
         let st = self.st.clone();
         tokio::spawn(async move {
             let shutdown = st.clone();
-            let _ = axum::serve(listener, app)
+            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async move {
                     shutdown.shutdown.notified().await;
                 })
@@ -483,6 +842,9 @@ impl Gateway {
         self.spawn_catalog_refresh();
         self.spawn_patrol();
         self.spawn_feed();
+        // 扩展目录 materialize + sidecar 空闲清扫。没用到扩展就零开销。
+        freeport_ext::install::materialize_builtin(&freeport_ext::install::extensions_dir());
+        freeport_ext::start_reaper(freeport_ext::shared());
         Ok(actual)
     }
 
@@ -490,9 +852,72 @@ impl Gateway {
         self.st.shutdown.notify_waiters();
         self.st.running.store(false, Ordering::SeqCst);
         self.st.bound_port.store(0, Ordering::SeqCst);
+        // sidecar 是独立进程，宿主退出时显式带走，不留孤儿
+        crate::exts::shutdown_all().await;
     }
 
     /* ── 控制面 ───────────────────────────────────── */
+
+    /// 配置里写的监听地址（不是实际绑定的端口）。
+    ///
+    /// 给「另一个进程」用：MCP server 是一个独立进程，它看不到这里的内存状态，
+    /// 但可以拿这个地址去探一下网关在不在。
+    pub async fn configured_addr(&self) -> (String, u16) {
+        let d = self.st.data.read().await;
+        (d.gateway.host.clone(), d.gateway.port)
+    }
+
+    /// 这次加载用的数据目录。MCP 靠它去读 `control.key`。
+    pub async fn data_dir(&self) -> std::path::PathBuf {
+        self.st.dir.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 本地控制凭据。没起过服务就是空串（MCP 那边读文件即可）。
+    pub async fn control_token(&self) -> String {
+        self.st.control_token.read().await.clone()
+    }
+
+    /// 问一次「那边的网关现在到底在做什么」。
+    ///
+    /// 返回 `None` 就说明**连不上**（没起、换了端口、或凭据还没生成）。
+    /// 调用方必须把 `None` 与「在线但没日志」分开处理——把前者说成后者，
+    /// 是自省工具最常见的撒谎方式。
+    pub async fn inspect_live(&self) -> Option<Value> {
+        let (host, port) = self.configured_addr().await;
+        let port = match self.st.bound_port.load(Ordering::SeqCst) {
+            0 => port,
+            p => p,
+        };
+        if port == 0 {
+            return None;
+        }
+        let host = match host.trim() {
+            "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+            h => h.to_string(),
+        };
+        let token = self.control_token().await;
+        let token = if token.is_empty() {
+            crate::control::read_token(&self.data_dir().await).unwrap_or_default()
+        } else {
+            token
+        };
+        if token.is_empty() {
+            return None;
+        }
+        let res = self
+            .st
+            .client
+            .get(format!("http://{host}:{port}/v1/freeport/inspect?limit=200"))
+            .header(crate::control::HEADER, token)
+            .timeout(Duration::from_millis(1_500))
+            .send()
+            .await
+            .ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        res.json::<Value>().await.ok()
+    }
 
     pub async fn status(&self) -> GwStatus {
         let d = self.st.data.read().await;
@@ -518,9 +943,87 @@ impl Gateway {
             tokens_in: d.stats.tokens_in,
             tokens_out: d.stats.tokens_out,
             errors: d.stats.errors,
+            compress: d.gateway.compress.enabled,
+            compress_max_tool_chars: d.gateway.compress.max_tool_chars,
+            compress_smart: d.gateway.compress.smart_filters,
+            identifier_limit: d.gateway.identifier_limit,
+            cache: d.gateway.cache.enabled,
+            cache_ttl_secs: d.gateway.cache.ttl_secs,
             cooldowns: self.st.cooldowns.snapshot(),
             error: None,
         }
+    }
+
+    /// 查一条凭据的**官方**订阅额度。
+    ///
+    /// 和账本不是一回事：账本记的是「我们发出去多少」，这里问的是
+    /// 「厂商认为你还剩多少」。两个数字可以不一致——账本漏记的部分
+    /// 就是差额，而用户要的是后者。
+    ///
+    /// 永远返回一个可渲染的 `GwUsage`：查不到就说为什么，不抛错。
+    pub async fn usage(&self, account_id: &str) -> freeport_core::dto::GwUsage {
+        let now = chrono::Utc::now().to_rfc3339();
+        let live = match self.st.broker.token(account_id).await {
+            Ok(l) => l,
+            Err(e) => {
+                return freeport_core::dto::GwUsage {
+                    kind: String::new(),
+                    ok: false,
+                    windows: Vec::new(),
+                    credits: None,
+                    note: Some(e),
+                    checked_at: now,
+                }
+            }
+        };
+        crate::usage::fetch(
+            &self.st.client,
+            &self.st.broker.endpoints(),
+            &live.kind,
+            &live.tokens.access_token,
+            live.tokens.account_id.as_deref(),
+        )
+        .await
+    }
+
+    /// 每日摘要：一行结论 + 最多三条变更 + 需要处理的事（§3.5.1）。
+    /// 纯内存聚合，不发任何上游请求，可以随便刷。
+    pub async fn digest(&self) -> freeport_core::digest::Digest {
+        // 池战绩只能从日志算，而日志只在内存里。本进程没跑网关时（MCP 进程、
+        // 或第二个实例）本地环是空的——直接算会得出「今天没有任何请求」，
+        // 而空数组最容易被读成这个意思。所以空的时候先问活着的那个网关。
+        let mut logs = self.logs().await;
+        if logs.is_empty() {
+            if let Some(l) = self.live_logs().await {
+                logs = l;
+            }
+        }
+        let d = self.st.data.read().await;
+        freeport_core::digest::build_with_logs(&d, freeport_core::cooldown::now_ms(), &logs)
+    }
+
+    /// 从正在运行的网关取实时日志（同进程时就是它自己）。连不上返回 `None`。
+    async fn live_logs(&self) -> Option<Vec<LogEntry>> {
+        let v = self.inspect_live().await?;
+        let arr = v.get("logs")?.clone();
+        serde_json::from_value(arr).ok()
+    }
+
+    /// 近 `hours` 小时观测：p50/p95、token、按目录价折算的美元、按厂商/用途拆。
+    ///
+    /// 与 `/v1/freeport/inspect` 的 `window` 段同源（`observed_of`），
+    /// 日志取法与 `digest` 一致：本进程环空时问活着的那个网关，
+    /// 否则第二个实例会一本正经地报告「今天一条请求都没有」。
+    pub async fn observed(&self, hours: i64) -> GwObserved {
+        let mut logs = self.logs().await;
+        if logs.is_empty() {
+            if let Some(l) = self.live_logs().await {
+                logs = l;
+            }
+        }
+        // 上限一个月：日志环只有 300 条，再大的窗口也只是回到「全量」
+        let since = freeport_core::cooldown::now_ms() - hours.clamp(1, 24 * 30) * 3_600_000;
+        observed_of(&self.st, &logs, since).await
     }
 
     pub async fn providers(&self) -> Vec<GwProvider> {
@@ -570,7 +1073,18 @@ impl Gateway {
             return Err("key 名称不能为空".into());
         }
         let secret = keys::generate();
-        let k = keys::new_key(name, &secret, input.rpm_limit, input.daily_limit);
+        let mut k = keys::new_key(name, &secret, input.rpm_limit, input.daily_limit);
+        k.daily_token_limit = input.daily_token_limit;
+        k.allowed_models = input
+            .allowed_models
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        k.expires_at = input
+            .expires_at
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let view = GwKey::from(&k);
         {
             let mut d = self.st.data.write().await;
@@ -578,7 +1092,7 @@ impl Gateway {
                 return Err(format!("已存在名为 {name} 的 key"));
             }
             d.api_keys.push(k);
-            store::save(&d);
+            save_here(&self.st, &d);
         }
         Ok(KeyCreated { key: view, secret })
     }
@@ -586,7 +1100,7 @@ impl Gateway {
     pub async fn delete_key(&self, id: &str) -> Vec<GwKey> {
         let mut d = self.st.data.write().await;
         d.api_keys.retain(|k| k.id != id);
-        store::save(&d);
+        save_here(&self.st, &d);
         d.api_keys.iter().map(GwKey::from).collect()
     }
 
@@ -596,7 +1110,7 @@ impl Gateway {
             return Err(format!("找不到 key {id}"));
         };
         k.enabled = enabled;
-        store::save(&d);
+        save_here(&self.st, &d);
         Ok(d.api_keys.iter().map(GwKey::from).collect())
     }
 
@@ -605,18 +1119,73 @@ impl Gateway {
         GwRouting {
             strategy: d.routing.strategy.clone(),
             chain: d.routing.chain.clone(),
+            chains: d.routing.chains.clone(),
+            purpose_chain: d.routing.purpose_chain.clone(),
+            weights: d.routing.weights,
             cooldowns: self.st.cooldowns.snapshot(),
         }
     }
 
-    pub fn presets(&self) -> Vec<presets::ProviderPreset> {
-        presets::all()
+    /// 「可接入」预设 = 内置硬编码表 + 目录里的 Tier A 免费厂商。
+    /// 内置表只是离线兜底，目录（基线 + models.dev + feed）才是主来源。
+    pub async fn presets(&self) -> Vec<presets::ProviderPreset> {
+        let mut out = presets::all();
+        let cat = self.st.catalog.read().await;
+        for p in cat.providers.iter() {
+            if p.tier != "A" || !p.free_tier {
+                continue;
+            }
+            if out.iter().any(|x| x.id == p.id) {
+                continue;
+            }
+            let Some(api) = &p.api else { continue };
+            // baseUrl 带 {占位符}（如 Cloudflare 的 account_id）时接入弹窗改不了 baseUrl，先不进列表
+            if api.contains('{') {
+                continue;
+            }
+            out.push(presets::ProviderPreset {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                base_url: api.clone(),
+                tier: p.tier.clone(),
+                homepage: p.docs.clone(),
+                note: p.free_note.clone(),
+            });
+        }
+        out
     }
 
     /// 预演一条链路：不推进 SWRR、不写粘性表。
     /// GUI 的「路由」页每刷新一次都会调它，绝不能带副作用。
+    ///
+    /// 池维度取 chat：这个探针回答的是「一条普通请求会怎么走」，
+    /// 要按别的用途看，用 [`Gateway::explain_route_for`] 或 `GET /v1/route?purpose=`。
     pub async fn explain_route(&self, model: &str, session: &str) -> serde_json::Value {
-        explain_route_json(&self.st, model, session, false, Needs::default()).await
+        self.explain_route_for(model, session, Purpose::Chat).await
+    }
+
+    /// 按指定用途预演。分池出问题时，先看 `purpose` 判得对不对，再看链。
+    pub async fn explain_route_for(
+        &self,
+        model: &str,
+        session: &str,
+        purpose: Purpose,
+    ) -> serde_json::Value {
+        explain_route_json(&self.st, model, session, false, Needs::default(), purpose, None).await
+    }
+
+    /// 带成本估算的预演（MCP 的 `freeport_route?tokens=` 走这条）。
+    ///
+    /// `cost` 是这单预计吃掉多少 token。给了才判「装不装得下」——没给就
+    /// 保持 `null`，因为拿一个猜出来的数字去报红，比不报更糟。
+    pub async fn explain_route_cost(
+        &self,
+        model: &str,
+        session: &str,
+        purpose: Purpose,
+        cost: Option<f64>,
+    ) -> serde_json::Value {
+        explain_route_json(&self.st, model, session, false, Needs::default(), purpose, cost).await
     }
 
     pub async fn logs(&self) -> Vec<LogEntry> {
@@ -683,6 +1252,7 @@ impl Gateway {
             added_at: now_rfc.clone(),
             quota: None,
             health: None,
+            purposes: Vec::new(),
         };
 
         let mut provider = Provider {
@@ -710,6 +1280,7 @@ impl Gateway {
             // 限额默认不填：免费额度的公开数字经常变，宁可只记账不误拦
             quota: None,
             accounts: if login_only { Vec::new() } else { vec![account.clone()] },
+            proxy: None,
             health: Health {
                 status: HealthStatus::Probing,
                 checked_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -725,7 +1296,7 @@ impl Gateway {
         if !login_only {
             // 用真 key 拉一次模型；拉不到就不入库（匿名端点允许用目录兜底）
             let t0 = Instant::now();
-            match providers::list_models(&self.st.client, &provider, &Credential::bearer(key.clone())).await {
+            match providers::list_models(&providers::client_of(&provider), &provider, &Credential::bearer(key.clone())).await {
                 Ok(mut models) => {
                     // 目录补全：上下文长度、免费判定、能力声明。上游没给的才填。
                     self.st.catalog.read().await.enrich(&pid, &mut models);
@@ -774,9 +1345,12 @@ impl Gateway {
         }
 
         let model_count = provider.models.len();
+        // 自动入链只取非付费的：auto 只花免费额度，把付费模型塞进链只会多一条
+        // 「被拦下」的记录，还占掉原本留给免费模型的两个位置。
         let chain_entries: Vec<String> = provider
             .models
             .iter()
+            .filter(|m| m.free != Some(false))
             .take(2)
             .map(|m| format!("{pid}:{}", m.id))
             .collect();
@@ -805,7 +1379,7 @@ impl Gateway {
                 d.routing.chain.push(entry);
             }
         }
-        store::save(&d);
+        save_here(&self.st, &d);
         let saved = d.providers.iter().find(|p| p.id == pid).cloned();
         drop(d);
 
@@ -852,7 +1426,7 @@ impl Gateway {
 
         // 验证：能拉到模型才算这条凭据可用
         let t0 = Instant::now();
-        let models = providers::list_models(&self.st.client, &provider, &Credential::bearer(key.clone())).await;
+        let models = providers::list_models(&providers::client_of(&provider), &provider, &Credential::bearer(key.clone())).await;
         let latency = t0.elapsed().as_millis() as u64;
         let (models, degraded) = match models {
             Ok(m) => (m, None),
@@ -890,6 +1464,7 @@ impl Gateway {
                 model_count: Some(models.len()),
                 error: None,
             }),
+            purposes: input.purposes,
         };
         secrets::set_key(&acc.id, &key)?;
 
@@ -905,7 +1480,7 @@ impl Gateway {
             if let Some(err) = degraded {
                 p.health.error = Some(format!("/models 不可用：{err}"));
             }
-            store::save(&d);
+            save_here(&self.st, &d);
         }
         tracing::info!(provider = %provider.id, account = %acc.id, "已追加凭据");
         Ok(self.providers().await)
@@ -952,7 +1527,7 @@ impl Gateway {
             jar: imported.jar.clone(),
         };
         let t0 = Instant::now();
-        let probed = providers::list_models(&self.st.client, &provider, &cred_obj).await;
+        let probed = providers::list_models(&providers::client_of(&provider), &provider, &cred_obj).await;
         let latency = t0.elapsed().as_millis() as u64;
 
         let (models, degraded) = match probed {
@@ -987,6 +1562,7 @@ impl Gateway {
                 model_count: Some(models.len()),
                 error: None,
             }),
+            purposes: Vec::new(),
         };
 
         {
@@ -999,7 +1575,7 @@ impl Gateway {
             if p.models.is_empty() && !models.is_empty() {
                 p.models = models;
             }
-            store::save(&d);
+            save_here(&self.st, &d);
         }
 
         tracing::info!(
@@ -1043,7 +1619,7 @@ impl Gateway {
                     a.key_mask = "web-session".into();
                 }
             }
-            store::save(&d);
+            save_here(&self.st, &d);
         }
         tracing::info!(account = %account_id, cookies = n, "已更新 web 会话");
         Ok(self.providers().await)
@@ -1059,7 +1635,7 @@ impl Gateway {
             // 凭据也要墓碑：跨机合并是按 id 补缺的，没有墓碑就会把删掉的 key 加回来
             d.tombstones.bury_account(account_id);
             d.ledger.forget(account_id);
-            store::save(&d);
+            save_here(&self.st, &d);
         }
         secrets::delete_credential(account_id);
         self.st.cooldowns.forget_account(account_id);
@@ -1097,7 +1673,18 @@ impl Gateway {
             } else if let Some(q) = patch.quota {
                 a.quota = Some(q);
             }
-            store::save(&d);
+            if let Some(ps) = patch.purposes {
+                // 去重但保留用户勾选顺序：界面上的标签就按这个顺序出现，
+                // 每次保存都重排一遍会让人以为自己点错了。
+                let mut seen = Vec::with_capacity(ps.len());
+                for p in ps {
+                    if !seen.contains(&p) {
+                        seen.push(p);
+                    }
+                }
+                a.purposes = seen;
+            }
+            save_here(&self.st, &d);
         }
         Ok(self.providers().await)
     }
@@ -1169,7 +1756,7 @@ impl Gateway {
         };
         let mut d = self.st.data.write().await;
         let sum = transfer::apply(body, &mut d, mode);
-        store::save(&d);
+        save_here(&self.st, &d);
         tracing::info!(
             target: "transfer",
             mode = sum.mode.as_str(),
@@ -1197,7 +1784,7 @@ impl Gateway {
             d.routing.chain.retain(|c| !c.starts_with(&format!("{id}:")));
             let prefix = format!("{id}:");
             d.model_health.retain(|k, _| !k.starts_with(&prefix));
-            store::save(&d);
+            save_here(&self.st, &d);
             ids
         };
         for a in account_ids {
@@ -1216,7 +1803,38 @@ impl Gateway {
                 .find(|p| p.id == id)
                 .ok_or_else(|| "provider 不存在".to_string())?;
             p.enabled = enabled;
-            store::save(&d);
+            save_here(&self.st, &d);
+        }
+        Ok(self.providers().await)
+    }
+
+    /// 设厂商级代理。空串等于清掉（回落到环境变量）。
+    ///
+    /// 只影响这一个厂商的上游请求（聊天、拉模型、探针），不影响目录同步——
+    /// 目录是我们自己的公共资源，走系统链路。
+    pub async fn set_provider_proxy(
+        &self,
+        id: &str,
+        proxy: Option<String>,
+    ) -> Result<Vec<GwProvider>, String> {
+        let clean = proxy
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(url) = clean.as_deref() {
+            // 早失败：地址写错就让用户当场看到，而不是等第一次请求超时
+            if reqwest::Proxy::all(url).is_err() {
+                return Err(format!("代理地址不合法：{url}"));
+            }
+        }
+        {
+            let mut d = self.st.data.write().await;
+            let p = d
+                .providers
+                .iter_mut()
+                .find(|p| p.id == id)
+                .ok_or_else(|| "provider 不存在".to_string())?;
+            p.proxy = clean;
+            save_here(&self.st, &d);
         }
         Ok(self.providers().await)
     }
@@ -1287,7 +1905,7 @@ impl Gateway {
         };
 
         let t0 = Instant::now();
-        let result = providers::list_models(&self.st.client, &p, &cred).await;
+        let result = providers::list_models(&providers::client_of(&p), &p, &cred).await;
         let latency = t0.elapsed().as_millis() as u64;
         let checked_at = chrono::Utc::now().to_rfc3339();
 
@@ -1337,7 +1955,7 @@ impl Gateway {
         if let Some(slot) = d.providers.iter_mut().find(|x| x.id == provider_id) {
             *slot = p;
         }
-        store::save(&d);
+        save_here(&self.st, &d);
         out
     }
 
@@ -1349,12 +1967,39 @@ impl Gateway {
         {
             let mut d = self.st.data.write().await;
             if let Some(s) = patch.strategy {
-                d.routing.strategy = s;
+                // 只收认识的模式：写进一个拼错的词会让排序静默退回 balanced，
+                // 而用户以为自己的选择生效了。
+                d.routing.strategy = Strategy::parse(&s).as_str().to_string();
             }
             if let Some(c) = patch.chain {
                 d.routing.chain = c;
             }
-            store::save(&d);
+            if let Some(c) = patch.chains {
+                // 空 profile 名与空链都丢掉：它们只会让选择器多出一堆点了没用的项
+                d.routing.chains = c
+                    .into_iter()
+                    .filter(|(k, v)| !k.trim().is_empty() && !v.is_empty())
+                    .collect();
+            }
+            if let Some(m) = patch.purpose_chain {
+                d.routing.purpose_chain = m
+                    .into_iter()
+                    .filter(|(_, v)| !v.trim().is_empty())
+                    .collect();
+            }
+            if let Some(mut w) = patch.weights {
+                // 夹到 0..=100：界面上是滑杆，但 IPC 是明文接口。
+                // 三个都为 0 等于「不分先后」，那样 SWRR 会退化成一模一样的轮转，
+                // 而用户以为自己调了个策略——所以兜一个 100 在可靠性上。
+                w.reliability = w.reliability.min(100);
+                w.speed = w.speed.min(100);
+                w.intelligence = w.intelligence.min(100);
+                if w.reliability as u32 + w.speed as u32 + w.intelligence as u32 == 0 {
+                    w.reliability = 100;
+                }
+                d.routing.weights = w;
+            }
+            save_here(&self.st, &d);
         }
         self.routing().await
     }
@@ -1376,7 +2021,30 @@ impl Gateway {
                     d.gateway.hold_total_ms = ms;
                 }
             }
-            store::save(&d);
+            if let Some(v) = patch.compress {
+                d.gateway.compress.enabled = v;
+            }
+            if let Some(n) = patch.compress_max_tool_chars {
+                // 太低会把正常输出也剪掉，太高等于没开。1000..200000 是个能用的窗口。
+                if (1_000..=200_000).contains(&n) {
+                    d.gateway.compress.max_tool_chars = n;
+                    // 留头留尾按阈值等比缩放，用户只填一个数就够了
+                    d.gateway.compress.keep_head = n * 3 / 10;
+                    d.gateway.compress.keep_tail = n * 15 / 100;
+                }
+            }
+            if let Some(v) = patch.identifier_limit {
+                // 上限给个天花板：把它写成一百万等于关掉，但界面上会显示「已开启」
+                d.gateway.identifier_limit = v.min(10_000);
+            }
+            if let Some(v) = patch.cache {
+                d.gateway.cache.enabled = v;
+            }
+            if let Some(secs) = patch.cache_ttl_secs {
+                // 上限一天：再长就不是「复用答案」而是「喂陈旧信息」了
+                d.gateway.cache.ttl_secs = secs.clamp(10, 86_400);
+            }
+            save_here(&self.st, &d);
         }
         self.status().await
     }
@@ -1431,7 +2099,7 @@ impl Gateway {
                 {
                     let mut d = self.st.data.write().await;
                     d.catalog.error = Some(e.clone());
-                    store::save(&d);
+                    save_here(&self.st, &d);
                 }
                 Err(e)
             }
@@ -1443,7 +2111,7 @@ impl Gateway {
         let mut d = self.st.data.write().await;
         d.catalog = meta;
         d.catalog.error = error;
-        store::save(&d);
+        save_here(&self.st, &d);
     }
 
     /// 目录更新后，把已有厂商的模型重新补一遍元数据。
@@ -1453,7 +2121,7 @@ impl Gateway {
         for p in d.providers.iter_mut() {
             cat.enrich(&p.id, &mut p.models);
         }
-        store::save(&d);
+        save_here(&self.st, &d);
     }
 
     fn spawn_catalog_refresh(&self) {
@@ -1501,6 +2169,8 @@ impl Gateway {
             seq: f.seq,
             version: f.version.clone(),
             served_tier: f.served_tier.clone(),
+            served_feats: f.served_feats.clone(),
+            feats_skipped: f.feats_skipped.clone(),
             last_check_at: f.last_check_at.clone(),
             last_ok_at: f.last_ok_at.clone(),
             last_error: f.last_error.clone(),
@@ -1550,7 +2220,7 @@ impl Gateway {
                 f.halted = None;
                 f.pending = None;
             }
-            store::save(&d);
+            save_here(&self.st, &d);
         }
         self.feed().await
     }
@@ -1572,12 +2242,13 @@ impl Gateway {
             if !f.accepts_feed() {
                 return self.feed().await;
             }
-            if !manual && !f.due(chrono::Utc::now().timestamp_millis()) {
-                return self.feed().await;
-            }
             // 身份取当前许可证现算：宽限期仍按 Pro 报，过期立刻退回 free。
             // 这里只决定「请求带什么」，不决定「给不给拉」。
             let id = license::identity(&d);
+            // 轮询节奏按档位：免费档问得再勤，服务端给的还是月度快照
+            if !manual && !f.due_for(chrono::Utc::now().timestamp_millis(), id.tier) {
+                return self.feed().await;
+            }
             (
                 f.url.clone(),
                 f.channel.clone(),
@@ -1617,7 +2288,7 @@ impl Gateway {
                 d.feed.last_check_at = Some(now.clone());
                 d.feed.last_ok_at = Some(now);
                 d.feed.last_error = None;
-                store::save(&d);
+                save_here(&self.st, &d);
             }
             Ok(catalog::feed::Poll::Pending(m)) => {
                 let mut d = self.st.data.write().await;
@@ -1631,7 +2302,7 @@ impl Gateway {
                     published_at: Some(m.published_at).filter(|s| !s.is_empty()),
                     at: Some(now),
                 });
-                store::save(&d);
+                save_here(&self.st, &d);
             }
             Ok(catalog::feed::Poll::Applied(a)) => {
                 let a = *a;
@@ -1682,6 +2353,9 @@ impl Gateway {
                     // 记下服务端说这份目录属于哪个档：界面据此显示「Pro 目录」，
                     // 但收不收、用不用，都只看签名——不看本机档位。
                     f.served_tier = a.tier.clone();
+                    // 字段包同理：服务端按许可证的 feat 名单挑了哪几项，如实记下来
+                    f.served_feats = a.feats.clone();
+                    f.feats_skipped = a.feats_skipped.clone();
                     f.last_check_at = Some(now.clone());
                     f.last_ok_at = Some(now.clone());
                     f.last_error = None;
@@ -1694,7 +2368,7 @@ impl Gateway {
                         f.tombstones.remove(k);
                     }
                     f.push_events(a.events.clone());
-                    store::save(&d);
+                    save_here(&self.st, &d);
                 }
                 self.sync_catalog_meta(None).await;
                 self.re_enrich().await;
@@ -1714,7 +2388,7 @@ impl Gateway {
                 } else {
                     d.feed.last_error = Some(e.message.clone());
                 }
-                store::save(&d);
+                save_here(&self.st, &d);
                 tracing::warn!(halted = e.halted, "catalog feed rejected: {}", e.message);
             }
         }
@@ -1791,9 +2465,10 @@ impl Gateway {
         };
         let auth = (hn, hv.as_str());
 
-        let out = probe::liveness(&self.st.client, &p.base_url, model, auth).await;
+        let probe_client = providers::client_of(&p);
+        let out = probe::liveness(&probe_client, &p.base_url, model, auth).await;
         let measured = if deep && out.ok {
-            Some(probe::capability(&self.st.client, &p.base_url, model, auth).await.caps)
+            Some(probe::capability(&probe_client, &p.base_url, model, auth).await.caps)
         } else {
             None
         };
@@ -1814,7 +2489,7 @@ impl Gateway {
         }
         let status = h.status.as_str().to_string();
         let caps = if h.caps.is_empty() { None } else { Some(h.caps) };
-        store::save(&d);
+        save_here(&self.st, &d);
 
         GwModelProbe {
             ok: out.ok,
@@ -1906,7 +2581,7 @@ impl Gateway {
             let today = Local::now().format("%Y-%m-%d").to_string();
             let b = budget_of(&cat, &d);
             budget::roll(&mut d.patrol, &today, b);
-            store::save(&d);
+            save_here(&self.st, &d);
         }
         self.patrol().await
     }
@@ -1953,17 +2628,19 @@ impl Gateway {
         }
 
         for item in items {
-            // 巡检挑第一条有 key 的凭据：模型健康是厂商级事实，不必每条 key 都探
+            // 巡检挑第一条有 key 且接巡检这活儿的凭据：模型健康是厂商级事实，
+            // 不必每条 key 都探。标成 coding-only 的号不该被探针烧额度。
             let picked = {
                 let d = self.st.data.read().await;
                 d.providers.iter().find(|p| p.id == item.provider).and_then(|p| {
                     let base = p.base_url.clone();
+                    let proxy = p.proxy.clone();
                     p.live_accounts()
-                        .find(|a| secrets::has_credential(&a.id))
-                        .map(|a| (base, a.id.clone(), a.quota))
+                        .find(|a| a.admits(Purpose::Probe) && secrets::has_credential(&a.id))
+                        .map(|a| (base, a.id.clone(), a.quota, proxy))
                 })
             };
-            let Some((base, account_id, account_quota)) = picked else {
+            let Some((base, account_id, account_quota, proxy)) = picked else {
                 continue;
             };
             let Some(cred) = self.credential(&account_id).await else {
@@ -1987,9 +2664,16 @@ impl Gateway {
                 let mut d = self.st.data.write().await;
                 d.ledger
                     .reserve_now(&account_id, limits, PROBE_RESERVE, true);
+                // 模型级窗口分列记进 used_probe：探针打的是哪一个模型，哪本账就该动
+                d.ledger
+                    .reserve_model_now(&account_id, &item.model, PROBE_RESERVE, true);
             }
 
-            let out = probe::liveness(&self.st.client, &base, &item.model, auth).await;
+            let patrol_client = match proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(u) => providers::client_for_proxy(u),
+                None => self.st.client.clone(),
+            };
+            let out = probe::liveness(&patrol_client, &base, &item.model, auth).await;
             report.ran += 1;
             if out.ok {
                 report.ok += 1;
@@ -2011,6 +2695,22 @@ impl Gateway {
             if out.ok {
                 health::apply_ok(h, out.latency_ms, &now_rfc);
                 budget::note_ok(&mut d.patrol);
+                // 探针成功同时证明了厂商可达、凭据能用、模型有响应：
+                // 把「猜出来的」冷却提前解除。上游明说的重置时刻不动。
+                let n = self.st.cooldowns.recover_after_probe(
+                    &item.provider,
+                    &account_id,
+                    Some(&item.model),
+                    freeport_core::cooldown::now_ms(),
+                );
+                if n > 0 {
+                    tracing::info!(
+                        provider = %item.provider,
+                        model = %item.model,
+                        cleared = n,
+                        "probe cleared heuristic cooldown early"
+                    );
+                }
             } else if out.no_free_tier {
                 health::apply_no_free_tier(h, out.error.clone().unwrap_or_default(), &now_rfc);
             } else {
@@ -2024,8 +2724,11 @@ impl Gateway {
             if force_all {
                 d.patrol.last_sweep_at = Some(chrono::Utc::now().to_rfc3339());
                 d.patrol.last_sweep_day = Some(Local::now().format("%Y-%m-%d").to_string());
+                // 每日全量体检之后把那一行结论写进日志：用户翻日志能对上「今天变了吗」
+                let dg = freeport_core::digest::build(&d, chrono::Utc::now().timestamp_millis());
+                tracing::info!(digest = %dg.headline, "daily digest");
             }
-            store::save(&d);
+            save_here(&self.st, &d);
         }
 
         if report.ran > 0 {
@@ -2063,9 +2766,24 @@ impl Gateway {
             }
         }
 
+        // unavailable 满 7 天的转 retired：移出路由与巡检队列，保留历史
+        let newly_retired = {
+            let mut d = self.st.data.write().await;
+            let keys = patrol_calc::retire_pass(&mut d, chrono::Utc::now().timestamp_millis());
+            if !keys.is_empty() {
+                save_here(&self.st, &d);
+            }
+            keys
+        };
+        for k in &newly_retired {
+            tracing::info!(model = %k, "model retired after 7 days unavailable");
+        }
+
         let sweep = {
             let d = self.st.data.read().await;
-            patrol_calc::sweep_due(&d.patrol, Local::now())
+            // ±90 分钟抖动：几百台机器同一个 03:00 打上游，等于自己造尖峰
+            let jitter = patrol_calc::sweep_jitter_min(&d.install_id);
+            patrol_calc::sweep_due_at(&d.patrol, Local::now(), jitter)
         };
         let _ = self.patrol_pass(sweep).await;
     }
@@ -2101,10 +2819,10 @@ impl Default for Gateway {
 /* ── handlers ─────────────────────────────────────── */
 
 /// 在途请求守卫。Drop 时自动减一，panic 也不会漏计。
-struct Inflight<'a>(&'a AtomicUsize);
+pub(crate) struct Inflight<'a>(&'a AtomicUsize);
 
 impl<'a> Inflight<'a> {
-    fn new(c: &'a AtomicUsize) -> Self {
+    pub(crate) fn new(c: &'a AtomicUsize) -> Self {
         c.fetch_add(1, Ordering::SeqCst);
         Self(c)
     }
@@ -2114,6 +2832,18 @@ impl Drop for Inflight<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// 把配置写回**本实例的数据目录**，而不是进程级的 `store::data_dir()`。
+///
+/// 为什么非这样不可：`store::save()` 写的是 `FREEPORT_DATA_DIR` 或系统默认目录。
+/// 一个用 `load_from(dir)` 载入的实例（测试、将来的多配置档/便携模式）只要走到
+/// 任何落盘路径——配额记账、统计、健康度回写都会——就会把那份数据写进**真实
+/// 用户目录**。真机上的表现是「跑一次测试，用户的厂商和 key 全没了」，而且
+/// 不报错：保存成功，只是存错了地方。
+pub(crate) fn save_here(st: &Arc<State_>, data: &AppData) -> bool {
+    let dir = st.dir.read().unwrap_or_else(|e| e.into_inner()).clone();
+    store::save_to(&dir, data)
 }
 
 /// 模型健康每次请求都在变，但磁盘不该每个请求都写。
@@ -2132,10 +2862,10 @@ async fn persist_throttled(st: &Arc<State_>) {
         return;
     }
     let d = st.data.read().await;
-    store::save(&d);
+    save_here(st, &d);
 }
 
-fn oai_error(message: &str, kind: &str, code: &str, extra: Value) -> Value {
+pub(crate) fn oai_error(message: &str, kind: &str, code: &str, extra: Value) -> Value {
     let mut err = json!({ "message": message, "type": kind, "code": code });
     if let Some(obj) = extra.as_object() {
         for (k, v) in obj {
@@ -2168,6 +2898,147 @@ async fn pause_guard(
             .into_response();
     }
     next.run(req).await
+}
+
+#[derive(serde::Deserialize)]
+struct InspectQuery {
+    limit: Option<usize>,
+}
+
+/// 本地自省：把**只有网关进程知道**的事实时说出来。
+///
+/// MCP server 是独立进程，它能读磁盘上的配置、健康与账本，但读不到三样东西：
+/// 实时日志、内存里的冷却、此刻的在途数。少了这三样，「为什么刚才失败了」
+/// 就只能靠猜——而猜错比不说更糟。
+///
+/// 两道闸：只接受回环来源，且要带 `x-freeport-control`。凭据在数据目录的
+/// `control.key`（0600），**不是** `authToken`——那把能发请求烧额度，
+/// 为了看日志把它交出去是不划算的。
+async fn inspect(
+    State(st): State<Arc<State_>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Query(q): Query<InspectQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(oai_error(
+                "本地控制接口只接受本机回环访问",
+                "invalid_request_error",
+                "not_loopback",
+                json!({ "peer": peer.ip().to_string() }),
+            )),
+        )
+            .into_response();
+    }
+
+    let expected = st.control_token.read().await.clone();
+    let got = headers
+        .get(crate::control::HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    if !crate::control::verify(&expected, got) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(oai_error(
+                "缺少本地控制凭据：需带 x-freeport-control，值见数据目录下的 control.key",
+                "invalid_request_error",
+                "control_unauthorized",
+                json!({}),
+            )),
+        )
+            .into_response();
+    }
+
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let (log_total, logs) = {
+        let buf = st.logs.read().await;
+        // 日志环形缓冲是「新的在后」。截最近 N 条时反过来取，再翻回时间序，
+        // 这样调用方读到的仍是「按发生顺序」。
+        let start = buf.len().saturating_sub(limit);
+        (buf.len(), buf[start..].to_vec())
+    };
+    // 观测口径固定在 24h：与下面 `stats.requests` 的累计计数同名不同源，
+    // 但「最近一天」是用户唯一能自己核对的时间窗。
+    let since = freeport_core::cooldown::now_ms() - 24 * 3_600_000;
+    let observed = observed_of(&st, &logs, since).await;
+    let d = st.data.read().await;
+    let uptime = st
+        .started_at
+        .read()
+        .await
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+
+    Json(json!({
+        "ok": true,
+        "running": st.running.load(Ordering::SeqCst),
+        "paused": st.paused.load(Ordering::SeqCst),
+        "uptimeSec": uptime,
+        "inflight": st.inflight.load(Ordering::SeqCst),
+        "port": match st.bound_port.load(Ordering::SeqCst) {
+            0 => None,
+            p => Some(p),
+        },
+        "configuredPort": d.gateway.port,
+        "host": d.gateway.host,
+        "budgetMs": d.gateway.request_budget_ms,
+        "logTotal": log_total,
+        "logs": logs,
+        "cooldowns": st.cooldowns.snapshot(),
+        "stats": {
+            "requests24h": d.stats.requests,
+            "tokensIn": d.stats.tokens_in,
+            "tokensOut": d.stats.tokens_out,
+            "errors": d.stats.errors,
+        },
+        // 下面这块来自内存日志环（≤300 条），是「最近一天」的样本，
+        // 与上面的累计计数不是一个口径：一个是全生命周期，一个是近期样本。
+        "window": observed,
+    }))
+    .into_response()
+}
+
+/// 观测口径的唯一实现。`inspect` 与桌面端 `gw_window` 都走这里——
+/// 两边各写一遍迟早会分叉，然后用户就会看到两个不同的 p95。
+async fn observed_of(st: &Arc<State_>, logs: &[LogEntry], since: i64) -> GwObserved {
+    let summary = {
+        let cat = st.catalog.read().await;
+        freeport_core::observe::summarize(logs, since, |p, m| {
+            cat.find_model(p, m).map(|x| (x.cost_in, x.cost_out))
+        })
+    };
+    let buckets = |v: Vec<(String, usize, u64)>| -> Vec<GwBucket> {
+        v.into_iter()
+            .map(|(key, requests, avg_ok_ms)| GwBucket {
+                key,
+                requests,
+                avg_ok_ms,
+            })
+            .collect()
+    };
+    GwObserved {
+        since_ms: since,
+        requests: summary.requests,
+        ok: summary.ok,
+        errors: summary.errors,
+        p50_ms: summary.p50_ms,
+        p95_ms: summary.p95_ms,
+        max_ms: summary.max_ms,
+        tokens_in: summary.tokens_in,
+        tokens_out: summary.tokens_out,
+        // 六位小数足够：目录价本身就是每百万 token 的美元数
+        cost_usd: (summary.cost_usd * 1e6).round() / 1e6,
+        cost_unknown: summary.cost_unknown,
+        by_provider: buckets(freeport_core::observe::bucket(logs, since, |e| {
+            e.provider.as_deref()
+        })),
+        by_purpose: buckets(freeport_core::observe::bucket(logs, since, |e| {
+            Some(e.purpose.as_str())
+        })),
+    }
 }
 
 async fn health(State(st): State<Arc<State_>>) -> impl IntoResponse {
@@ -2209,6 +3080,9 @@ fn model_json(m: &GwModel) -> Value {
 }
 
 /// 别名行。`display_name` 带厂商名，否则选择器里全是 `claude-freeport-xxx`。
+///
+/// 三种行：虚拟项（`auto`）、**模型组**（同名模型在多家都有）、单厂商模型。
+/// 组的 `display_name` 要写明「几家」，否则用户看不出它与单厂商那条的区别。
 fn alias_json(a: &freeport_core::route::AliasEntry) -> Value {
     if a.is_virtual() {
         return json!({
@@ -2220,6 +3094,25 @@ fn alias_json(a: &freeport_core::route::AliasEntry) -> Value {
             "owned_by": "freeport",
             "created": 0,
             "freeport": { "virtual": true },
+        });
+    }
+    if a.is_group() {
+        return json!({
+            "id": a.alias,
+            "object": "model",
+            "type": "model",
+            "display_name": format!("Freeport · {} · {} 家可用", a.model, a.members.len()),
+            "created_at": "1970-01-01T00:00:00Z",
+            "owned_by": "freeport",
+            "created": 0,
+            // `group` + `providers` 是给界面看的：这条名字背后是几条通道，
+            // 而不是某一家。客户端不需要懂它们的含义。
+            "freeport": {
+                "virtual": true,
+                "group": true,
+                "providers": a.members,
+                "upstreamModel": a.model,
+            },
         });
     }
     json!({
@@ -2330,6 +3223,38 @@ async fn get_model(
         .into_response()
 }
 
+/// 这次请求该进哪个账号池。
+///
+/// 三个信号按可靠性排序，判定的顺序见 [`Purpose::infer`]：
+/// - `x-freeport-purpose` 是调用方的明确声明，给需要精确控制的脚本用；
+/// - 请求里带图是客观事实，不需要任何配置；
+/// - Agent 身份来自我们自己注入的 `agent:<id>` key —— 这是最有价值的一条，
+///   因为它让「IDE 里的 Claude Code」和「手动 curl」在**零配置**下就分开了。
+///
+/// 认不出来就 chat：绝大多数未标注的请求确实是普通对话。
+///
+/// 返回依据（`PurposeSource`）是为了写进日志：池过滤是静默的，
+/// 不记依据的话，「为什么没走那把更快的 key」只能靠猜。
+fn purpose_of(headers: &HeaderMap, needs: Needs, key_name: Option<&str>) -> (Purpose, PurposeSource) {
+    let declared = headers
+        .get("x-freeport-purpose")
+        .and_then(|v| v.to_str().ok())
+        .and_then(Purpose::parse);
+    if declared.is_none() {
+        // 写错的值不该让请求失败，但要留痕：否则用户会以为标签生效了
+        if let Some(raw) = headers
+            .get("x-freeport-purpose")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            tracing::warn!(value = %raw, "x-freeport-purpose 取值无法识别，已改用自动判定");
+        }
+    }
+    let from_agent = key_name.map(|n| n.starts_with("agent:")).unwrap_or(false);
+    Purpose::infer_with_source(declared, needs.vision, from_agent)
+}
+
 /// 会话标识：优先用调用方显式给的 header，没有就按对话内容推指纹。
 ///
 /// 显式 header 让「同一段对话但不重发开头」的客户端（很少见）也能粘住；
@@ -2360,8 +3285,9 @@ fn build_plan(
     requested: &str,
     session: &str,
     needs: Needs,
+    purpose: Purpose,
 ) -> (Plan, bool) {
-    build_plan_opts(st, d, requested, session, true, needs)
+    build_plan_opts(st, d, requested, session, true, needs, purpose)
 }
 
 /// `commit = false` 是「预演」：SWRR 用状态副本算顺序、不写回粘性表。
@@ -2375,12 +3301,13 @@ fn build_plan_opts(
     session: &str,
     commit: bool,
     needs: Needs,
+    purpose: Purpose,
 ) -> (Plan, bool) {
     // 对外露的是 `claude-freeport-*`，进来先脱壳，否则裸 id 找不到任何厂商
     let requested = freeport_core::route::resolve_alias(requested);
     let mut p = plan_with(d, requested, &st.cooldowns, &|a: &Account| {
         secrets::has_credential(&a.id)
-    }, &d.ledger, needs);
+    }, &d.ledger, needs, purpose);
 
     let now = freeport_core::cooldown::now_ms();
 
@@ -2415,15 +3342,16 @@ fn build_plan_opts(
 
     // ② Order：没粘住才轮转
     if !sticky && p.candidates.len() > 1 {
+        let strategy = Strategy::parse(&d.routing.strategy);
         let cands = std::mem::take(&mut p.candidates);
         p.candidates = {
             let mut swrr = st.swrr.lock().unwrap_or_else(|e| e.into_inner());
             if commit {
-                swrr.order(cands, d, &d.ledger, now)
+                swrr.order_with(strategy, cands, d, &d.ledger, now)
             } else {
                 // 副本推进：既不写回，也不影响下一次真实请求
                 let mut ghost = swrr.clone();
-                ghost.order(cands, d, &d.ledger, now)
+                ghost.order_with(strategy, cands, d, &d.ledger, now)
             }
         };
     }
@@ -2452,22 +3380,40 @@ async fn route_debug(
         tools: on("tools"),
         json: on("json"),
     };
+    // 调试时没有请求体可看，所以 `?caps=vision` 同时当作「这是一条图片请求」，
+    // 否则想验证 vision 池的人还得另外拼个 header。
+    let purpose = q
+        .get("purpose")
+        .and_then(|v| Purpose::parse(v))
+        .unwrap_or_else(|| Purpose::infer(None, needs.vision, false));
+    // 这单大概要吃多少 token。给了才判「账面上有额度、实际装不下」——
+    // 不给就留空，别拿一个猜的数字去报红。
+    let cost = q
+        .get("tokens")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 10_000_000.0);
     // 调试接口用预演模式：curl 一下不该改变下一单真实请求的落点
-    Json(explain_route_json(&st, &requested, &session, false, needs).await).into_response()
+    Json(explain_route_json(&st, &requested, &session, false, needs, purpose, cost).await)
+        .into_response()
 }
 
 /// 把一条链路解释成 JSON。`/v1/route` 与 GUI 的「路由」页共用这一份，
 /// 保证界面看到的顺序就是 curl 出来的顺序。
+///
+/// `cost` 只是「这单要吃多少 token」的估算，`None` 表示不判装不装得下。
 async fn explain_route_json(
     st: &Arc<State_>,
     model: &str,
     session: &str,
     commit: bool,
     needs: Needs,
+    purpose: Purpose,
+    cost: Option<f64>,
 ) -> serde_json::Value {
     let d = st.data.read().await;
     let now = freeport_core::cooldown::now_ms();
-    let (p, sticky) = build_plan_opts(st, &d, model, session, commit, needs);
+    let (p, sticky) = build_plan_opts(st, &d, model, session, commit, needs, purpose);
+    let weights = d.routing.weights.active();
 
     let hops = p
         .candidates
@@ -2478,7 +3424,18 @@ async fn explain_route_json(
             let (tier, headroom, health) =
                 freeport_core::weight_factors(prov, &c.account, &d.ledger, h, now);
             let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
-            let base = freeport_core::weight_of(prov, &c.account, &d.ledger, h, now);
+            let base =
+                freeport_core::weight_of_model(prov, &c.account, &c.model_id, &d.ledger, h, now, weights);
+            // 启用三维权重后，第三个因子被合成评分顶替。两个都发：
+            // 界面要能同时说清「原始健康」与「实际使用的评分」。
+            let blend = weights.map(|w| {
+                freeport_core::blend_score(
+                    w,
+                    h,
+                    prov.models.iter().find(|m| m.id == c.model_id),
+                    now,
+                )
+            });
             json!({
                 "provider": prov.id,
                 "account": c.account,
@@ -2492,6 +3449,9 @@ async fn explain_route_json(
                     "tier": r3(tier),
                     "headroom": r3(headroom),
                     "health": r3(health),
+                    "blend": blend.map(r3),
+                    // 长期可靠性后验；样本不足时是 null，界面据此说明「样本不足」
+                    "reliability": h.and_then(|x| x.reliability(now)).map(r3),
                     "caps": r3(cap_factor(c)),
                 },
                 // 请求要的能力这个模型没测过：仍可用，但排在确认支持的后面
@@ -2517,6 +3477,9 @@ async fn explain_route_json(
     json!({
         "model": model,
         "session": session,
+        // 这一次请求被归到哪个池。分池出问题时第一个要看的就是它：
+        // 用户以为是 coding，网关判成 chat，链上自然全是另一批账号。
+        "purpose": purpose.as_str(),
         "needs": { "vision": needs.vision, "tools": needs.tools, "json": needs.json },
         "sticky": sticky,
         "strategy": d.routing.strategy,
@@ -2524,13 +3487,132 @@ async fn explain_route_json(
         "chain": hops,
         "rejected": rejected,
         "cooldowns": st.cooldowns.snapshot(),
+        "pool": pool_forecast(st, &d, purpose, &p.candidates, cost, now).await,
+    })
+}
+
+/// 「这条请求现在会落在谁身上、那个池还够不够」——一句话结论，附证据。
+///
+/// 光有 `chain` 回答不了用户真正会问的两件事：
+///
+/// 1. **这个用途到底有几个号接着。** 勾错标签是最常见的现场：链路全空，
+///    而「厂商」页一片绿，用户只会觉得网关坏了。
+/// 2. **排第一那个号余量够不够这单跑完。** Gate 只判「窗口有没有耗尽」，
+///    日窗口还剩 300 token 时一条 8k 的请求照样放行，然后在上面撞 429。
+///
+/// 池战绩复用 `digest::pool_stat`，不另算一份——否则摘要说 78%、预演说
+/// 100%，用户没法判断该信哪个。
+async fn pool_forecast(
+    st: &Arc<State_>,
+    d: &AppData,
+    purpose: Purpose,
+    chain: &[freeport_core::Candidate],
+    cost: Option<f64>,
+    now: i64,
+) -> serde_json::Value {
+    let mut total = 0usize;
+    let mut admits = 0usize;
+    for p in d.providers.iter().filter(|p| p.enabled) {
+        for a in p.live_accounts() {
+            total += 1;
+            if a.admits(purpose) {
+                admits += 1;
+            }
+        }
+    }
+
+    let recent = {
+        let logs = st.logs.read().await;
+        freeport_core::digest::pool_stat(&logs, purpose, now)
+    };
+
+    let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+    let headroom = chain
+        .first()
+        .map(|c| d.ledger.remaining_ratio(&c.account, now))
+        .unwrap_or(0.0);
+
+    let lands_on = chain.first().map(|c| {
+        json!({
+            "provider": d.providers[c.provider].id,
+            "account": c.account,
+            "model": c.model_id,
+            "headroom": r3(headroom),
+        })
+    });
+
+    // 链上最紧的一跳。第一跳最紧是常态，但 hedge 与失败换家会用到后面的跳，
+    // 只盯第一跳会漏掉「换到第二家正好是最满的那个号」。
+    let tightest = chain
+        .iter()
+        .filter_map(|c| d.ledger.tightest(&c.account, now).map(|t| (c, t)))
+        .min_by(|a, b| {
+            a.1.ratio
+                .partial_cmp(&b.1.ratio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(c, t)| {
+            json!({
+                "provider": d.providers[c.provider].id,
+                "account": c.account,
+                // token / rpm / rpd / tpd：光看「还剩 12%」不知道是什么见底了
+                "window": t.kind.as_str(),
+                "left": t.remaining,
+                "headroom": r3(t.ratio),
+                "resetAt": t.reset_at,
+            })
+        });
+
+    // 装不下的是**第一跳**：第二跳装不下无所谓，本来就排后面
+    let short = cost.and_then(|c| {
+        chain
+            .first()
+            .and_then(|f| d.ledger.shortfall(&f.account, c, now))
+    });
+
+    let failing = recent
+        .as_ref()
+        .map(|r| r.requests >= 3 && r.errors * 2 >= r.requests)
+        .unwrap_or(false);
+
+    let verdict = if admits == 0 {
+        "empty-pool"
+    } else if chain.is_empty() {
+        "no-candidate"
+    } else if short.is_some() {
+        "too-big"
+    } else if failing {
+        "pool-failing"
+    } else if headroom < TIGHT_HEADROOM {
+        "tight"
+    } else {
+        "ok"
+    };
+
+    json!({
+        "purpose": purpose.as_str(),
+        // 空池和「有号但全被拦下」是两回事，分开报用户才知道该去改标签还是等冷却
+        "accounts": { "total": total, "admits": admits, "blocked": total - admits },
+        "recent": recent.as_ref().map(|r| json!({
+            "requests": r.requests,
+            "errors": r.errors,
+            "okRate": r.ok_rate,
+        })),
+        "landsOn": lands_on,
+        "tightest": tightest,
+        // 传了 `?tokens=` 才有值。`fits: false` 时 `shortfall` 说明是哪个窗口不够
+        "cost": cost,
+        "fits": cost.map(|_| short.is_none()),
+        "shortfall": short.map(|(kind, left)| json!({ "window": kind.as_str(), "left": left })),
+        // 结论码。措辞留给各端自己写（GUI 要中英双语，MCP 只要一句中文）
+        "verdict": verdict,
     })
 }
 
 /// 解析调用方身份。`None` 表示未授权。
 ///
 /// `require_auth = false` 时不校验，但仍尝试识别 key 以便归因（本地开发常见）。
-async fn resolve_key(st: &Arc<State_>, headers: &HeaderMap) -> Option<keys::Identity> {
+pub(crate) async fn resolve_key(st: &Arc<State_>, headers: &HeaderMap) -> Option<keys::Identity> {
     let (require, token) = {
         let d = st.data.read().await;
         let token = headers
@@ -2569,27 +3651,13 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
     // 日志归因：id 决定用量归属，name 是当次快照（key 以后被删也不影响这条记录）
     let key_label = identity.label();
 
-    // 虚拟 key 的配额在这里判：任一维度打满就本地拒，不打上游
-    {
-        let blocked = {
-            let mut d = st.data.write().await;
-            keys::check_and_spend(&mut d, &key_label, "").err()
-        };
-        if let Some(msg) = blocked {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(oai_error(&msg, "rate_limit_error", "key_quota", json!({}))),
-            )
-                .into_response();
-        }
-        persist_throttled(&st).await;
-    }
-
     let started = Instant::now();
     // 在途计数：巡检靠它给真实流量让路；函数返回时自动减回去
     let _inflight = Inflight::new(&st.inflight);
 
-    let payload: Value = match serde_json::from_slice(&body) {
+    // 可变是因为工具输出压缩会改写 `messages`。幂等指纹在下面按「客户端真正发来的
+    // 那份 body」算，压缩放在判完幂等之后——否则同一条重试会算出两个指纹。
+    let mut payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
             return (
@@ -2608,15 +3676,114 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "auto".into());
 
+    // 幂等重放：同键同指纹直接返回上次的响应，同键不同体一律 409。
+    // 只对非流式生效——流式已经把 token 发出去，没法重放。
+    // 重放放在虚拟 key 记账之前：重试一次不该再扣一遍用户配额。
+    let idem_ctx = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !stream)
+        .map(|k| (idem::sha256_hex(k), idem::fingerprint(&payload)));
+    if let Some((k, fp)) = idem_ctx.as_ref() {
+        match st.idem.check(k, fp, freeport_core::cooldown::now_ms()) {
+            idem::Lookup::Hit {
+                body: cached,
+                provider,
+                model,
+            } => {
+                tracing::debug!(provider = %provider, model = %model, "idempotent replay");
+                let mut res = Response::new(Body::from(cached));
+                *res.status_mut() = StatusCode::OK;
+                let h = res.headers_mut();
+                h.insert(
+                    "content-type",
+                    HeaderValue::from_static("application/json; charset=utf-8"),
+                );
+                h.insert("x-freeport-idempotent-replay", HeaderValue::from_static("1"));
+                if let Ok(v) = HeaderValue::from_str(&provider) {
+                    h.insert("x-freeport-provider", v);
+                }
+                if let Ok(v) = HeaderValue::from_str(&model) {
+                    h.insert("x-freeport-model", v);
+                }
+                return res;
+            }
+            idem::Lookup::Conflict => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(oai_error(
+                        "同一个 Idempotency-Key 被用于了另一份请求体；换一个 key 或原样重发",
+                        "invalid_request_error",
+                        "idempotency_conflict",
+                        json!({}),
+                    )),
+                )
+                    .into_response();
+            }
+            idem::Lookup::Miss => {}
+        }
+    }
+
+    // 工具输出压缩：只动 tool / tool_result，默认关（见 `compress` 模块头部的四条约束）。
+    // 放在这里是因为幂等指纹已经算完了，而 `payload` 之后只被 clone 出去发上游。
+    let squash = {
+        let cfg = {
+            let d = st.data.read().await;
+            d.gateway.compress.clone()
+        };
+        crate::compress::apply(&mut payload, &cfg)
+    };
+    if squash.changed() {
+        tracing::info!(
+            blocks = squash.blocks,
+            saved = squash.saved(),
+            before = squash.chars_before,
+            "工具输出已压缩"
+        );
+    }
+
+    // 虚拟 key 的配额在这里判：任一维度打满就本地拒，不打上游
+    {
+        let blocked = {
+            let mut d = st.data.write().await;
+            keys::check_and_spend(&mut d, &key_label, &requested).err()
+        };
+        if let Some(msg) = blocked {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(oai_error(&msg, "rate_limit_error", "key_quota", json!({}))),
+            )
+                .into_response();
+        }
+        persist_throttled(&st).await;
+    }
+
+    // 调用方标识的分钟窗口：同一把 key 下区分终端用户。
+    // 只有在设置里配了上限才生效，默认关闭——本机自用没有这个维度。
+    if let Err(retry) = ident_touch(&st, &headers).await {
+        let mut r = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(oai_error(
+                &format!("该调用方已达每分钟上限，请 {retry} 秒后重试"),
+                "rate_limit_error",
+                "identifier_rate_limited",
+                json!({}),
+            )),
+        )
+            .into_response();
+        r.headers_mut()
+            .insert("retry-after", HeaderValue::from_str(&retry.to_string()).unwrap_or(HeaderValue::from_static("60")));
+        return r;
+    }
+
     // 会话指纹：agent 不会主动带 session id，默认从「第一条 user 消息」推
     let session = session_key(&headers, &requested, &payload);
     // 能力要求从归一后的请求体里读：四个协议入口都汇到这里，只判一次
     let needs = Needs::of_chat(&payload);
 
-    let (budget_ms, plan, has_any_key, sticky, key_name) = {
+    let (budget_ms, plan, has_any_key, sticky, key_name, purpose, purpose_source) = {
         let d = st.data.read().await;
-        let (p, sticky) = build_plan(&st, &d, &requested, &session, needs);
-        let has_any = d.providers.iter().any(|p| secrets::has_credential(&p.id));
         let name = d
             .api_keys
             .iter()
@@ -2624,7 +3791,44 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
             .map(|k| k.name.clone())
             // 老 authToken 不在 key 列表里，但日志里也得看得出「这条是老客户端打的」
             .or_else(|| (key_label == "default").then(|| "legacy token".to_string()));
-        (d.gateway.request_budget_ms, p, has_any, sticky, name)
+        // 用途要在 plan 之前定：它参与候选过滤，不是事后标注
+        let (purpose, source) = purpose_of(&headers, needs, name.as_deref());
+        let (mut p, sticky) = build_plan(&st, &d, &requested, &session, needs, purpose);
+        // key 的模型白名单在计划之后过滤：候选（provider + model）要到这一步才存在。
+        // 过滤掉的不静默消失，写进 rejected，用户才知道是 key 白名单挡的。
+        if let Some(k) = d.api_keys.iter().find(|k| k.id == key_label) {
+            if !k.allowed_models.is_empty() {
+                p.candidates.retain(|c| {
+                    let pid = &d.providers[c.provider].id;
+                    keys::model_allowed(&k.allowed_models, pid, &c.model_id)
+                });
+                if p.candidates.is_empty() {
+                    p.rejected.push(freeport_core::route::Rejected {
+                        provider: "*".into(),
+                        account: None,
+                        model: requested.clone(),
+                        reason: format!(
+                            "not in this key's allowlist ({})",
+                            k.allowed_models.join(", ")
+                        ),
+                        kind: "key",
+                    });
+                }
+            }
+        }
+        let has_any = d
+            .providers
+            .iter()
+            .any(|p| p.accounts.iter().any(|a| secrets::has_credential(&a.id)));
+        (
+            d.gateway.request_budget_ms,
+            p,
+            has_any,
+            sticky,
+            name,
+            purpose,
+            source,
+        )
     };
 
     // 各协议入口都汇到 chat()，日志里的 path 由调用方用内部头标注（只用于展示，不转发上游）
@@ -2652,28 +3856,94 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
         usage: None,
         attempts: Vec::new(),
         sticky,
+        purpose,
+        purpose_source: Some(purpose_source),
         key_id: Some(key_label.clone()),
         key_name,
         error: None,
     };
 
+    // 精确匹配缓存：同样的请求体已经答过，直接复用。
+    // 只对非流式生效——流式要边生成边发，拿不出一个「完整的答案」来存。
+    let cache_key = if !stream {
+        let d = st.data.read().await;
+        d.gateway.cache.enabled.then(|| cache::key(&payload))
+    } else {
+        None
+    };
+    if let Some(k) = cache_key.as_deref() {
+        let hit = {
+            let mut c = st.resp_cache.lock().unwrap_or_else(|e| e.into_inner());
+            c.get(k, freeport_core::cooldown::now_ms())
+        };
+        if let Some(hit) = hit {
+            entry.ok = true;
+            entry.status = 200;
+            entry.provider = Some(hit.provider.clone());
+            entry.model = Some(hit.model.clone());
+            entry.ms = started.elapsed().as_millis() as u64;
+            record(&st, entry).await;
+            let mut res = Response::new(Body::from(hit.body));
+            *res.status_mut() = StatusCode::OK;
+            let h = res.headers_mut();
+            h.insert(
+                "content-type",
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            h.insert("x-freeport-cache-hit", HeaderValue::from_static("1"));
+            h.insert(
+                "x-freeport-provider",
+                HeaderValue::from_str(&hit.provider).unwrap_or(HeaderValue::from_static("")),
+            );
+            h.insert(
+                "x-freeport-model",
+                HeaderValue::from_str(&hit.model).unwrap_or(HeaderValue::from_static("")),
+            );
+            return res;
+        }
+    }
+
     if plan.is_empty() {
-        let msg = if has_any_key {
-            "所有候选都在冷却中，或没有可用模型"
+        // 用途标签挡掉的候选要单独点名：否则用户看到「都在冷却」会去查额度，
+        // 而真相是他把所有号都标成了别的用途。
+        let pooled_out = plan.rejected.iter().filter(|r| r.kind == "purpose").count();
+        // 点名了一个模型却无路可走：这时**不换别的模型顶上**，所以必须说清
+        // 为什么没有，否则用户只会看到「所有候选都在冷却」去查错方向。
+        let named = !freeport_core::route::is_auto(&requested);
+        let msg = if !has_any_key {
+            "还没有接入任何厂商，请先在「厂商」页添加 API Key".to_string()
+        } else if named && pooled_out > 0 {
+            format!(
+                "模型 {requested} 的凭据都因用途标签被排除（本次请求按 {} 处理）。去「账号」页调整标签，或留空表示不限",
+                purpose.as_str()
+            )
+        } else if named {
+            format!(
+                "模型 {requested} 没有可用通道（未接入 / 已下架 / 凭据不可用 / 额度耗尽）。没有拿别的模型顶替：去掉模型名让网关自己选，或换一个模型"
+            )
+        } else if pooled_out > 0 {
+            format!(
+                "没有可用候选：{pooled_out} 条凭据因用途标签被排除（本次请求按 {} 处理）。去「账号」页调整标签，或留空表示不限",
+                purpose.as_str()
+            )
         } else {
-            "还没有接入任何厂商，请先在「厂商」页添加 API Key"
+            "所有候选都在冷却中，或没有可用模型".to_string()
         };
         entry.status = 503;
         entry.ms = started.elapsed().as_millis() as u64;
-        entry.error = Some(msg.into());
+        entry.error = Some(msg.clone());
         record(&st, entry).await;
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(oai_error(
-                msg,
+                &msg,
                 "freeport_no_route",
                 "no_candidate",
-                json!({ "cooling": st.cooldowns.snapshot().into_iter().take(10).collect::<Vec<_>>() }),
+                json!({
+                    "requested": requested,
+                    "cooling": st.cooldowns.snapshot().into_iter().take(10).collect::<Vec<_>>(),
+                    "purpose": purpose.as_str(),
+                }),
             )),
         )
             .into_response();
@@ -2684,6 +3954,8 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
 
     let queue = plan.candidates.clone();
     let queue_len = queue.len();
+    // 只有明确要了 JSON 才判「格式违约」，否则一半编程对话都会被误杀
+    let wants_json = payload.get("response_format").is_some();
     for (qi, cand) in queue.into_iter().enumerate() {
         let has_next = qi + 1 < queue_len;
         if started.elapsed() > Duration::from_millis(budget_ms) && entry.attempts.len() >= 2 {
@@ -2704,6 +3976,13 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
         let Some(mut cred) = credential(&st, &cand.account).await else { continue };
         let account_id = cand.account.clone();
 
+        // 并发闸：拿不到名额就换下一条，不排队——排队会把 45s 预算耗在等上
+        let cap = { st.data.read().await.gateway.max_inflight_per_account };
+        let Some(slot) = try_slot(&st, &account_id, cap) else {
+            tracing::debug!(account = %account_id, "凭据并发已满，跳过");
+            continue;
+        };
+
         let mut body_for_upstream = payload.clone();
         body_for_upstream["model"] = json!(cand.model_id);
         if stream && body_for_upstream.get("stream_options").is_none() {
@@ -2715,6 +3994,19 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
         let remaining = Duration::from_millis(
             budget_ms.saturating_sub(started.elapsed().as_millis() as u64).max(1000),
         );
+        // hedge（§3.6.8）：还有下家时，这一跳只分到一段切片。
+        // 只控「是否开始下一次重试」是不够的——上游最常见的是「头回来了、体不发」，
+        // 不掐这一跳就会把 45s 全耗在它身上，后面的候选连尝试的机会都没有。
+        // 最后一跳拿满剩余预算：后面没人了，掐掉只是白等。
+        let attempt_ms = if has_next {
+            let left = budget_ms.saturating_sub(started.elapsed().as_millis() as u64);
+            let slice = left / ((queue_len - qi) as u64).max(1);
+            remaining.min(Duration::from_millis(
+                slice.clamp(HEDGE_MIN_MS, HEDGE_MAX_MS),
+            ))
+        } else {
+            remaining
+        };
         let t0 = Instant::now();
 
         // 先记账再发请求：并发下不会超卖，代价是偏保守
@@ -2723,9 +4015,12 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
         {
             let mut d = st.data.write().await;
             d.ledger.reserve_now(&account_id, limits, est_total, false);
+            // 上游学过的模型级窗口跟着记一笔：没学过时是 no-op。
+            // 不记的话学到的模型限额永远不会被填满，Gate 的检查形同虚设。
+            d.ledger.reserve_model_now(&account_id, &cand.model_id, est_total, false);
         }
 
-        match providers::create_chat(&st.client, &provider, &cred, &body_for_upstream, remaining).await {
+        match providers::create_chat(&providers::client_of(&provider), &provider, &cred, &body_for_upstream, attempt_ms).await {
             Ok(upstream) => {
                 // web 会话轮换（服务端换 session）必须当场学回来，否则用户
                 // 过一阵就被踢出去，日志上还看不出原因
@@ -2750,13 +4045,14 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                     let committed = if has_next {
                         let cfg = {
                             let d = st.data.read().await;
-                            let cap = remaining.as_millis() as u64;
+                            // 扣住的时间不能超过这一跳的切片，否则 hedge 无从谈起
+                            let cap = attempt_ms.as_millis() as u64;
                             HoldCfg {
                                 idle_ms: d.gateway.hold_idle_ms.min(cap),
                                 total_ms: d.gateway.hold_total_ms.min(cap),
                             }
                         };
-                        match hold::wait_commit(upstream, &cfg).await {
+                        match hold::wait_commit(upstream, &cfg, upwire::wire_of_provider(&provider_id)).await {
                             HoldOutcome::Committed { head, rest } => Ok((head, rest)),
                             HoldOutcome::Rejected { kind, detail } => {
                                 // 这段 detail 会被写进日志并回给客户端，先抹掉 key
@@ -2771,7 +4067,8 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                         Ok((head, rest)) => {
                             mark_success(&st, &mut entry, &provider_id, &account_id, &model_id, t0.elapsed().as_millis() as u64, cand.half_open, &session).await;
                             let trail = trail_of(&entry);
-                            return stream_response(st.clone(), head, rest, entry, started, provider_id, account_id, model_id, trail, limits, est_total);
+                            let wire = upwire::wire_of_provider(&provider_id);
+                            return stream_response(st.clone(), head, rest, entry, started, provider_id, account_id, model_id, trail, limits, est_total, wire, slot);
                         }
                         Err((kind, detail)) => {
                             let cls = if kind == "upstream_body" {
@@ -2781,24 +4078,72 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                             };
                             note_fail(&mut entry, &st, &provider_id, &account_id, &model_id, &cls, 0, t0.elapsed().as_millis() as u64, &detail).await;
                             // 上游已受理过（200 但内容无效），输入被计费，只回吐输出的预扣
-                            settle_quota(&st, &account_id, limits, est_total, est_input).await;
+                            settle_quota(&st, &account_id, &model_id, limits, est_total, est_input).await;
                             continue;
                         }
                     }
                 }
 
-                // 非流式：读全 body 再判，200 里藏 error 是免费厂商的常见形态
-                let text = upstream.text().await.unwrap_or_default();
+                // 非流式：读全 body 再判，200 里藏 error 是免费厂商的常见形态。
+                // reqwest 的 timeout 只覆盖到响应头，体卡住得自己掐——
+                // 否则「头回来了、体不发」会让整条链停在这一跳。
+                let read_budget = attempt_ms
+                    .saturating_sub(t0.elapsed())
+                    .max(Duration::from_millis(500));
+                let text = match tokio::time::timeout(read_budget, upstream.text()).await {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => {
+                        let detail = red.redact(&e.to_string());
+                        let cls = ErrorClass::soft("truncated");
+                        note_fail(&mut entry, &st, &provider_id, &account_id, &model_id, &cls, 0, t0.elapsed().as_millis() as u64, &detail).await;
+                        // 头已回、体断了：不确定上游是否计费，按只算输入退
+                        settle_quota(&st, &account_id, &model_id, limits, est_total, est_input).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        let cls = ErrorClass::soft("timeout");
+                        note_fail(&mut entry, &st, &provider_id, &account_id, &model_id, &cls, 504, t0.elapsed().as_millis() as u64, "响应体在这一跳的预算内没有读完").await;
+                        settle_quota(&st, &account_id, &model_id, limits, est_total, est_input).await;
+                        continue;
+                    }
+                };
                 if let Some(cls) = body_error(&text) {
                     // 200 里藏的 error 也可能带 key 回显，进日志前抹掉
                     let clean = red.redact(&text);
                     note_fail(&mut entry, &st, &provider_id, &account_id, &model_id, &cls, 0, t0.elapsed().as_millis() as u64, &clean).await;
+                    // 上游已经受理（200），输出没有产出：只认输入
+                    settle_quota(&st, &account_id, &model_id, limits, est_total, est_input).await;
+                    continue;
+                }
+
+                let mut json: Value =
+                    serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+                // 上游讲原生协议时，从这里开始一切必须回到 OpenAI 形态：
+                // 记账、幂等、缓存、回给客户端的都是这个形状
+                let wire = upwire::wire_of_provider(&provider_id);
+                if !wire.is_openai() {
+                    json = upwire::response(wire, &json, &model_id);
+                }
+
+                // 200 却拿不到内容：reasoning 吃满 max_tokens 很常见，值得再试同模型，
+                // 但不能记成健康。连续 3 次之后由 note_fail 升级成冷却。
+                if let Some(kind) = freeport_core::error::empty_completion(&json) {
+                    let cls = ErrorClass::soft(kind);
+                    note_fail(&mut entry, &st, &provider_id, &account_id, &model_id, &cls, 200, t0.elapsed().as_millis() as u64, "上游 200 但没有可用内容").await;
+                    settle_quota(&st, &account_id, &model_id, limits, est_total, est_input).await;
+                    continue;
+                }
+                // 要了 JSON 却回了一段话：模型没遵守契约。只影响这一单的选路，
+                // 不改能力门禁——同一模型在别的请求里可能照常工作。
+                if freeport_core::error::format_ignored(&json, wants_json) {
+                    let cls = ErrorClass::soft("format_ignored");
+                    note_fail(&mut entry, &st, &provider_id, &account_id, &model_id, &cls, 200, t0.elapsed().as_millis() as u64, "要求 JSON 但返回的不是 JSON").await;
+                    settle_quota(&st, &account_id, &model_id, limits, est_total, est_input).await;
                     continue;
                 }
 
                 mark_success(&st, &mut entry, &provider_id, &account_id, &model_id, t0.elapsed().as_millis() as u64, cand.half_open, &session).await;
 
-                let json: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
                 entry.usage = json.get("usage").and_then(parse_usage);
                 entry.ms = started.elapsed().as_millis() as u64;
                 bump_stats(&st, &entry.usage, false).await;
@@ -2806,6 +4151,7 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                 settle_quota(
                     &st,
                     &account_id,
+                    &model_id,
                     limits,
                     est_total,
                     usage_tokens(&entry.usage).unwrap_or(est_total),
@@ -2813,6 +4159,41 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                 .await;
                 let trail = trail_of(&entry);
                 record(&st, entry.clone()).await;
+                if let Some((k, fp)) = idem_ctx.as_ref() {
+                    if idem::cacheable(&json) {
+                        st.idem.put(
+                            k,
+                            fp,
+                            json.to_string(),
+                            provider_id.clone(),
+                            model_id.clone(),
+                            freeport_core::cooldown::now_ms(),
+                        );
+                    }
+                }
+                // 响应缓存：只存正常收尾、且不带工具调用的回答。
+                // 带 tool_calls 的复用了会跳过工具执行，比不缓存更危险。
+                if let Some(k) = cache_key.as_ref() {
+                    if cache::cacheable(&json) {
+                        let (ttl, max) = {
+                            let d = st.data.read().await;
+                            (d.gateway.cache.ttl_secs, d.gateway.cache.max_entries)
+                        };
+                        let mut c = st.resp_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        c.put(
+                            k.clone(),
+                            cache::Hit {
+                                body: json.to_string(),
+                                provider: provider_id.clone(),
+                                model: model_id.clone(),
+                                at: freeport_core::cooldown::now_ms(),
+                            },
+                            freeport_core::cooldown::now_ms(),
+                            ttl,
+                            max,
+                        );
+                    }
+                }
                 let mut res = Response::new(Body::from(json.to_string()));
                 *res.status_mut() = StatusCode::OK;
                 let h = res.headers_mut();
@@ -2820,6 +4201,13 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                 h.insert("x-freeport-provider", HeaderValue::from_str(&provider_id).unwrap_or(HeaderValue::from_static("")));
                 h.insert("x-freeport-model", HeaderValue::from_str(&model_id).unwrap_or(HeaderValue::from_static("")));
                 h.insert("x-freeport-trail", HeaderValue::from_str(&trail).unwrap_or(HeaderValue::from_static("")));
+                // 压了就明说：用户看到账单变小、或者模型说「没看到中间那截」，
+                // 都得能立刻对上原因，而不是翻日志猜
+                if squash.changed() {
+                    if let Ok(v) = HeaderValue::from_str(&squash.saved().to_string()) {
+                        h.insert("x-freeport-compressed", v);
+                    }
+                }
                 return res;
             }
             Err(e) => {
@@ -2846,7 +4234,7 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                 }
                 // status == 0 表示没连上，上游没计费，全退；否则输入已送达，退到只算输入
                 let actual = if e.status == 0 { 0.0 } else { est_input };
-                settle_quota(&st, &account_id, limits, est_total, actual).await;
+                settle_quota(&st, &account_id, &cand.model_id, limits, est_total, actual).await;
             }
         }
     }
@@ -2994,6 +4382,132 @@ async fn count_tokens(State(st): State<Arc<State_>>, headers: HeaderMap, body: B
     Json(json!({ "input_tokens": input.ceil() as u64 })).into_response()
 }
 
+/* ── OpenAI 旧版补全入口（`/v1/completions`） ───────
+   和 messages / responses 一样：请求转成 chat 形态走同一条接力链，
+   响应再改回 `choices[].text` 的旧形状。一堆老 SDK 与脚本还在说这个协议，
+   而免费厂商只认 chat —— 这层适配就是「能不能用」的差别。
+
+   拒绝而不是猜的三种输入见 `completions::to_chat`：批量 prompt、token id、suffix。 */
+
+async fn completions_entry(
+    State(st): State<Arc<State_>>,
+    mut headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(oai_error(
+                    "请求体不是合法 JSON",
+                    "invalid_request_error",
+                    "bad_json",
+                    json!({}),
+                )),
+            )
+                .into_response()
+        }
+    };
+    let stream = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
+    // echo 是本地实现的（拼回 text），所以在这里剥掉，不能漏给上游
+    let echo = v.get("echo").and_then(|x| x.as_bool()).unwrap_or(false);
+
+    // 让请求日志按真实入口记账，而不是一律写成 chat/completions
+    headers.insert("x-freeport-path", HeaderValue::from_static("/v1/completions"));
+
+    let (chat_body, prompt) = match crate::completions::to_chat(&v) {
+        Ok(x) => x,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(oai_error(
+                    &msg,
+                    "invalid_request_error",
+                    "unsupported_parameter",
+                    json!({}),
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let res = chat(State(st), headers, Bytes::from(chat_body.to_string())).await;
+    let status = res.status();
+    let model = res
+        .headers()
+        .get("x-freeport-model")
+        .and_then(|x| x.to_str().ok())
+        .unwrap_or("freeport")
+        .to_string();
+    let diag: Vec<(String, String)> = res
+        .headers()
+        .iter()
+        .filter(|(k, _)| k.as_str().starts_with("x-freeport-"))
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
+        .collect();
+
+    if stream && status.is_success() {
+        let mut out = Response::new(crate::completions::sse_transform(
+            res.into_body(),
+            model,
+            echo.then(|| prompt.clone()),
+        ));
+        *out.status_mut() = StatusCode::OK;
+        let h = out.headers_mut();
+        h.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        h.insert("cache-control", HeaderValue::from_static("no-cache"));
+        h.insert("connection", HeaderValue::from_static("keep-alive"));
+        for (k, v) in diag {
+            if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(&v)) {
+                h.insert(name, val);
+            }
+        }
+        return out;
+    }
+
+    let raw = axum::body::to_bytes(res.into_body(), MAX_BODY)
+        .await
+        .unwrap_or_default();
+    let parsed: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+
+    let mut out = if parsed.get("error").is_some() {
+        // 网关自己的错误本来就是 OpenAI 形状，旧客户端认，不必再包一层
+        (status, Json(parsed)).into_response()
+    } else if parsed.is_null() {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(oai_error(
+                "上游返回了无法解析的响应",
+                "api_error",
+                "bad_upstream",
+                json!({}),
+            )),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            Json(crate::completions::from_chat(
+                &parsed,
+                &model,
+                echo.then(|| prompt.as_str()),
+            )),
+        )
+            .into_response()
+    };
+
+    if let Some((_, trail)) = diag.iter().find(|(k, _)| k == "x-freeport-trail") {
+        if let Ok(val) = HeaderValue::from_str(trail) {
+            out.headers_mut().insert("x-freeport-trail", val);
+        }
+    }
+    out
+}
+
 /* ── OpenAI Responses 入口（Codex 原生协议） ───────
    和 messages / gemini 一样：请求转成 chat 形态走同一条接力链，
    响应再组装回 `output` 数组与语义化 SSE 事件。 */
@@ -3083,6 +4597,296 @@ async fn responses_entry(
         }
     }
     out
+}
+
+/* ── OpenAI Embeddings 入口 ───────────────────────
+   embeddings 不是 chat：没有消息、没有流、没有工具调用，所以不走
+   chat() 的接力链，只复用它的 Gate（build_plan）、账本与失败分类。
+   三条边界都是刻意的：
+   - 只转发给讲 OpenAI 兼容线的厂商（订阅号的原生端点没有 embeddings）；
+   - 不做「auto 帮你挑个 embedding 模型」——目录没把 embedding 单列，
+     让网关猜一个等于猜错也能跑通，宁可选不上；
+   - 目录里没有声明该模型时如实 503，不假装。 */
+async fn embeddings_entry(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(identity) = resolve_key(&st, &headers).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(oai_error(
+                "未授权：请带上 Authorization: Bearer <Freeport Key>",
+                "invalid_request_error",
+                "unauthorized",
+                json!({}),
+            )),
+        )
+            .into_response();
+    };
+    let key_label = identity.label();
+    let started = Instant::now();
+    let _inflight = Inflight::new(&st.inflight);
+
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(oai_error("请求体不是合法 JSON", "invalid_request_error", "bad_json", json!({}))),
+            )
+                .into_response()
+        }
+    };
+
+    let requested = v
+        .get("model")
+        .and_then(|x| x.as_str())
+        .map(|s| freeport_core::route::resolve_alias(s.trim()))
+        .unwrap_or("")
+        .to_string();
+    if requested.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(oai_error("embeddings 请求必须带 model", "invalid_request_error", "missing_model", json!({}))),
+        )
+            .into_response();
+    }
+
+    // input：字符串 / 字符串数组 / token id 数组，三者都合法且都能原样转发；
+    // 空的没有语义，其它形状（对象、混合数组）转发只会换来一次必然的 400
+    let input = v.get("input");
+    let input_ok = match input {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => {
+            !a.is_empty()
+                && a.iter().all(|x| {
+                    x.is_string() || x.is_i64() || x.is_u64()
+                })
+        }
+        _ => false,
+    };
+    if !input_ok {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(oai_error(
+                "input 必须是非空字符串，或非空的字符串 / token id 数组",
+                "invalid_request_error",
+                "unsupported_parameter",
+                json!({}),
+            )),
+        )
+            .into_response()
+    }
+
+    // 上游体只带认识且必要的字段。多一个上游不认识的键就是一次 400 换家，
+    // 和 completions / responses 入口同一条纪律。
+    let mut up = json!({ "model": requested, "input": input });
+    if let Some(d) = v.get("dimensions").and_then(|x| x.as_u64()) {
+        up["dimensions"] = json!(d);
+    }
+    if let Some(f) = v.get("encoding_format").and_then(|x| x.as_str()) {
+        up["encoding_format"] = json!(f);
+    }
+
+    // token 预估：embeddings 没有输出，预扣只算输入（字符数 ÷ 3，与 chat 同口径）
+    let mut chars = 0usize;
+    fn chars_of(v: &Value, out: &mut usize) {
+        match v {
+            Value::String(s) => *out += s.chars().count(),
+            Value::Array(a) => a.iter().for_each(|x| chars_of(x, out)),
+            _ => {}
+        }
+    }
+    if let Some(i) = input {
+        chars_of(i, &mut chars);
+    }
+    let est = (chars as f64 / 3.0).ceil().max(1.0);
+
+    let mut entry = LogEntry {
+        id: format!("req_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+        at: chrono::Utc::now().to_rfc3339(),
+        path: "/v1/embeddings".into(),
+        requested_model: requested.clone(),
+        model: None,
+        provider: None,
+        account_id: None,
+        account_name: None,
+        stream: false,
+        ok: false,
+        status: 0,
+        ms: 0,
+        usage: None,
+        attempts: Vec::new(),
+        sticky: false,
+        purpose: Purpose::Chat,
+        purpose_source: Some(freeport_core::model::PurposeSource::Default),
+        key_id: Some(key_label.clone()),
+        key_name: None,
+        error: None,
+    };
+
+    let (budget_ms, plan, has_any_key) = {
+        let d = st.data.read().await;
+        let (mut p, _sticky) =
+            build_plan(&st, &d, &requested, "", Needs::default(), Purpose::Chat);
+        // 虚拟 key 的白名单同样要过：embeddings 不该成为绕过白名单的侧门
+        if let Some(k) = d.api_keys.iter().find(|k| k.id == key_label) {
+            if !k.allowed_models.is_empty() {
+                p.candidates.retain(|c| {
+                    let pid = &d.providers[c.provider].id;
+                    keys::model_allowed(&k.allowed_models, pid, &c.model_id)
+                });
+            }
+        }
+        let has_any = d
+            .providers
+            .iter()
+            .any(|p| p.accounts.iter().any(|a| secrets::has_credential(&a.id)));
+        (d.gateway.request_budget_ms, p, has_any)
+    };
+
+    if plan.is_empty() {
+        let msg = if !has_any_key {
+            "还没有接入任何厂商，请先在「厂商」页添加 API Key".to_string()
+        } else {
+            format!(
+                "模型 {requested} 没有可用的 embeddings 通道（目录里没有这个模型，或凭据不可用）。embeddings 不会由网关代选模型"
+            )
+        };
+        entry.status = 503;
+        entry.error = Some(msg.clone());
+        record(&st, entry).await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(oai_error(&msg, "freeport_no_route", "no_candidate", json!({ "requested": requested }))),
+        )
+            .into_response();
+    }
+
+    let mut skipped: HashSet<(usize, String, String)> = HashSet::new();
+    for cand in plan.candidates.clone() {
+        if started.elapsed() > Duration::from_millis(budget_ms) && !entry.attempts.is_empty() {
+            break;
+        }
+        if skipped.contains(&(cand.provider, cand.account.clone(), cand.model_id.clone())) {
+            continue;
+        }
+        let (provider, account_quota) = {
+            let d = st.data.read().await;
+            let p = d.providers[cand.provider].clone();
+            let quota = p.account(&cand.account).and_then(|a| a.quota);
+            (p, quota)
+        };
+        // 订阅号的原生端点没有 embeddings：不是失败，是这单从一开始就不该来
+        if !upwire::wire_of_provider(&provider.id).is_openai() {
+            entry.attempts.push(Attempt {
+                provider: provider.id.clone(),
+                account: Some(cand.account.clone()),
+                model: cand.model_id.clone(),
+                ms: 0,
+                status: 0,
+                kind: "no_embeddings_endpoint".into(),
+                scope: Some("provider".into()),
+                cooled_ms: None,
+                detail: Some("该厂商只有原生协议端点，不支持 embeddings".into()),
+                skip_provider: Some(true),
+            });
+            continue;
+        }
+        let Some(cred) = credential(&st, &cand.account).await else { continue };
+        let account_id = cand.account.clone();
+        let model_id = cand.model_id.clone();
+
+        let limits = quota::limits_of(account_quota.as_ref());
+        {
+            let mut d = st.data.write().await;
+            d.ledger.reserve_now(&account_id, limits, est, false);
+            d.ledger.reserve_model_now(&account_id, &model_id, est, false);
+        }
+        let t0 = Instant::now();
+        let remaining = Duration::from_millis(
+            budget_ms.saturating_sub(started.elapsed().as_millis() as u64).max(1_000),
+        );
+
+        // 组里可能是同名模型的另一家：model 要换成这一候选的
+        let mut body_for_upstream = up.clone();
+        body_for_upstream["model"] = json!(model_id);
+
+        match providers::create_embeddings(&providers::client_of(&provider), &provider, &cred, &body_for_upstream, remaining).await {
+            Ok(res) => {
+                let text = res.text().await.unwrap_or_default();
+                let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                let shapes_ok = json.get("data").and_then(|x| x.as_array())
+                    .map(|a| !a.is_empty() && a.iter().all(|d| d.get("embedding").map(|e| e.is_array()).unwrap_or(false)))
+                    .unwrap_or(false);
+                if !shapes_ok {
+                    // 200 但不是 embeddings 形状：透明代理到了错误端点。如实记失败
+                    let cls = ErrorClass::soft("bad_upstream");
+                    note_fail(&mut entry, &st, &provider.id, &account_id, &model_id, &cls, 200, t0.elapsed().as_millis() as u64, "上游 200 但不是 embeddings 形状").await;
+                    settle_quota(&st, &account_id, &model_id, limits, est, 0.0).await;
+                    continue;
+                }
+                entry.ok = true;
+                entry.status = 200;
+                entry.provider = Some(provider.id.clone());
+                entry.account_id = Some(account_id.clone());
+                entry.account_name = provider.account(&account_id).map(|a| a.name.clone());
+                entry.model = Some(model_id.clone());
+                entry.usage = json.get("usage").and_then(parse_usage);
+                entry.ms = started.elapsed().as_millis() as u64;
+                bump_stats(&st, &entry.usage, false).await;
+                let actual = usage_tokens(&entry.usage).unwrap_or(est);
+                settle_quota(&st, &account_id, &model_id, limits, est, actual).await;
+                mark_success(&st, &mut entry, &provider.id, &account_id, &model_id, t0.elapsed().as_millis() as u64, cand.half_open, "").await;
+
+                let mut res = (StatusCode::OK, Json(json)).into_response();
+                let h = res.headers_mut();
+                for (k, v) in [
+                    ("x-freeport-provider", provider.id.as_str()),
+                    ("x-freeport-model", model_id.as_str()),
+                ] {
+                    if let Ok(val) = HeaderValue::from_str(v) {
+                        h.insert(k, val);
+                    }
+                }
+                let trail = trail_of(&entry);
+                if let Ok(val) = HeaderValue::from_str(&trail) {
+                    h.insert("x-freeport-trail", val);
+                }
+                record(&st, entry).await;
+                return res;
+            }
+            Err(e) => {
+                let cls = freeport_core::error::classify(e.status, &e.body, e.retry_after_ms);
+                let detail = e.body.clone();
+                if note_fail(&mut entry, &st, &provider.id, &account_id, &model_id, &cls, e.status, t0.elapsed().as_millis() as u64, &detail).await {
+                    let whole_provider = matches!(cls.scope, freeport_core::Scope::Provider);
+                    for c in plan.candidates.iter() {
+                        if c.provider == cand.provider && (whole_provider || c.account == account_id) {
+                            skipped.insert((c.provider, c.account.clone(), c.model_id.clone()));
+                        }
+                    }
+                }
+                let actual = if e.status == 0 { 0.0 } else { est };
+                settle_quota(&st, &account_id, &model_id, limits, est, actual).await;
+            }
+        }
+    }
+
+    let status = failure_status(&entry.attempts);
+    entry.status = status;
+    entry.ms = started.elapsed().as_millis() as u64;
+    let kinds: Vec<String> = entry.attempts.iter().map(|a| a.kind.clone()).collect();
+    entry.error = Some(kinds.join(", "));
+    bump_stats(&st, &None, true).await;
+    record(&st, entry.clone()).await;
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+        Json(oai_error(
+            "全部 embeddings 候选失败",
+            "freeport_all_failed",
+            entry.attempts.first().map(|a| a.kind.as_str()).unwrap_or("no_candidate"),
+            json!({ "attempts": entry.attempts }),
+        )),
+    )
+        .into_response()
 }
 
 /* ── Gemini 原生协议（/v1beta） ─────────────────── */
@@ -3397,6 +5201,72 @@ fn anth_error(status: u16, kind: &str, msg: &str) -> Response {
         .into_response()
 }
 
+/// 「200 但没内容」在前几次不判故障：reasoning 模型吃满 `max_tokens` 是常态，
+/// 换一个模型重发通常就好了。超过这个次数才当成「这条通道真的答不出东西」。
+const EMPTY_STREAK_EXEMPT: u32 = 3;
+
+/// 一条凭据的在途名额。Drop 时归还，流式响应由后台任务持有到流结束。
+struct AcctSlot {
+    st: Arc<State_>,
+    id: String,
+}
+
+impl Drop for AcctSlot {
+    fn drop(&mut self) {
+        let mut m = self
+            .st
+            .acct_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// 抢一个名额。`cap == 0` 表示不限，只记账不拦。
+///
+/// 抢不到时**不排队**：45 秒预算里等一个空位，比换下一家更慢，
+/// 而且排队期间用户看到的是「没反应」。
+fn try_slot(st: &Arc<State_>, id: &str, cap: u32) -> Option<AcctSlot> {
+    let mut m = st.acct_inflight.lock().unwrap_or_else(|e| e.into_inner());
+    let n = m.entry(id.to_string()).or_insert(0);
+    if cap > 0 && *n >= cap as usize {
+        return None;
+    }
+    *n += 1;
+    Some(AcctSlot {
+        st: st.clone(),
+        id: id.to_string(),
+    })
+}
+
+fn empty_key(provider_id: &str, account_id: &str, model_id: &str) -> String {
+    format!("{provider_id}:{account_id}:{model_id}")
+}
+
+fn bump_empty(st: &Arc<State_>, provider_id: &str, account_id: &str, model_id: &str) -> u32 {
+    let mut m = st.empty_streak.lock().unwrap_or_else(|e| e.into_inner());
+    let n = {
+        let e = m.entry(empty_key(provider_id, account_id, model_id)).or_insert(0);
+        *e = e.saturating_add(1);
+        *e
+    };
+    // 进程长期运行，别让这张表无限长
+    if m.len() > 512 {
+        m.retain(|_, v| *v > 0);
+    }
+    n
+}
+
+fn reset_empty(st: &Arc<State_>, provider_id: &str, account_id: &str, model_id: &str) {
+    let mut m = st.empty_streak.lock().unwrap_or_else(|e| e.into_inner());
+    m.remove(&empty_key(provider_id, account_id, model_id));
+}
+
 /// 判定为成功：写 trail、清冷却、更新模型健康。
 /// 只有真正拿到内容后才调用——响应头不算成功。
 async fn mark_success(
@@ -3442,6 +5312,7 @@ async fn mark_success(
     }
 
     st.cooldowns.note_success(provider_id, account_id, Some(model_id));
+    reset_empty(st, provider_id, account_id, model_id);
 
     // 真实流量是最高优先级的探针：成功一次就够把模型拉回 healthy
     {
@@ -3471,9 +5342,25 @@ async fn note_fail(
     ms: u64,
     detail: &str,
 ) -> bool {
+    let mut cls = cls.clone();
+    // 空回复前三次只换下一跳；连续第四次才当成通道故障，冷却 90 秒。
+    // 这条豁免很关键：reasoning 模型把 max_tokens 全花在思考上是正常现象，
+    // 一看到空就冷却会让用户「换个问题就好了」——那是最难查的一类 bug。
+    if matches!(
+        cls.kind.as_str(),
+        "empty_completion" | "empty_reasoning" | "empty_stream"
+    ) {
+        let n = bump_empty(st, provider_id, account_id, model_id);
+        if n > EMPTY_STREAK_EXEMPT {
+            cls.scope = freeport_core::Scope::Key;
+            cls.cooldown_ms = 90_000;
+            cls.source = freeport_core::cooldown::Source::Heuristic;
+        }
+    }
     // 冷却 0 的失败（安全拒答 / 空响应 / 模型慢）只换下一跳，不写冷却
     let cooled = if cls.cooldown_ms > 0 {
-        st.cooldowns.hit(
+        st.cooldowns.hit_with(
+            cls.source,
             cls.scope,
             provider_id,
             account_id,
@@ -3487,14 +5374,41 @@ async fn note_fail(
 
     // 上游在 429 里写明了额度上限时回填账本：Gate 从此按真值算余量，
     // 不用等用户手工把 rpd 填进配置。只收紧，见 `Ledger::learn`。
+    //
+    // 文案点名了模型（`Rate limit reached for model \`x\``）→ 这是**模型级**
+    // 限额，记进 `account|model` 的窗口：同一条 key 上的别的模型不受影响。
+    // 点名的模型与本次请求不一致时不学——宁可漏记，不能把别的模型的账记错。
     if let Some(l) = &cls.learned {
         let now = freeport_core::cooldown::now_ms();
         let mut d = st.data.write().await;
-        if let Some(rpd) = l.daily_limit {
-            d.ledger.learn(account_id, quota::WindowKind::Rpd, rpd as f64, now);
-        }
-        if let Some(rpm) = l.minute_limit {
-            d.ledger.learn(account_id, quota::WindowKind::Rpm, rpm as f64, now);
+        match l.model.as_deref() {
+            Some(m) if m == model_id => {
+                if let Some(rpd) = l.daily_limit {
+                    d.ledger
+                        .learn_model(account_id, model_id, quota::WindowKind::Rpd, rpd as f64, now);
+                }
+                if let Some(rpm) = l.minute_limit {
+                    d.ledger
+                        .learn_model(account_id, model_id, quota::WindowKind::Rpm, rpm as f64, now);
+                }
+                if let Some(tpm) = l.token_minute_limit {
+                    d.ledger
+                        .learn_model(account_id, model_id, quota::WindowKind::Tpm, tpm as f64, now);
+                }
+                if let Some(tpd) = l.token_day_limit {
+                    d.ledger
+                        .learn_model(account_id, model_id, quota::WindowKind::Tpd, tpd as f64, now);
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let Some(rpd) = l.daily_limit {
+                    d.ledger.learn(account_id, quota::WindowKind::Rpd, rpd as f64, now);
+                }
+                if let Some(rpm) = l.minute_limit {
+                    d.ledger.learn(account_id, quota::WindowKind::Rpm, rpm as f64, now);
+                }
+            }
         }
     }
 
@@ -3543,12 +5457,19 @@ fn stream_response(
     trail: String,
     limits: [f64; 4],
     reserved: f64,
+    wire: upwire::Wire,
+    slot: AcctSlot,
 ) -> Response {
     // header 需要 provider 名，spawn 内部结算也要用，留一份
     let provider_id_header = provider_id.clone();
+    // 转换要用模型名，header 也要用——spawn 会把 model_id 移走，各留一份
+    let model_for_wire = model_id.clone();
+    let model_for_header = model_id.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
 
     tokio::spawn(async move {
+        // 名额跟着流走：流结束（或客户端断开）才释放，否则「限并发」只是限住了握手
+        let _slot = slot;
         let mut tail = String::new();
         let mut broken = false;
         // head 是 Hold 阶段已经读掉的字节，必须先补发给客户端
@@ -3557,6 +5478,12 @@ fn stream_response(
         )
         .chain(rest)
         .boxed();
+        // 上游的原生 SSE 必须先转成 OpenAI 的 chunk 流：下面抓 usage、
+        // 以及再往上一层对客户端协议的转换，全都按 OpenAI 的形状写的。
+        // head 和 rest 一起进转换，否则断在帧中间的那一片会丢。
+        if !wire.is_openai() {
+            stream = upwire::rewrite(wire, model_for_wire, stream);
+        }
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -3610,6 +5537,7 @@ fn stream_response(
         settle_quota(
             &st,
             &account_id,
+            &model_id,
             limits,
             reserved,
             usage_tokens(&entry.usage).unwrap_or(reserved),
@@ -3626,7 +5554,7 @@ fn stream_response(
     h.insert("connection", HeaderValue::from_static("keep-alive"));
     h.insert("x-accel-buffering", HeaderValue::from_static("no"));
     h.insert("x-freeport-provider", HeaderValue::from_str(&provider_id_header).unwrap_or(HeaderValue::from_static("")));
-    h.insert("x-freeport-model", HeaderValue::from_str(&model_id).unwrap_or(HeaderValue::from_static("")));
+    h.insert("x-freeport-model", HeaderValue::from_str(&model_for_header).unwrap_or(HeaderValue::from_static("")));
     h.insert("x-freeport-trail", HeaderValue::from_str(&trail).unwrap_or(HeaderValue::from_static("")));
     res
 }
@@ -3655,7 +5583,7 @@ fn stream_complete(tail: &str) -> bool {
 }
 
 fn trail_of(entry: &LogEntry) -> String {
-    entry
+    let hops = entry
         .attempts
         .iter()
         .map(|a| {
@@ -3666,7 +5594,14 @@ fn trail_of(entry: &LogEntry) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join(" > ")
+        .join(" > ");
+    // chat 是默认池，不加前缀：那条 trail 恰恰是「没有任何特别处理」的，
+    // 给它挂一段 `[chat:default]` 只是给每次排障增加噪音。
+    if entry.purpose == Purpose::Chat {
+        return hops;
+    }
+    let src = entry.purpose_source.map(|s| s.as_str()).unwrap_or("?");
+    format!("[{}:{}] {hops}", entry.purpose.as_str(), src)
 }
 
 /// 预扣用的 token 估算：返回 `(输入估算, 输入 + max_tokens)`。
@@ -3715,12 +5650,15 @@ fn usage_tokens(u: &Option<Usage>) -> Option<f64> {
 async fn settle_quota(
     st: &Arc<State_>,
     account: &str,
+    model: &str,
     limits: [f64; 4],
     reserved: f64,
     actual: f64,
 ) {
     let mut d = st.data.write().await;
     d.ledger.settle_now(account, limits, reserved, actual, false);
+    // 模型级窗口同口径结算；没学过时是 no-op
+    d.ledger.settle_model_now(account, model, reserved, actual, false);
 }
 
 fn parse_usage(v: &Value) -> Option<Usage> {
@@ -3772,6 +5710,49 @@ fn failure_status(attempts: &[Attempt]) -> u16 {
     502
 }
 
+/// 推进 `x-freeport-identifier` 的分钟窗口。返回 `Err(还需等待秒数)` 表示超限。
+///
+/// 没配上限、没带标识、标识里含可疑字符时一律放行：限流是附加能力，
+/// 不该因为一个格式不对的头把正常请求拦下来。
+async fn ident_touch(st: &Arc<State_>, headers: &HeaderMap) -> Result<(), i64> {
+    let limit = { st.data.read().await.gateway.identifier_limit };
+    if limit == 0 {
+        return Ok(());
+    }
+    let Some(raw) = headers
+        .get("x-freeport-identifier")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(());
+    };
+    let id = raw.trim();
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:|@".contains(c))
+    {
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let minute = now / 60;
+    let mut map = st.idents.lock().unwrap_or_else(|e| e.into_inner());
+    // 别让这张表随客户端数量无限长大：一分钟以上的桶直接清掉
+    if map.len() > 4096 {
+        map.retain(|_, (m, _)| *m >= minute - 1);
+    }
+    let e = map.entry(id.to_string()).or_insert((minute, 0));
+    if e.0 != minute {
+        *e = (minute, 0);
+    }
+    e.1 += 1;
+    if e.1 > limit {
+        return Err(60 - now % 60);
+    }
+    Ok(())
+}
+
 async fn bump_stats(st: &Arc<State_>, usage: &Option<Usage>, error: bool) {
     let mut d = st.data.write().await;
     d.stats.bump(
@@ -3782,6 +5763,18 @@ async fn bump_stats(st: &Arc<State_>, usage: &Option<Usage>, error: bool) {
 }
 
 async fn record(st: &Arc<State_>, entry: LogEntry) {
+    // key 的 token 账在这里记：只有这一处同时拿得到 key 身份与真实 usage。
+    // 请求数在入口预扣，token 只能事后记——预扣得靠估算，估错了会挡住本来能跑的请求。
+    if let (Some(kid), Some(u)) = (entry.key_id.as_deref(), entry.usage.as_ref()) {
+        let tokens = u.tokens_in().saturating_add(u.tokens_out());
+        if tokens > 0 {
+            {
+                let mut d = st.data.write().await;
+                keys::spend_tokens(&mut d, kid, tokens);
+            }
+            persist_throttled(st).await;
+        }
+    }
     {
         let mut logs = st.logs.write().await;
         logs.insert(0, entry.clone());

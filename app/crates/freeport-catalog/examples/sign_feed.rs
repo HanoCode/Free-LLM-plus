@@ -24,7 +24,7 @@ use rand_core::RngCore;
 use freeport_catalog::feed::{
     diff, snapshot_digest, snapshot_value, PatchFile, PatchRef, Snapshot,
 };
-use freeport_catalog::{jcs, Manifest};
+use freeport_catalog::{jcs, FeatRef, Manifest};
 use sha2::{Digest, Sha256};
 
 fn main() {
@@ -102,6 +102,33 @@ fn main() {
         });
     }
 
+    // 字段包：`--feats <dir>` 下每个 `<name>.json` 作为一份按 feat 下发的情报。
+    // 只复制、不加工——摘要进 manifest，服务端照着文件原样吐出去。
+    let mut feat: Vec<FeatRef> = Vec::new();
+    if let Some(dir) = args.feats.as_ref() {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("读不到 --feats 目录")
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".json").map(str::to_string))
+            .collect();
+        names.sort();
+        let dest = out.join("feat");
+        std::fs::create_dir_all(&dest).unwrap();
+        for name in names {
+            let raw = std::fs::read(dir.join(format!("{name}.json"))).expect("读不到字段包");
+            // 解析一次：发布一个语法坏掉的包，客户端只会把它记进 featsSkipped
+            let _: serde_json::Value =
+                serde_json::from_slice(&raw).expect(&format!("字段包 {name} 不是合法 JSON"));
+            std::fs::write(dest.join(format!("{name}.json")), &raw).unwrap();
+            feat.push(FeatRef {
+                name: name.clone(),
+                url: format!("feat/{name}.json"),
+                sha256: hex::encode(Sha256::digest(&raw)),
+            });
+            println!("feat:     feat/{name}.json（{} 字节）", raw.len());
+        }
+    }
+
     let mut m = Manifest {
         version: args.version.expect("缺少 --version"),
         channel: args.channel,
@@ -112,6 +139,7 @@ fn main() {
         url,
         tier: args.tier,
         notes: args.notes,
+        feat,
         patches,
     };
 
@@ -168,6 +196,8 @@ struct Args {
     patch_from: Option<PathBuf>,
     /// 补丁在 manifest 目录下的相对目录
     patch_url: String,
+    /// 字段包目录：每个 `<name>.json` 变成一份按 feat 下发的情报
+    feats: Option<PathBuf>,
 }
 
 impl Args {
@@ -185,6 +215,7 @@ impl Args {
             out: None,
             patch_from: None,
             patch_url: "patches".into(),
+            feats: None,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -209,6 +240,7 @@ impl Args {
                 "--out" => a.out = Some(PathBuf::from(take())),
                 "--patch-from" => a.patch_from = Some(PathBuf::from(take())),
                 "--patch-url" => a.patch_url = take(),
+                "--feats" => a.feats = Some(PathBuf::from(take())),
                 other => panic!("未知参数 {other}"),
             }
             i += 1;

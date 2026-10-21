@@ -1,0 +1,17 @@
+{
+  "id": "video",
+  "name": "Video",
+  "version": "1.0.0",
+  "kind": "video",
+  "entry": "self",
+  "author": "freeport",
+  "permissions": {
+    "domains": [
+      "api.openai.com",
+      "api.minimax.io",
+      "api.replicate.com"
+    ],
+    "paths": []
+  },
+  "sig": "/e5A5hJCwZL1twi4ojfZtx2O/FL2qMBegQLX2Ed9EqHHcRGj9/XtgUo2pLjItcO2ybwSAe1EoqJRiIeAIht7Bg=="
+}

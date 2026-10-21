@@ -1,0 +1,16 @@
+{
+  "id": "asr",
+  "name": "ASR",
+  "version": "1.0.0",
+  "kind": "asr",
+  "entry": "self",
+  "author": "freeport",
+  "permissions": {
+    "domains": [
+      "api.groq.com",
+      "api.openai.com"
+    ],
+    "paths": []
+  },
+  "sig": "PMb/4KMwys/38esfg/2OjpkJc5VoN6+Lu3PvddBsj5nQRPMpRU0IW5o5l4Z32u2omZYMe5WZ7pKzSB6PA8gjDg=="
+}

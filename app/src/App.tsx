@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Topbar } from './components/Topbar';
 import { ToastHost } from './components/ui';
+import { LicenseDialog } from './components/License';
 import { useApp, applyTheme } from './lib/store';
 import { initGateway } from './lib/gateway';
 import { Overview } from './pages/Overview';
@@ -14,6 +15,7 @@ import { Agents } from './pages/Agents';
 import { Extensions } from './pages/Extensions';
 import { Logs } from './pages/Logs';
 import { Settings } from './pages/Settings';
+import { Playground } from './pages/Playground';
 
 const pages = {
   overview: Overview,
@@ -26,6 +28,7 @@ const pages = {
   extensions: Extensions,
   logs: Logs,
   settings: Settings,
+  playground: Playground,
 };
 
 export default function App() {
@@ -51,6 +54,7 @@ export default function App() {
           <View />
         </section>
       </main>
+      <LicenseDialog />
       <ToastHost />
     </div>
   );

@@ -94,6 +94,9 @@ async fn legacy_token_still_works_and_each_key_has_its_own_quota() {
             name: "ci".into(),
             rpm_limit: None,
             daily_limit: Some(1),
+            daily_token_limit: None,
+            allowed_models: Vec::new(),
+            expires_at: None,
         })
         .await
         .expect("建 key 应当成功");
@@ -127,6 +130,9 @@ async fn legacy_token_still_works_and_each_key_has_its_own_quota() {
             name: "other".into(),
             rpm_limit: None,
             daily_limit: Some(5),
+            daily_token_limit: None,
+            allowed_models: Vec::new(),
+            expires_at: None,
         })
         .await
         .unwrap();

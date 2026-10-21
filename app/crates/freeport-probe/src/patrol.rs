@@ -6,7 +6,9 @@
 
 use chrono::{Datelike, Local, Timelike};
 
-use freeport_core::model::{parse_rfc3339_ms, AppData, HealthStatus, PatrolConfig};
+use freeport_core::model::{parse_rfc3339_ms, AppData, HealthStatus, PatrolConfig, Purpose};
+
+use crate::health;
 
 /// 有真实流量后多久算「热模型」
 const HOT_WINDOW_HOURS: i64 = 24;
@@ -61,9 +63,21 @@ fn collect(
         if !has_key(&p.id) {
             continue;
         }
+        // 巡检只碰「不限用途」或明确标了 `probe` 的账号。
+        //
+        // 整家都被标成别的用途时必须**在入队前**跳过，不能等到发请求时再 continue：
+        // 那样每次巡检都会挑中它、发现没账号、跳过，而它的 overdue 只增不减，
+        // 永远排在最前面，把真正该测的模型饿死。
+        if !p.live_accounts().any(|a| a.admits(Purpose::Probe)) {
+            continue;
+        }
         for m in &p.models {
             let k = key(&p.id, &m.id);
             let h = data.model_health.get(&k);
+            // retired 已移出路由，不再烧探针预算；唤醒靠手动重探或目录热更新
+            if h.map(|h| h.status == HealthStatus::Retired).unwrap_or(false) {
+                continue;
+            }
             let hot = h
                 .and_then(|h| h.last_used_at.as_deref())
                 .and_then(parse_rfc3339_ms)
@@ -101,9 +115,47 @@ fn collect(
     out
 }
 
-/// 今天该不该做全量体检。
+/// 巡检前跑一遍：把「连续 7 天 unavailable」的模型转 retired（§3.5.1 状态机的最后一站）。
+/// 返回本次 retired 的 `provider:model` key，调用方据此记日志。
+/// retired 之后不再进 `due()` 队列，探针预算让给活着的模型；
+/// 厂商恢复免费额度后由手动「重新探测」唤醒（apply_ok 清掉 retired）。
+pub fn retire_pass(data: &mut AppData, now_ms: i64) -> Vec<String> {
+    let mut retired = Vec::new();
+    for (k, h) in data.model_health.iter_mut() {
+        if health::retire_if_dead(h, now_ms) {
+            retired.push(k.clone());
+        }
+    }
+    retired
+}
+
+/// 本机的全量体检抖动（分钟，-90..+90）。
+///
+/// 所有用户都在 03:00 整打上游，等于我们自己造了一个尖峰；免费额度本来就紧，
+/// 尖峰里的 429 会被用户读成「这软件没用」。抖动由 `install_id` 决定，
+/// 同一台机器每天同一时刻，重启也不变——不会出现「昨天 3 点今天 4 点」。
+pub fn sweep_jitter_min(install_id: &str) -> i64 {
+    if install_id.is_empty() {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
+    for b in install_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    (h % 180) as i64 - 90
+}
+
+/// 今天该不该做全量体检（固定时刻，无抖动）。单测与不需要抖动的调用方用这个。
 pub fn sweep_due(state: &PatrolConfig, now: chrono::DateTime<Local>) -> bool {
+    sweep_due_at(state, now, 0)
+}
+
+/// 带抖动的版本：`jitter_min` 由 [`sweep_jitter_min`] 从 install_id 算出。
+pub fn sweep_due_at(state: &PatrolConfig, now: chrono::DateTime<Local>, jitter_min: i64) -> bool {
     let (hh, mm) = parse_hhmm(&state.sweep_at).unwrap_or((3, 0));
+    let target = (hh as i64 * 60 + mm as i64 + jitter_min).clamp(0, 24 * 60 - 1) as u32;
+    let (hh, mm) = (target / 60, target % 60);
     let today = format!(
         "{:04}-{:02}-{:02}",
         now.year(),
@@ -152,7 +204,9 @@ mod tests {
                 added_at: String::new(),
                 quota: None,
                 health: None,
+                purposes: Vec::new(),
             }],
+            proxy: None,
             models: vec![ModelInfo {
                 id: "m1".into(),
                 owned_by: id.into(),
@@ -220,6 +274,93 @@ mod tests {
         let mut d = AppData::default();
         d.providers = vec![provider("a")];
         assert!(due(&d, 0, 10, &|_| false).is_empty());
+    }
+
+    #[test]
+    fn retired_models_leave_the_patrol_queue() {
+        let mut d = AppData::default();
+        d.providers = vec![provider("a")];
+        let now = chrono::Utc::now();
+        // 旧检查时间，保证正常情况下必到期
+        let old = (now - chrono::Duration::hours(48)).to_rfc3339();
+        d.model_health.insert(
+            "a:m1".into(),
+            ModelHealth {
+                status: HealthStatus::Unavailable,
+                checked_at: Some(old.clone()),
+                ..Default::default()
+            },
+        );
+        d.model_health.insert(
+            "a:m1-retired".into(),
+            ModelHealth {
+                status: HealthStatus::Retired,
+                checked_at: Some(old.clone()),
+                ..Default::default()
+            },
+        );
+        // health 里挂了两个 key，但 provider 只有 m1 一条模型 —— due 只看目录里有的
+        let items = due(&d, now.timestamp_millis(), 10, &|_| true);
+        assert_eq!(items.len(), 1);
+
+        // 把 m1 直接标 retired，队列立刻清空
+        d.model_health.get_mut("a:m1").unwrap().status = HealthStatus::Retired;
+        assert!(due(&d, now.timestamp_millis(), 10, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn retire_pass_flips_only_seven_day_dead_models() {
+        use crate::health::RETIRE_AFTER_MS;
+        let mut d = AppData::default();
+        let t0 = parse_rfc3339_ms("2026-10-01T00:00:00Z").unwrap();
+        let fresh_fail = "2026-10-19T08:00:00Z";
+        d.model_health.insert(
+            "a:dead".into(),
+            ModelHealth {
+                status: HealthStatus::Unavailable,
+                unavailable_since: Some("2026-10-01T00:00:00Z".into()),
+                checked_at: Some(fresh_fail.into()),
+                ..Default::default()
+            },
+        );
+        d.model_health.insert(
+            "a:recent".into(),
+            ModelHealth {
+                status: HealthStatus::Unavailable,
+                unavailable_since: Some("2026-10-18T00:00:00Z".into()),
+                checked_at: Some(fresh_fail.into()),
+                ..Default::default()
+            },
+        );
+        let retired = retire_pass(&mut d, t0 + RETIRE_AFTER_MS);
+        assert_eq!(retired, vec!["a:dead".to_string()]);
+        assert_eq!(d.model_health["a:dead"].status, HealthStatus::Retired);
+        assert_eq!(d.model_health["a:recent"].status, HealthStatus::Unavailable);
+    }
+
+    #[test]
+    fn sweep_jitter_is_stable_per_install_and_within_90_minutes() {
+        let a = sweep_jitter_min("install-abc");
+        assert_eq!(a, sweep_jitter_min("install-abc"), "同一台机器必须天天同一时刻");
+        assert!((-90..90).contains(&a));
+        assert_eq!(sweep_jitter_min(""), 0, "没有 install_id 就不抖，别把时间抖到未知处");
+        // 抖动真的会把时刻挪走（不同 install_id 至少有一个不同）
+        let b = sweep_jitter_min("install-xyz");
+        assert!(a != b || a == 0, "抖动应当按机器分散");
+    }
+
+    #[test]
+    fn jitter_moves_the_due_minute() {
+        use chrono::TimeZone;
+        let mut s = PatrolConfig::default();
+        s.sweep_at = "03:00".into();
+        let at_three = Local.with_ymd_and_hms(2026, 10, 19, 3, 1, 0).unwrap();
+        assert!(sweep_due_at(&s, at_three, 0));
+        assert!(!sweep_due_at(&s, at_three, 60), "往后抖 1 小时，3:01 还没到");
+        assert!(
+            sweep_due_at(&s, at_three, -60),
+            "往前抖 1 小时，3:01 已经过了"
+        );
     }
 
     #[test]

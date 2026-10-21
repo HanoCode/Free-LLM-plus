@@ -1,0 +1,20 @@
+[package]
+name = "freeport-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freeport 的无界面宿主：容器 / NAS / systemd 用，不含任何 GUI 依赖。"
+
+[[bin]]
+name = "freeport"
+path = "src/main.rs"
+
+[dependencies]
+freeport-core = { path = "../freeport-core" }
+freeport-gateway = { path = "../freeport-gateway" }
+freeport-mcp = { path = "../freeport-mcp" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

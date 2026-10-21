@@ -109,6 +109,7 @@ pub async fn exchange_at(
         scope: Some("copilot".into()),
         expires_at,
         account: None,
+        account_id: None,
     })
 }
 

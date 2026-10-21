@@ -2,11 +2,15 @@
 members = [
     "crates/freeport-core",
     "crates/freeport-catalog",
+    "crates/freeport-catalogd",
     "crates/freeport-probe",
     "crates/freeport-inject",
     "crates/freeport-auth",
     "crates/freeport-license",
+    "crates/freeport-ext",
     "crates/freeport-gateway",
+    "crates/freeport-mcp",
+    "crates/freeport-daemon",
     "src-tauri",
 ]
 resolver = "2"

@@ -1,0 +1,17 @@
+{
+  "id": "speech",
+  "name": "Speech (TTS)",
+  "version": "1.0.0",
+  "kind": "speech",
+  "entry": "self",
+  "author": "freeport",
+  "permissions": {
+    "domains": [
+      "api.openai.com",
+      "api.elevenlabs.io",
+      "api.minimax.chat"
+    ],
+    "paths": []
+  },
+  "sig": "CzWqniKuSMMI/kwcNP4PZN2UtgM040KWvJAKGOYPzGasupFNbIl02dtUZtMmDqp/a661oCtpRphB6OhRgpnpBw=="
+}

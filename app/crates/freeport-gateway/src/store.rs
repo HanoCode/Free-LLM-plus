@@ -24,6 +24,21 @@ pub fn data_file() -> PathBuf {
     data_dir().join(FILE_NAME)
 }
 
+/// 测试用的进程级环境锁：谁动 `FREEPORT_DATA_DIR` 谁先拿它。
+///
+/// 为什么必须共享一把锁（而不是每个模块自己一把）：这个变量是**进程级**的，
+/// 模块私有的锁彼此看不见。真实踩到的样子是——扩展用例正在往临时目录写
+/// builtin manifest，隔壁 secrets 用例把目录改指到别处，于是 `find("asr")`
+/// 拿不到，报成「扩展消失了」。看起来是扩展的问题，其实是两个用例在抢目录。
+///
+/// 用例跑完就删目录的也归这把锁管：删除和写入撞在一起同样会造出假故障。
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // 某个用例 panic 会把锁毒掉，但那不该连坐下一条用例——它们本来也互不相干
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn load() -> AppData {
     load_from(&data_dir())
 }

@@ -46,6 +46,7 @@ async fn main() -> Result<(), String> {
                 key_mask: "gh-oauth".into(),
                 enabled: true,
                 added_at: chrono::Utc::now().to_rfc3339(),
+                proxy: None,
                 models: Vec::new(),
                 quota: None,
                 accounts: Vec::new(),
@@ -97,6 +98,7 @@ async fn main() -> Result<(), String> {
             model_count: Some(models.len()),
             ..Default::default()
         }),
+        purposes: Vec::new(),
     };
 
     let p = &mut data.providers[idx];

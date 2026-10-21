@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Check, ExternalLink, RefreshCw, Radar, KeyRound, Radio, TriangleAlert, ShieldCheck } from 'lucide-react';
 import { T } from '../lib/i18n';
-import { Badge, Status, toast } from '../components/ui';
+import { Badge, Status, TierBadge, toast } from '../components/ui';
+import { BrandLogo } from '../components/BrandLogo';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
 import type { GwCatalogProvider, GwFeed } from '../lib/bridge';
@@ -186,6 +187,7 @@ export function Discover() {
         {anonymous.map((p) => (
           <DiscCard
             key={p.id}
+            id={p.id}
             name={p.name}
             tier={p.tier}
             meta_zh={`${p.models} 个模型 · ${p.freeModels} 个零价\n${p.freeNote ?? '匿名公开端点'}`}
@@ -213,6 +215,7 @@ export function Discover() {
         {keyed.slice(0, 9).map((p) => (
           <DiscCard
             key={p.id}
+            id={p.id}
             name={p.name}
             tier={p.tier}
             meta_zh={`${p.freeModels} 个零价模型 · 共 ${p.models} 个\n${p.freeNote ?? '官方免费档'}`}
@@ -261,7 +264,10 @@ export function Discover() {
             {watching.map((p) => (
               <tr key={p.id}>
                 <td>
-                  <div className="t-main">{p.name}</div>
+                  <div className="t-main" style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                    <BrandLogo id={p.id} name={p.name} size={14} />
+                    {p.name}
+                  </div>
                   <div className="t-sub">{p.api ?? '—'}</div>
                 </td>
                 <td className="t-sub">{p.source}</td>
@@ -320,6 +326,7 @@ export function Discover() {
 }
 
 function DiscCard({
+  id,
   name,
   tier,
   meta_zh,
@@ -327,6 +334,7 @@ function DiscCard({
   foot,
   children,
 }: {
+  id: string;
   name: string;
   tier: string;
   meta_zh: string;
@@ -337,9 +345,12 @@ function DiscCard({
   return (
     <div className="card disc">
       <div className="disc-top">
+        <span className="disc-logo">
+          <BrandLogo id={id} name={name} size={20} />
+        </span>
         <div className="disc-name">{name}</div>
         <span style={{ marginLeft: 'auto' }}>
-          <Badge tone={tier === 'A' ? 'ok' : 'accent'}>Tier {tier}</Badge>
+          <TierBadge tier={tier} tone={tier === 'A' ? 'ok' : 'accent'} />
         </span>
       </div>
       <div className="disc-meta" style={{ whiteSpace: 'pre-line' }}>
@@ -624,9 +635,15 @@ function FeedCard({ feed }: { feed: GwFeed | null }) {
             onChange={(e) => void save({ policy: e.target.value })}
             disabled={!feed}
           >
-            <option value="auto">auto · 自动应用 + canary</option>
-            <option value="notify">notify · 先问再应用</option>
-            <option value="pinned">pinned · 锁定不接收</option>
+            <option value="auto">
+              <T zh="自动 · 灰度后应用" en="auto · canary then apply" />
+            </option>
+            <option value="notify">
+              <T zh="仅提示 · 先问再应用" en="notify · ask first" />
+            </option>
+            <option value="pinned">
+              <T zh="锁定 · 不接收更新" en="pinned · no updates" />
+            </option>
           </select>
         </label>
         <label>
@@ -638,8 +655,12 @@ function FeedCard({ feed }: { feed: GwFeed | null }) {
             onChange={(e) => void save({ channel: e.target.value })}
             disabled={!feed}
           >
-            <option value="stable">stable</option>
-            <option value="beta">beta</option>
+            <option value="stable">
+              <T zh="稳定" en="stable" />
+            </option>
+            <option value="beta">
+              <T zh="测试（beta）" en="beta" />
+            </option>
           </select>
         </label>
         <label>

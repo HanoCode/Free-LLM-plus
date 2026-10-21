@@ -19,6 +19,8 @@ use freeport_core::presets::ProviderPreset;
 use freeport_gateway::Gateway;
 use tauri::{Emitter, Manager, WebviewWindow};
 
+mod prefs;
+
 pub struct AppState {
     gw: Arc<Gateway>,
 }
@@ -64,6 +66,65 @@ fn win_toggle_devtools(win: WebviewWindow) {
     } else {
         win.open_devtools();
     }
+}
+
+/* ── 启动与退出偏好 ─────────────────────────────── */
+
+/// 开机自启的真实状态问系统，不问我们自己的配置。
+///
+/// 用户可能在「系统设置 → 登录项」里手删过；我们若只信自己写的布尔，
+/// 界面就会显示「已开启」而实际不启动——这种假状态比不做这个开关更糟。
+#[tauri::command]
+fn win_autostart_get(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn win_autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let m = app.autolaunch();
+    let out = if enabled { m.enable() } else { m.disable() };
+    out.map_err(|e| e.to_string())?;
+    m.is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn win_prefs() -> prefs::DesktopPrefs {
+    prefs::load()
+}
+
+#[tauri::command]
+fn win_set_prefs(patch: prefs::PrefsPatch) -> Result<prefs::DesktopPrefs, String> {
+    prefs::apply(patch)
+}
+
+/// 退出清理：把当前处于 `injected` 的 Agent 全部回滚。
+///
+/// 只碰注入日志里记着自己写过的那些：没注入过的 Agent 一个目录都不动。
+/// 幂等——回滚过的条目会从日志里消失，重复调用不会第二次改写文件。
+fn revert_injections() -> usize {
+    let mut n = 0;
+    for a in freeport_inject::list(SUPPORTED) {
+        if a.state == "injected" && freeport_inject::revert(&a.id).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 真正的退出路径（托盘「退出」与系统级退出都走这里）。
+fn quit_app(app: &tauri::AppHandle) {
+    if prefs::load().cleanup_on_quit {
+        let n = revert_injections();
+        if n > 0 {
+            tracing::info!("退出清理：已回滚 {n} 个 Agent 注入");
+        }
+    }
+    if let Some(state) = app.try_state::<AppState>() {
+        tauri::async_runtime::block_on(state.gw.stop());
+    }
+    app.exit(0);
 }
 
 #[tauri::command]
@@ -375,6 +436,23 @@ async fn gw_logs(state: tauri::State<'_, AppState>) -> Result<Vec<LogEntry>, Str
     Ok(state.gw.logs().await)
 }
 
+/// 每日摘要。纯本地聚合，不发上游请求，概览页可随时刷新。
+#[tauri::command]
+async fn gw_digest(
+    state: tauri::State<'_, AppState>,
+) -> Result<freeport_core::digest::Digest, String> {
+    Ok(state.gw.digest().await)
+}
+
+/// 近 24h 观测：p50/p95、token、按目录价折算的美元。
+/// 与 `/v1/freeport/inspect` 的 `window` 段同一个实现，口径不会漂。
+#[tauri::command]
+async fn gw_window(
+    state: tauri::State<'_, AppState>,
+) -> Result<freeport_core::dto::GwObserved, String> {
+    Ok(state.gw.observed(24).await)
+}
+
 /// 暂停业务转发。不发日志、不动配置：这是运行时开关。
 #[tauri::command]
 async fn gw_pause(state: tauri::State<'_, AppState>, paused: bool) -> Result<GwStatus, String> {
@@ -398,8 +476,8 @@ async fn gw_routing(state: tauri::State<'_, AppState>) -> Result<GwRouting, Stri
 }
 
 #[tauri::command]
-fn gw_presets(state: tauri::State<'_, AppState>) -> Vec<ProviderPreset> {
-    state.gw.presets()
+async fn gw_presets(state: tauri::State<'_, AppState>) -> Result<Vec<ProviderPreset>, String> {
+    Ok(state.gw.presets().await)
 }
 
 #[tauri::command]
@@ -425,6 +503,16 @@ async fn gw_toggle_provider(
     enabled: bool,
 ) -> Result<Vec<GwProvider>, String> {
     state.gw.toggle_provider(&id, enabled).await
+}
+
+/// 设厂商级代理。空串 = 清掉，回落到环境变量。
+#[tauri::command]
+async fn gw_set_provider_proxy(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    proxy: Option<String>,
+) -> Result<Vec<GwProvider>, String> {
+    state.gw.set_provider_proxy(&id, proxy).await
 }
 
 #[tauri::command]
@@ -504,6 +592,33 @@ async fn gw_login_poll(
     login_id: String,
 ) -> Result<GwLoginState, String> {
     Ok(state.gw.login_poll(&login_id).await)
+}
+
+/* ── 订阅登录（授权码 + PKCE） ──────────────────────
+   浏览器跳回本机回环；端口不可用时退回「手工粘贴回调地址」。 */
+
+/// 等浏览器回调。`wait_secs` 是这一次最多阻塞多久，超时返回 `pending`，
+/// 界面可以再调一次——用户可能只是还没登录完。
+#[tauri::command]
+async fn gw_login_wait(
+    state: tauri::State<'_, AppState>,
+    login_id: String,
+    wait_secs: Option<u64>,
+) -> Result<GwLoginState, String> {
+    Ok(state
+        .gw
+        .login_wait(&login_id, wait_secs.unwrap_or(120).clamp(5, 600))
+        .await)
+}
+
+/// 用户把浏览器地址栏那一整条粘回来。整条 URL、`code#state`、裸 code 都认。
+#[tauri::command]
+async fn gw_login_complete(
+    state: tauri::State<'_, AppState>,
+    login_id: String,
+    callback: String,
+) -> Result<GwLoginState, String> {
+    Ok(state.gw.login_complete(&login_id, &callback).await)
 }
 
 #[tauri::command]
@@ -678,17 +793,27 @@ async fn gw_catalog(state: tauri::State<'_, AppState>) -> Result<GwCatalog, Stri
 }
 
 /// 路由预演。页面刷新链路不该推动真实的加权轮转。
+///
+/// `purpose` 决定按哪个账号池算：同一份配置在 chat / coding / vision 下的链
+/// 可以完全不同，所以它必须能切换——否则「路由」页只能解释三分之一的请求。
 #[tauri::command]
 async fn gw_route(
     state: tauri::State<'_, AppState>,
     model: Option<String>,
     session: Option<String>,
+    purpose: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let purpose = match purpose.as_deref() {
+        Some(s) => freeport_core::model::Purpose::parse(s)
+            .ok_or_else(|| format!("purpose 只能是 chat / coding / vision / probe，收到 {s}"))?,
+        None => freeport_core::model::Purpose::Chat,
+    };
     Ok(state
         .gw
-        .explain_route(
+        .explain_route_for(
             &model.unwrap_or_else(|| "auto".into()),
             &session.unwrap_or_default(),
+            purpose,
         )
         .await)
 }
@@ -759,6 +884,18 @@ async fn gw_set_patrol(
     patch: PatrolPatch,
 ) -> Result<GwPatrol, String> {
     Ok(state.gw.set_patrol(patch).await)
+}
+
+/// 查一条凭据的**官方**订阅额度（OAuth 账号才有）。
+///
+/// 和 `gw_quota` 不是一回事：那个读的是本机账本，这个问的是厂商。
+/// 查不到就返回 `ok=false` + 一句原因，不抛错——界面上它只是一行字。
+#[tauri::command]
+async fn gw_usage(
+    state: tauri::State<'_, AppState>,
+    account_id: String,
+) -> Result<freeport_core::dto::GwUsage, String> {
+    Ok(state.gw.usage(&account_id).await)
 }
 
 #[tauri::command]
@@ -895,6 +1032,8 @@ async fn gw_agent_apply(
             name: name.clone(),
             rpm_limit: None,
             daily_limit: None,
+            // 注入给 Agent 的 key 不额外限流：限了用户会觉得「网关偷偷卡我」
+            ..Default::default()
         })
         .await?;
 
@@ -947,6 +1086,7 @@ async fn ensure_agent_key(
             name,
             rpm_limit: None,
             daily_limit: None,
+            ..Default::default()
         })
         .await?;
     Ok((created.secret, Some(created.key.id)))
@@ -1038,20 +1178,71 @@ async fn gw_agent_project_revert(
     Ok(info)
 }
 
+/* ── 扩展宿主 ───────────────────────────────────── */
+
+#[tauri::command]
+async fn gw_ext_list(state: tauri::State<'_, AppState>) -> Result<Vec<freeport_gateway::exts::GwExt>, String> {
+    Ok(state.gw.ext_list().await)
+}
+
+#[tauri::command]
+async fn gw_ext_set_config(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    enabled: bool,
+    base_url: String,
+    model: String,
+) -> Result<Vec<freeport_gateway::exts::GwExt>, String> {
+    state.gw.ext_set_config(&id, enabled, base_url, model).await
+}
+
+#[tauri::command]
+async fn gw_ext_set_key(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    key: String,
+) -> Result<Vec<freeport_gateway::exts::GwExt>, String> {
+    state.gw.ext_set_key(&id, &key).await
+}
+
+#[tauri::command]
+async fn gw_ext_stop(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Vec<freeport_gateway::exts::GwExt>, String> {
+    Ok(state.gw.ext_stop(&id).await)
+}
+
 /* ── 入口 ───────────────────────────────────────── */
 
 pub fn run() {
     install_panic_hook();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
 
     let args: Vec<String> = std::env::args().collect();
+    // MCP 模式下 **stdout 是协议通道**：混进一行日志，客户端会在半行日志上解析失败，
+    // 表现成「服务器连不上」，而不是「日志打错地方了」。所以先把日志改道 stderr，
+    // 再决定走哪条分支。
+    let mcp = args.iter().any(|a| a == "--mcp" || a == "mcp");
+    let fmt = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    if mcp {
+        fmt.with_writer(std::io::stderr).init();
+        run_mcp();
+        return;
+    }
+    fmt.init();
+
     if args.iter().any(|a| a == "--headless" || a == "serve") {
         run_headless();
+        return;
+    }
+    // sidecar 模式：扩展宿主拉起的独立进程，只服务自己的那一个能力。
+    // 必须在任何窗口/网关初始化之前分流——sidecar 不该再有第二个网关。
+    if let Some(pos) = args.iter().position(|a| a == "--freeport-sidecar") {
+        let id = args.get(pos + 1).cloned().unwrap_or_default();
+        freeport_ext::runtime::main_entry(&id);
         return;
     }
 
@@ -1060,6 +1251,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // LaunchAgent：macOS 上不注册守护进程，就是一份 ~/Library/LaunchAgents plist
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(AppState { gw: gw.clone() })
         .setup(move |app| {
             // 网关与窗口同进程：先起网关，窗口才能读到真实状态
@@ -1080,9 +1276,13 @@ pub fn run() {
 
             build_tray(app.handle())?;
 
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.set_focus();
+            // 「启动时最小化」= 启动后只驻留托盘。窗口在 tauri.conf 里本来就是
+            // visible:false，这里不 show 就是最小化启动，不会有闪一下的观感。
+            if !prefs::load().start_minimized {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
             }
             Ok(())
         })
@@ -1099,6 +1299,10 @@ pub fn run() {
             win_toggle_maximize,
             win_close,
             win_toggle_devtools,
+            win_autostart_get,
+            win_autostart_set,
+            win_prefs,
+            win_set_prefs,
             open_external,
             gw_status,
             gw_pause,
@@ -1106,6 +1310,8 @@ pub fn run() {
             gw_save_diagnostics,
             check_update,
             gw_logs,
+            gw_digest,
+            gw_window,
             gw_providers,
             gw_models,
             gw_routing,
@@ -1113,6 +1319,7 @@ pub fn run() {
             gw_add_provider,
             gw_remove_provider,
             gw_toggle_provider,
+            gw_set_provider_proxy,
             gw_probe,
             gw_probe_account,
             gw_reveal_key,
@@ -1128,6 +1335,8 @@ pub fn run() {
             gw_clear_license,
             gw_login_start,
             gw_login_poll,
+            gw_login_wait,
+            gw_login_complete,
             gw_add_cookie_account,
             gw_set_account_cookie,
             gw_set_routing,
@@ -1146,6 +1355,7 @@ pub fn run() {
             gw_patrol_pass,
             gw_set_patrol,
             gw_quota,
+            gw_usage,
             gw_keys,
             gw_create_key,
             gw_delete_key,
@@ -1154,13 +1364,30 @@ pub fn run() {
             gw_agent_preview,
             gw_agent_apply,
             gw_agent_revert,
+            gw_ext_list,
+            gw_ext_set_config,
+            gw_ext_set_key,
+            gw_ext_stop,
             gw_agent_project_list,
             gw_agent_project_preview,
             gw_agent_project_apply,
             gw_agent_project_revert,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Freeport");
+        .build(tauri::generate_context!())
+        .expect("error while building Freeport")
+        .run(|_app, event| {
+            // 托盘之外的退出路径（Cmd+Q、系统注销/关机、崩溃前的正常退出）
+            // 也必须能清理注入，否则「退出时清理」只在一种退法下成立。
+            // revert_injections 幂等，重复进入不会二次改写文件。
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if prefs::load().cleanup_on_quit {
+                    let n = revert_injections();
+                    if n > 0 {
+                        tracing::info!("退出清理：已回滚 {n} 个 Agent 注入");
+                    }
+                }
+            }
+        });
 }
 
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
@@ -1182,12 +1409,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     let _ = win.set_focus();
                 }
             }
-            "quit" => {
-                if let Some(state) = app.try_state::<AppState>() {
-                    tauri::async_runtime::block_on(state.gw.stop());
-                }
-                app.exit(0);
-            }
+            "quit" => quit_app(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -1214,6 +1436,29 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     }
     builder.build(app)?;
     Ok(())
+}
+
+/// MCP server 形态：给 Claude Desktop / Codex 这类客户端当「自省通道」。
+///
+/// 刻意**不起网关**：MCP 只回答问题，不转发流量。起网关会多占一个端口、
+/// 多开一份巡检，而且客户端本来就已经连着用户的网关（或者没有，那不关 MCP 的事）。
+fn run_mcp() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        let gw = Gateway::new();
+        // `load` 只在「首次启动补 install_id」「tmp 兜底恢复」这两种情况下写盘，
+        // 所以常态下 MCP 对配置文件是纯读的——和正开着的窗口不会抢写。
+        gw.load().await;
+        if let Err(e) = freeport_mcp::serve(&gw).await {
+            // stderr：stdout 只能是 JSON-RPC
+            eprintln!("freeport mcp: {e}");
+            std::process::exit(1);
+        }
+    });
 }
 
 fn run_headless() {

@@ -45,8 +45,14 @@ async fn main() -> Result<(), String> {
     let start = gw.login_start("copilot").await?;
     println!();
     println!("  ┌──────────────────────────────────────────────");
-    println!("  │  浏览器打开：{}", start.verification_uri);
-    println!("  │  输入代码：  {}", start.user_code);
+    println!(
+        "  │  浏览器打开：{}",
+        start.verification_uri.clone().unwrap_or_default()
+    );
+    println!(
+        "  │  输入代码：  {}",
+        start.user_code.clone().unwrap_or_default()
+    );
     println!("  │  有效期：    {} 秒", start.expires_in);
     println!("  └──────────────────────────────────────────────");
     if let Some(u) = &start.verification_uri_complete {
@@ -56,7 +62,7 @@ async fn main() -> Result<(), String> {
     println!();
 
     let deadline = Instant::now() + Duration::from_secs(start.expires_in.max(60));
-    let mut interval = start.interval.max(5);
+    let mut interval = start.interval.unwrap_or(5).max(5);
 
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;

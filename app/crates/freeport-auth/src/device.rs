@@ -215,6 +215,7 @@ fn step_from(value: Value, now: i64) -> DeviceStep {
             scope: parsed.scope,
             expires_at: parsed.expires_in.map(|secs| now + secs),
             account: None,
+            account_id: None,
         }),
         _ => DeviceStep::Pending,
     }

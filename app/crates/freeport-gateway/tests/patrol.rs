@@ -161,7 +161,9 @@ async fn patrol_probes_and_drives_the_health_state_machine() {
                     added_at: String::new(),
                     quota: None,
                     health: None,
+                    purposes: Vec::new(),
                 }],
+                proxy: None,
                 models: vec![freeport_core::model::ModelInfo {
                     id: "m1".into(),
                     owned_by: "bad".into(),

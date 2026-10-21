@@ -1,0 +1,17 @@
+{
+  "id": "image",
+  "name": "Image",
+  "version": "1.0.0",
+  "kind": "image",
+  "entry": "self",
+  "author": "freeport",
+  "permissions": {
+    "domains": [
+      "api.openai.com",
+      "openrouter.ai",
+      "api.pollinations.ai"
+    ],
+    "paths": []
+  },
+  "sig": "pTowsCDkr5ewy8FSJphqEBbl3XCUwd9xgyHD967LnEKy0i5qn59yzxyTcmeHpcSji1ndOJCRVcwapiM7808WBA=="
+}

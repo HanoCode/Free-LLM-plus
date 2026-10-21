@@ -15,6 +15,7 @@ const titles: Record<PageId, [string, string]> = {
   extensions: ['扩展', 'Extensions'],
   logs: ['日志', 'Logs'],
   settings: ['设置', 'Settings'],
+  playground: ['试验场', 'Playground'],
 };
 
 export function Topbar() {

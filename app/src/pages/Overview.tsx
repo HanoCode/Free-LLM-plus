@@ -5,6 +5,13 @@ import { useGateway } from '../lib/gateway';
 import { Badge, CopyBtn, Status, fmt, toast } from '../components/ui';
 import { QuotaPanel } from '../components/QuotaPanel';
 
+const POOL_LABEL: Record<string, { zh: string; en: string }> = {
+  chat: { zh: '对话', en: 'chat' },
+  coding: { zh: '编码', en: 'coding' },
+  vision: { zh: '视觉', en: 'vision' },
+  probe: { zh: '巡检', en: 'probe' },
+};
+
 function hhmm(iso?: string | null): string {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -24,9 +31,16 @@ function ago(iso?: string | null): string {
   return `${Math.round(h / 24)} 天前`;
 }
 
+/** 美元金额：小额保留四位，否则两位——0.0006 显示成 0.00 等于说谎 */
+function money(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '0';
+  return usd < 0.01 ? usd.toFixed(4) : usd.toFixed(2);
+}
+
 export function Overview() {
   const { setPage } = useApp();
-  const { status, providers, models, logs, patrol, quota, runPatrol } = useGateway();
+  const { status, providers, models, logs, patrol, quota, digest, observed, runPatrol } =
+    useGateway();
 
   const connected = providers.filter((p) => p.hasKey);
   // 凭据是真正的记账单位：同一家两把 key 算两条通道
@@ -110,6 +124,186 @@ export function Overview() {
           </div>
         </div>
       </div>
+
+      {digest && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div className="card-head">
+            <h3>
+              <T zh="今日摘要" en="Today" />
+            </h3>
+            <span className="sub">{digest.headline}</span>
+            <button
+              className="btn ghost sm"
+              style={{ marginLeft: 'auto' }}
+              onClick={() => setPage('settings')}
+            >
+              <T zh="巡检设置" en="Patrol settings" />
+              <ArrowRight size={12} />
+            </button>
+          </div>
+          <div className="src-row">
+            <span className="nm">
+              <T zh="变更" en="Changes" />
+            </span>
+            <span className="meta">
+              {digest.changes.length === 0 ? (
+                <T zh="24 小时内没有目录变更" en="No catalog changes in 24h" />
+              ) : (
+                digest.changes.map((c, i) => (
+                  <span key={`${c.kind}-${i}`} style={{ marginRight: 10 }}>
+                    <Badge tone={c.kind === 'removed' ? 'warn' : c.kind === 'added' ? 'ok' : 'bad'}>
+                      {c.title}
+                    </Badge>{' '}
+                    {c.detail}
+                  </span>
+                ))
+              )}
+            </span>
+            <span className="right">
+              <Badge tone={(patrol?.remaining ?? 0) > 0 ? 'ok' : 'warn'}>
+                {digest.probeUsed} / {digest.probeBudget}
+              </Badge>
+            </span>
+          </div>
+          <div className="src-row">
+            <span className="nm">
+              <T zh="健康" en="Health" />
+            </span>
+            <span className="meta">
+              <T
+                zh={`可用 ${digest.health.healthy} · 降级 ${digest.health.degraded} · 冷却 ${digest.health.cooling} · 不可用 ${digest.health.unavailable} · 退役 ${digest.health.retired}`}
+                en={`${digest.health.healthy} ready · ${digest.health.degraded} degraded · ${digest.health.cooling} cooling · ${digest.health.unavailable} down · ${digest.health.retired} retired`}
+              />
+            </span>
+            <span className="right">
+              <span className="ev-time">{hhmm(digest.at)}</span>
+            </span>
+          </div>
+          {digest.pools.length > 0 && (
+            <div className="src-row">
+              <span className="nm">
+                <T zh="用途池" en="Pools" />
+              </span>
+              <span className="meta">
+                <span className="faint" style={{ marginRight: 10 }}>
+                  <T
+                    zh={`最近 ${digest.logScanned} 条请求：`}
+                    en={`last ${digest.logScanned} requests: `}
+                  />
+                </span>
+                {digest.pools.map((p) => {
+                  const ok = p.requests - p.errors;
+                  // 有失败才染色：全绿挂一排绿标反而看不出哪个池在挂
+                  const tone = p.errors === 0 ? 'ok' : ok * 2 >= p.requests ? 'warn' : 'bad';
+                  const label = POOL_LABEL[p.purpose] ?? { zh: p.purpose, en: p.purpose };
+                  return (
+                    <span key={p.purpose} style={{ marginRight: 8 }}>
+                      <Badge tone={tone}>
+                        <T zh={label.zh} en={label.en} /> {ok}/{p.requests}
+                      </Badge>
+                    </span>
+                  );
+                })}
+              </span>
+              <span className="right" />
+            </div>
+          )}
+          {digest.attention.length > 0 && (
+            <div className="src-row">
+              <span className="nm">
+                <T zh="需要处理" en="Needs attention" />
+              </span>
+              <span className="meta">
+                {digest.attention.map((a) => (
+                  <span key={a} style={{ marginRight: 12 }}>
+                    <Status tone="warn">{a}</Status>
+                  </span>
+                ))}
+              </span>
+              <span className="right" />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 近期观测：样本是内存日志环，与上面的累计计数不是一个口径，
+          所以这块自己带「最近 N 单」的说法，不冒充全生命周期总量 */}
+      {observed && observed.requests > 0 && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div className="card-head">
+            <h3>
+              <T zh="近 24 小时" en="Last 24h" />
+            </h3>
+            <span className="sub">
+              <T
+                zh={`${observed.requests} 单 · 失败 ${observed.errors}`}
+                en={`${observed.requests} requests · ${observed.errors} failed`}
+              />
+            </span>
+          </div>
+          <div className="src-row">
+            <span className="nm">
+              <T zh="延迟" en="Latency" />
+            </span>
+            <span className="meta">
+              {/* 只统计成功的请求：一条 90s 超时会把均值带偏，分位数就是为了不被带偏 */}
+              <T
+                zh={`p50 ${observed.p50Ms === null ? '—' : fmt.ms(observed.p50Ms)} · p95 ${observed.p95Ms === null ? '—' : fmt.ms(observed.p95Ms)} · 最慢 ${observed.maxMs === null ? '—' : fmt.ms(observed.maxMs)}`}
+                en={`p50 ${observed.p50Ms === null ? '—' : fmt.ms(observed.p50Ms)} · p95 ${observed.p95Ms === null ? '—' : fmt.ms(observed.p95Ms)} · worst ${observed.maxMs === null ? '—' : fmt.ms(observed.maxMs)}`}
+              />
+            </span>
+            <span className="right">
+              <span className="faint">
+                <T zh="失败请求不计入" en="failures excluded" />
+              </span>
+            </span>
+          </div>
+          <div className="src-row">
+            <span className="nm">
+              <T zh="折算花费" en="List-price value" />
+            </span>
+            <span className="meta">
+              <T
+                zh={`约 $${money(observed.costUsd)} —— 按目录价折算，不是账单（免费额度实付 0）`}
+                en={`≈ $${money(observed.costUsd)} at list price, not a bill (free tiers cost nothing)`}
+              />
+              {observed.costUnknown > 0 && (
+                <span className="faint" style={{ marginLeft: 8 }}>
+                  <T
+                    zh={`· ${observed.costUnknown} 单目录里没有价格，未计入`}
+                    en={`· ${observed.costUnknown} requests have no price and are excluded`}
+                  />
+                </span>
+              )}
+            </span>
+            <span className="right">
+              <span className="ev-time">
+                {(observed.tokensIn + observed.tokensOut).toLocaleString()} tok
+              </span>
+            </span>
+          </div>
+          {observed.byPurpose.length > 1 && (
+            <div className="src-row">
+              <span className="nm">
+                <T zh="按用途" en="By purpose" />
+              </span>
+              <span className="meta">
+                {observed.byPurpose.map((b) => {
+                  const label = POOL_LABEL[b.key] ?? { zh: b.key, en: b.key };
+                  return (
+                    <span key={b.key} style={{ marginRight: 8 }}>
+                      <Badge tone="info">
+                        <T zh={label.zh} en={label.en} /> {b.requests}
+                      </Badge>
+                    </span>
+                  );
+                })}
+              </span>
+              <span className="right" />
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="metrics">
         <div className="card metric">

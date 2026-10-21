@@ -32,6 +32,35 @@ interface Row {
     ms: number;
   }[];
   stream: boolean;
+  /** 进了哪个账号池；池过滤是静默的，不标出来就只剩猜 */
+  purpose: string;
+  /** 这个池是怎么判出来的：header / image / agent-key / default */
+  purposeSource: string;
+}
+
+/** 池的展示名。chat 是默认值，行里不额外标（标了每行都有一枚，反而不显眼）。 */
+const POOL: Record<string, { zh: string; en: string; tone: string }> = {
+  chat: { zh: '对话', en: 'chat', tone: 'gray' },
+  coding: { zh: '编码', en: 'coding', tone: 'info' },
+  vision: { zh: '视觉', en: 'vision', tone: 'accent' },
+  probe: { zh: '巡检', en: 'probe', tone: 'warn' },
+};
+
+/** 依据的文案。header 与 agent-key 的区别很关键：一个是用户写的，一个是我们发的。 */
+const SOURCE: Record<string, { zh: string; en: string }> = {
+  header: { zh: '请求头指定', en: 'header' },
+  image: { zh: '请求含图', en: 'has image' },
+  'agent-key': { zh: 'Agent 注入 key', en: 'agent key' },
+  default: { zh: '默认', en: 'default' },
+};
+
+function PoolBadge({ p }: { p: string }) {
+  const m = POOL[p] ?? { zh: p, en: p, tone: 'gray' };
+  return (
+    <span className={`badge ${m.tone}`}>
+      <T zh={m.zh} en={m.en} />
+    </span>
+  );
 }
 
 function toRow(l: GwLog): Row {
@@ -48,6 +77,8 @@ function toRow(l: GwLog): Row {
     path: l.path || '/v1/chat/completions',
     key: l.keyName || '—',
     account: l.accountName || '—',
+    purpose: l.purpose || 'chat',
+    purposeSource: l.purposeSource || '',
     hops: l.attempts.map((a, i) => ({
       n: i,
       provider: a.provider,
@@ -70,7 +101,11 @@ export function Logs() {
   // 只有真日志。拿不到网关就是空表——日志是网关唯一的证据链，
   // 用示例行填满等于把证据也一起伪造了。
   const list: Row[] = gwLogs.map(toRow).filter((l) =>
-    q.trim() ? (l.model + l.provider).toLowerCase().includes(q.toLowerCase()) : true,
+    q.trim()
+      ? (l.model + l.provider + l.purpose)
+          .toLowerCase()
+          .includes(q.toLowerCase())
+      : true,
   );
 
   return (
@@ -211,9 +246,12 @@ export function Logs() {
                     <td className="num">{l.time}</td>
                     <td>
                       <div className="t-main">{l.model}</div>
-                      {l.hops.length > 1 && (
-                        <div className="t-sub">
-                          <T zh={`${l.hops.length} 跳接力`} en={`${l.hops.length} hops`} />
+                      {(l.hops.length > 1 || l.purpose !== 'chat') && (
+                        <div className="t-sub" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                          {l.purpose !== 'chat' && <PoolBadge p={l.purpose} />}
+                          {l.hops.length > 1 && (
+                            <T zh={`${l.hops.length} 跳接力`} en={`${l.hops.length} hops`} />
+                          )}
                         </div>
                       )}
                     </td>
@@ -257,6 +295,19 @@ export function Logs() {
                                 en={`total ${l.ms}ms · ${l.stream ? 'stream' : 'buffered'} · budget 45s`}
                               />
                             </span>
+                            <span
+                              className="faint"
+                              style={{ display: 'flex', gap: 6, alignItems: 'center' }}
+                              title="这条请求进了哪个账号池，以及是谁把它判进这个池的"
+                            >
+                              <PoolBadge p={l.purpose} />
+                              {SOURCE[l.purposeSource] && (
+                                <T
+                                  zh={`依据：${SOURCE[l.purposeSource].zh}`}
+                                  en={`via ${SOURCE[l.purposeSource].en}`}
+                                />
+                              )}
+                            </span>
                             <span className="num" style={{ marginLeft: 'auto', display: 'flex', gap: 10, alignItems: 'center' }}>
                               <span className="mono faint" title="协议入口">
                                 {l.path || '/v1/chat/completions'}
@@ -284,6 +335,13 @@ export function Logs() {
         <T
           zh="响应头 X-Freeport-Trail 带每跳的模型、错误分类、耗时与总预算，出问题直接贴给上游就能对齐。"
           en="The X-Freeport-Trail response header carries per-hop model, error class, latency and remaining budget."
+        />
+      </div>
+
+      <div className="hint-line">
+        <T
+          zh="「对话」是默认池，行内不标；出现「编码 / 视觉 / 巡检」说明这次请求被按账号用途过滤过。点开看依据：header 是你自己写的，image 是请求形态，agent-key 是注入时发的那把 key。"
+          en="Chat is the default pool and stays unlabelled. Coding / vision / probe mean the request was filtered by account purpose — expand a row to see why: header (you asked), image (request shape) or agent-key (the key we injected)."
         />
       </div>
     </>

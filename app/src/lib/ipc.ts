@@ -11,8 +11,11 @@ import { listen } from '@tauri-apps/api/event';
 import type {
   AgentDiffLine,
   AgentInfo,
+  DesktopPrefs,
   FreeportBridge,
   GwCatalog,
+  GwDigest,
+  GwExt,
   GwFeed,
   GwKey,
   GwLoginStart,
@@ -21,12 +24,14 @@ import type {
   GwLicense,
   GwModel,
   GwModelProbe,
+  GwObserved,
   GwPatrol,
   GwProvider,
   GwQuota,
   GwRoute,
   GwRouting,
   GwStatus,
+  GwUsage,
   ImportSummary,
   KeyCreated,
   PatrolReport,
@@ -61,6 +66,10 @@ export function installTauriBridge(): boolean {
       checkUpdate: () => invoke<UpdateCheck>('check_update'),
       diagnostics: () => invoke<Record<string, unknown>>('gw_diagnostics'),
       saveDiagnostics: () => invoke<string | null>('gw_save_diagnostics'),
+      prefs: () => invoke<DesktopPrefs>('win_prefs'),
+      setPrefs: (patch) => invoke<DesktopPrefs>('win_set_prefs', { patch }),
+      autostart: () => invoke<boolean>('win_autostart_get'),
+      setAutostart: (enabled) => invoke<boolean>('win_autostart_set', { enabled }),
     },
 
     win: {
@@ -74,17 +83,25 @@ export function installTauriBridge(): boolean {
       status: () => invoke<GwStatus>('gw_status'),
       pause: (paused) => invoke<GwStatus>('gw_pause', { paused }),
       logs: () => invoke<GwLog[]>('gw_logs'),
+      digest: () => invoke<GwDigest>('gw_digest'),
+      observed: () => invoke<GwObserved>('gw_window'),
       providers: () => invoke<GwProvider[]>('gw_providers'),
       models: () => invoke<GwModel[]>('gw_models'),
       routing: () => invoke<GwRouting | null>('gw_routing'),
-      route: (model, session) =>
-        invoke<GwRoute>('gw_route', { model: model ?? 'auto', session: session ?? '' }),
+      route: (model, session, purpose) =>
+        invoke<GwRoute>('gw_route', {
+          model: model ?? 'auto',
+          session: session ?? '',
+          purpose: purpose ?? 'chat',
+        }),
       presets: () => invoke<ProviderPreset[]>('gw_presets'),
 
       addProvider: (payload) =>
         invoke<{ provider: GwProvider; modelCount: number }>('gw_add_provider', { input: payload }),
       removeProvider: (id) => invoke<GwProvider[]>('gw_remove_provider', { id }),
       toggleProvider: (id, enabled) => invoke<GwProvider[]>('gw_toggle_provider', { id, enabled }),
+      setProviderProxy: (id, proxy) =>
+        invoke<GwProvider[]>('gw_set_provider_proxy', { id, proxy }),
       probe: (id) =>
         invoke<{ ok: boolean; models?: number; latencyMs?: number; error?: string }>('gw_probe', { id }),
       revealKey: (id) => invoke<string>('gw_reveal_key', { id }),
@@ -92,6 +109,10 @@ export function installTauriBridge(): boolean {
       addAccount: (input) => invoke<GwProvider[]>('gw_add_account', { input }),
       loginStart: (providerId) => invoke<GwLoginStart>('gw_login_start', { providerId }),
       loginPoll: (loginId) => invoke<GwLoginState>('gw_login_poll', { loginId }),
+      loginWait: (loginId, waitSecs) =>
+        invoke<GwLoginState>('gw_login_wait', { loginId, waitSecs }),
+      loginComplete: (loginId, callback) =>
+        invoke<GwLoginState>('gw_login_complete', { loginId, callback }),
       addCookieAccount: (providerId, name, cookie) =>
         invoke<GwProvider[]>('gw_add_cookie_account', { providerId, name, cookie }),
       setAccountCookie: (providerId, accountId, cookie) =>
@@ -137,6 +158,7 @@ export function installTauriBridge(): boolean {
       feedApply: () => invoke<GwFeed>('gw_feed_apply'),
 
       quota: () => invoke<GwQuota[]>('gw_quota'),
+      usage: (accountId) => invoke<GwUsage>('gw_usage', { accountId }),
       keys: () => invoke<GwKey[]>('gw_keys'),
       createKey: (input) => invoke<KeyCreated>('gw_create_key', { input }),
       deleteKey: (id) => invoke<GwKey[]>('gw_delete_key', { id }),
@@ -152,6 +174,12 @@ export function installTauriBridge(): boolean {
         invoke<AgentDiffLine[]>('gw_agent_project_preview', { id, root }),
       agentProjectApply: (id, root) => invoke<AgentInfo>('gw_agent_project_apply', { id, root }),
       agentProjectRevert: (id, root) => invoke<AgentInfo>('gw_agent_project_revert', { id, root }),
+
+      extList: () => invoke<GwExt[]>('gw_ext_list'),
+      extSetConfig: (id, enabled, baseUrl, model) =>
+        invoke<GwExt[]>('gw_ext_set_config', { id, enabled, baseUrl, model }),
+      extSetKey: (id, key) => invoke<GwExt[]>('gw_ext_set_key', { id, key }),
+      extStop: (id) => invoke<GwExt[]>('gw_ext_stop', { id }),
 
       onLog: (cb) => {
         let dispose: (() => void) | null = null;

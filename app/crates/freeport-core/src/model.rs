@@ -49,6 +49,25 @@ pub struct AppData {
     /// 否则「删掉又被加回来」会无限循环。
     #[serde(default)]
     pub tombstones: Tombstones,
+    /// 扩展配置（ASR / 图片生成）。只存开关与上游地址；凭据进密钥库，
+    /// 槽位 `ext:<id>`，这里只留掩码。
+    #[serde(default, rename = "extensions")]
+    pub extensions: BTreeMap<String, ExtState>,
+}
+
+/// 单个扩展的用户配置。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtState {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 上游 OpenAI 兼容端点（含版本前缀，如 https://api.groq.com/openai/v1）
+    #[serde(default, rename = "baseUrl")]
+    pub base_url: String,
+    /// 默认模型（转写模型 / 画图模型）。请求体里带了 model 时以请求为准。
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, rename = "keyMask")]
+    pub key_mask: String,
 }
 
 /// 删除记录。存时间是为了合并时能判断「谁删得更晚」——
@@ -123,6 +142,26 @@ pub struct ApiKey {
     /// 每日请求上限，None = 不限
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "dailyLimit")]
     pub daily_req_limit: Option<u32>,
+    /// 每日 token 上限（输入 + 输出）。None = 不限。
+    ///
+    /// 与请求数上限互补：一个 agent 反复读大文件时，请求数很少但 token 天文数字，
+    /// 只按次数限流等于没限。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "dailyTokenLimit"
+    )]
+    pub daily_token_limit: Option<u64>,
+    /// 模型白名单。空 = 不限；支持 `provider:model` 与 `前缀*`。
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "allowedModels"
+    )]
+    pub allowed_models: Vec<String>,
+    /// 过期时刻（RFC3339）。到点后直接拒，不用等计数器。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "expiresAt")]
+    pub expires_at: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(rename = "createdAt")]
@@ -141,6 +180,9 @@ pub struct KeyUsage {
     pub day: String,
     #[serde(default, rename = "dayCount")]
     pub day_count: u32,
+    /// 今日 token 用量（输入 + 输出），跨天惰性归零
+    #[serde(default, rename = "dayTokens")]
+    pub day_tokens: u64,
     /// unix 分钟
     #[serde(default)]
     pub minute: i64,
@@ -175,6 +217,7 @@ impl Default for AppData {
             install_id: String::new(),
             license: LicenseCfg::default(),
             tombstones: Tombstones::default(),
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -239,6 +282,106 @@ pub struct GatewayConfig {
     /// Hold 的总预算上限，兜底防止某些上游持续发空增量。
     #[serde(default = "default_budget", rename = "holdTotalMs")]
     pub hold_total_ms: u64,
+    /// 工具输出压缩。默认关——它会丢信息，不能让用户不知情地开着。
+    #[serde(default)]
+    pub compress: CompressConfig,
+    /// 按调用方标识（`x-freeport-identifier`）的每分钟请求上限。0 = 关闭。
+    ///
+    /// 与虚拟 key 的区别：key 是「谁在调用」，identifier 是「同一条 key 下的哪个终端用户」。
+    /// 把一个 key 嵌进前端页面时必须靠它，否则一个用户打满就把所有人都挡了。
+    #[serde(default, rename = "identifierLimit")]
+    pub identifier_limit: u32,
+    /// 精确匹配响应缓存。默认关：开了之后「再问一次」可能拿到旧答案。
+    #[serde(default)]
+    pub cache: CacheConfig,
+    /// 每条凭据同时在途的请求上限。0 = 不限（默认）。
+    ///
+    /// 免费额度是按条限流的，同一秒发十个请求只会换来九个 429 和一段
+    /// 被浪费的等待；限成一个队列反而更快拿全。默认关是因为单机场景下
+    /// 让人「排一下队」比自己决定打几个更容易被理解成卡住。
+    #[serde(default, rename = "maxInflightPerAccount")]
+    pub max_inflight_per_account: u32,
+}
+
+/// 响应缓存配置。见 `freeport-gateway/src/cache.rs` 的四条约束。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 生存期（秒）。默认 10 分钟：够覆盖 agent 的重试窗口，又不至于陈旧。
+    #[serde(default = "default_cache_ttl", rename = "ttlSecs")]
+    pub ttl_secs: u64,
+    /// 最多存多少条。满了先清过期项，仍然满就整体清空。
+    #[serde(default = "default_cache_max", rename = "maxEntries")]
+    pub max_entries: usize,
+}
+
+fn default_cache_ttl() -> u64 {
+    600
+}
+fn default_cache_max() -> usize {
+    512
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: default_cache_ttl(),
+            max_entries: default_cache_max(),
+        }
+    }
+}
+
+/// 工具输出压缩（§「prompt / 工具输出压缩」）。
+///
+/// 只动 `role: tool` / `tool_result` 这类**机器产出**的正文，不动用户说的话、
+/// 也不动模型的回答：前者丢了没法恢复，后者丢了呢模型自己都不知道它在丢。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 超过这个字符数才压。
+    #[serde(default = "default_tool_max", rename = "maxToolChars")]
+    pub max_tool_chars: usize,
+    /// 保留开头多少字符。
+    #[serde(default = "default_keep_head", rename = "keepHead")]
+    pub keep_head: usize,
+    /// 保留结尾多少字符（报错栈、退出码通常在尾巴上）。
+    #[serde(default = "default_keep_tail", rename = "keepTail")]
+    pub keep_tail: usize,
+    /// 按内容识别再压（git diff / grep / 目录树 / 重复日志）。
+    ///
+    /// 只影响「压得更聪明」，不影响「压不压」：`enabled = false` 时一律不动。
+    /// 认不出来就退回保留头尾的通用截断，不会因为没认出而把内容弄丢。
+    #[serde(default = "yes_default", rename = "smartFilters")]
+    pub smart_filters: bool,
+}
+
+fn yes_default() -> bool {
+    true
+}
+
+fn default_tool_max() -> usize {
+    8_000
+}
+fn default_keep_head() -> usize {
+    2_400
+}
+fn default_keep_tail() -> usize {
+    1_200
+}
+
+impl Default for CompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_tool_chars: default_tool_max(),
+            keep_head: default_keep_head(),
+            keep_tail: default_keep_tail(),
+            smart_filters: true,
+        }
+    }
 }
 
 fn default_port() -> u16 {
@@ -264,6 +407,10 @@ impl Default for GatewayConfig {
             request_budget_ms: default_budget(),
             hold_idle_ms: default_hold_idle(),
             hold_total_ms: default_budget(),
+            compress: CompressConfig::default(),
+            identifier_limit: 0,
+            cache: CacheConfig::default(),
+            max_inflight_per_account: 0,
         }
     }
 }
@@ -296,8 +443,133 @@ pub struct Provider {
     /// 这个厂商下的凭据。同一厂商可以有多个 key，各自算额度、各自冷却。
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// 厂商级代理（`http://127.0.0.1:7890` 这类）。空 = 跟随环境变量。
+    /// 优先级：账号级（未实现）> 厂商级 > 环境变量；本机回环永远直连。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     #[serde(default)]
     pub health: Health,
+}
+
+/// 账号池的用途维度。
+///
+/// 分池的目的只有一个：**别让某一类流量烧掉不该烧的额度**。典型的三种诉求是
+/// 「留给 Claude Code 的那把 key 不许被随手 curl 用掉」「带图的请求只走测过视觉
+/// 的那家」「巡检别碰我的主力号」。
+///
+/// 语义刻意做成「标签 = 准入限制」而不是「标签 = 分配」：
+/// 账号的 `purposes` **为空表示不限**，什么活都接。反过来（空 = 什么都不能干）
+/// 会让所有存量用户升级后一条路都没有——那是最坏的兼容性事故。
+///
+/// 因此它是**收窄**而不是**切分**：一块额度没有因为打标签而变小，
+/// 只是少了几类请求来抢它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Purpose {
+    /// 普通对话。未标注用途的请求默认落这里。
+    Chat,
+    /// 来自已注入 Agent 的流量（每个 Agent 一把 `agent:<id>` key，天然可识别）。
+    Coding,
+    /// 带图片的请求。判定优先于 coding：图片请求要的是视觉能力，不是身份。
+    Vision,
+    /// 巡检探针。单独成池，是为了让「探针别烧主力号」可配置。
+    Probe,
+}
+
+impl Default for Purpose {
+    fn default() -> Self {
+        Self::Chat
+    }
+}
+
+impl Purpose {
+    pub const ALL: [Purpose; 4] = [
+        Purpose::Chat,
+        Purpose::Coding,
+        Purpose::Vision,
+        Purpose::Probe,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Purpose::Chat => "chat",
+            Purpose::Coding => "coding",
+            Purpose::Vision => "vision",
+            Purpose::Probe => "probe",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "chat" => Some(Purpose::Chat),
+            "coding" | "code" => Some(Purpose::Coding),
+            "vision" | "image" => Some(Purpose::Vision),
+            "probe" | "patrol" => Some(Purpose::Probe),
+            _ => None,
+        }
+    }
+
+    /// 请求侧判定。三条规则的顺序是有理由的：
+    ///
+    /// 1. **显式头最优先**：调用方说「这次是 vision」就照办，不猜；
+    /// 2. **含图 ⇒ vision**：这是请求的客观属性，比「谁发的」更贴近它需要什么；
+    /// 3. **已注入 Agent ⇒ coding**：身份来自我们自己写进去的 key，不需要用户配置
+    ///    任何东西就能区分「IDE 里的 Agent」和「随手 curl」。
+    ///
+    /// 剩下的一律 chat —— 因为绝大多数未标注的请求确实是普通对话。
+    pub fn infer(declared: Option<Purpose>, has_image: bool, from_agent: bool) -> Self {
+        Self::infer_with_source(declared, has_image, from_agent).0
+    }
+
+    /// 同 [`Purpose::infer`]，另外告诉调用方「是哪条规则命中的」。
+    ///
+    /// 分开返回而不是让调用方自己再判一遍顺序：两处实现迟早会漂，
+    /// 然后日志上写的依据就和实际过滤用的池不一致了——那比不记还坏。
+    pub fn infer_with_source(
+        declared: Option<Purpose>,
+        has_image: bool,
+        from_agent: bool,
+    ) -> (Self, PurposeSource) {
+        if let Some(p) = declared {
+            return (p, PurposeSource::Header);
+        }
+        if has_image {
+            return (Self::Vision, PurposeSource::Image);
+        }
+        if from_agent {
+            return (Self::Coding, PurposeSource::AgentKey);
+        }
+        (Self::Chat, PurposeSource::Default)
+    }
+}
+
+/// 用途判定的依据，随日志一起存。
+///
+/// 为什么要记这个：池过滤是**静默的**——一条请求被挡在 coding 池外时，
+/// 用户看到的只是「为什么没走那把更快的 key」。没有依据就只能猜是
+/// header 写错了、还是图片被识别成 vision 了、还是 agent key 生效了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PurposeSource {
+    /// 调用方用 `x-freeport-purpose` 显式指定
+    Header,
+    /// 请求体里带图
+    Image,
+    /// 用的是注入时发的 `agent:<id>` key
+    AgentKey,
+    /// 都没命中，按普通对话处理
+    Default,
+}
+
+impl PurposeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PurposeSource::Header => "header",
+            PurposeSource::Image => "image",
+            PurposeSource::AgentKey => "agent-key",
+            PurposeSource::Default => "default",
+        }
+    }
 }
 
 /// 一条凭据（一个 API Key）。
@@ -328,6 +600,12 @@ pub struct Account {
     /// 而且「校验第二把 key」这个动作会看起来像是把厂商搞挂了。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<Health>,
+    /// 这条凭据只接哪些用途的活。**空 = 不限用途**（见 [`Purpose`]）。
+    ///
+    /// 不下发空数组：老配置里没有这个字段，`skip_serializing_if` 让它们继续以
+    /// 「无此字段」的形态存在，而不是被写成一串空数组。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub purposes: Vec<Purpose>,
 }
 
 impl Account {
@@ -340,7 +618,16 @@ impl Account {
             added_at: chrono::Utc::now().to_rfc3339(),
             quota: None,
             health: None,
+            purposes: Vec::new(),
         }
+    }
+
+    /// 这条凭据是否接某一类活。
+    ///
+    /// 空列表 = 不限。这是分池语义的全部实现，路由与巡检共用它，
+    /// 免得两边各写一份判断然后慢慢漂移。
+    pub fn admits(&self, purpose: Purpose) -> bool {
+        self.purposes.is_empty() || self.purposes.contains(&purpose)
     }
 }
 
@@ -527,6 +814,9 @@ pub enum HealthStatus {
     Degraded,
     Cooling,
     Unavailable,
+    /// 连续 7 天 unavailable，或目录标记下线。移出路由与巡检队列，保留历史；
+    /// 厂商恢复免费额度后由手动「重新探测」或目录热更新唤醒。
+    Retired,
     Error,
 }
 
@@ -539,11 +829,12 @@ impl HealthStatus {
             Self::Degraded => "degraded",
             Self::Cooling => "cooling",
             Self::Unavailable => "unavailable",
+            Self::Retired => "retired",
             Self::Error => "error",
         }
     }
 
-    /// 路由是否还愿意尝试。`Unavailable` 与 `Cooling` 不放行；
+    /// 路由是否还愿意尝试。`Unavailable` / `Retired` / `Cooling` 不放行；
     /// `Degraded` 放行（它只是慢，不是坏）。
     pub fn is_usable(&self) -> bool {
         matches!(
@@ -569,6 +860,13 @@ pub struct ModelHealth {
     /// 连续成功次数
     #[serde(default)]
     pub oks: u32,
+    /// 首次进入 unavailable 的时刻。连续 7 天没爬出来就 retired。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "unavailableSince")]
+    pub unavailable_since: Option<String>,
+    /// 最近一次从 unavailable / retired 爬回来的时刻。每日 Digest 用它统计「恢复」，
+    /// 不然「昨天挂了今天好了」这件事在状态里留不下痕迹。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "recoveredAt")]
+    pub recovered_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "lastOkAt")]
     pub last_ok_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "lastUsedAt")]
@@ -578,6 +876,22 @@ pub struct ModelHealth {
     /// 实测能力，优先于目录声明
     #[serde(default, skip_serializing_if = "ModelCaps::is_empty")]
     pub caps: ModelCaps,
+    /// 衰减加权的成功/失败样本（见 `score`）。状态机看「现在」，这里看「长期」。
+    #[serde(default, rename = "okWeight", skip_serializing_if = "is_zero")]
+    pub ok_weight: f64,
+    #[serde(default, rename = "failWeight", skip_serializing_if = "is_zero")]
+    pub fail_weight: f64,
+    /// 上一次把这些权重衰减到哪一刻（毫秒）。0 = 还没有样本。
+    #[serde(default, rename = "decayAt", skip_serializing_if = "is_zero_i64")]
+    pub decay_at: i64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 impl ModelHealth {
@@ -588,6 +902,20 @@ impl ModelHealth {
     /// 最近一次成功距今多少毫秒；从未成功返回 None。
     pub fn since_ok_ms(&self, now_ms: i64) -> Option<i64> {
         self.last_ok_at.as_deref().and_then(parse_rfc3339_ms).map(|t| now_ms - t)
+    }
+
+    /// 记一次成功/失败样本（衰减加权）。
+    pub fn note_ok(&mut self, now_ms: i64) {
+        crate::score::note(true, now_ms, &mut self.ok_weight, &mut self.fail_weight, &mut self.decay_at);
+    }
+
+    pub fn note_fail(&mut self, now_ms: i64) {
+        crate::score::note(false, now_ms, &mut self.ok_weight, &mut self.fail_weight, &mut self.decay_at);
+    }
+
+    /// 长期可靠性后验期望。样本不足返回 `None`（没意见，交给状态机）。
+    pub fn reliability(&self, now_ms: i64) -> Option<f64> {
+        crate::score::expected(self.ok_weight, self.fail_weight, self.decay_at, now_ms)
     }
 }
 
@@ -690,6 +1018,22 @@ pub struct RoutingConfig {
     pub strategy: String,
     #[serde(default)]
     pub chain: Vec<String>,
+    /// 命名链。键是 profile 名，值是 `provider:model` 列表。
+    ///
+    /// 与 `chain` 的区别是「谁在用」：`chain` 是全局兜底，命名链由
+    /// `auto:<名字>` 或用途映射（`purposeChain`）点中。分开存是为了让
+    /// 「coding 走强模型」不影响「随手问一句」的默认链。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub chains: BTreeMap<String, Vec<String>>,
+    /// 用途 → 命名链。键是 `chat` / `coding` / `vision` / `probe`。
+    ///
+    /// 只影响「链从哪来」，不改准入：用途分池仍然是 Gate 的事。
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "purposeChain"
+    )]
+    pub purpose_chain: BTreeMap<String, String>,
     /// 全部候选都被冷却挡掉时，是否把「马上就要到期」的那一条提前放出去试一次。
     ///
     /// 默认开：冷却只是暂时状态，直接回 503 等于把它升级成硬中断。
@@ -699,6 +1043,67 @@ pub struct RoutingConfig {
     /// reset 撞了也是白撞，如实告诉用户还要等多久更有用。
     #[serde(default = "default_fallback_horizon")]
     pub fallback_horizon_ms: i64,
+    /// 三维评分权重。`enabled = false` 时维持旧公式（档位 × 余量 × 健康），
+    /// 打开后第三因子换成「可靠性 / 速度 / 智能」的加权合成。
+    ///
+    /// 只被 `balanced` 策略使用：极值策略的定义就是「只看一个维度」，
+    /// 再叠一层权重会把「最快」变成「没那么快」。
+    #[serde(default, skip_serializing_if = "RouteWeights::is_unset")]
+    pub weights: RouteWeights,
+}
+
+/// 三维评分权重（百分比，不必凑够 100，按总和归一）。
+///
+/// 默认 70 / 15 / 15：先保证能跑通，再谈快慢与聪明。这是**相对**权重，
+/// 三个都填 10 与都填 100 等价。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteWeights {
+    /// 关掉即回落到「只看健康」，老用户升级后行为不变。
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_w_reliability")]
+    pub reliability: u8,
+    #[serde(default = "default_w_speed")]
+    pub speed: u8,
+    #[serde(default = "default_w_intelligence")]
+    pub intelligence: u8,
+}
+
+fn default_w_reliability() -> u8 {
+    70
+}
+fn default_w_speed() -> u8 {
+    15
+}
+fn default_w_intelligence() -> u8 {
+    15
+}
+
+impl Default for RouteWeights {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reliability: default_w_reliability(),
+            speed: default_w_speed(),
+            intelligence: default_w_intelligence(),
+        }
+    }
+}
+
+impl RouteWeights {
+    /// 配置落盘时省掉「没开且全是默认值」的那一段，别把默认值写进用户文件。
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 启用了才返回自身，避免调用点到处写 `if weights.enabled`。
+    pub fn active(&self) -> Option<RouteWeights> {
+        if self.enabled {
+            Some(*self)
+        } else {
+            None
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -718,8 +1123,11 @@ impl Default for RoutingConfig {
         Self {
             strategy: default_strategy(),
             chain: Vec::new(),
+            chains: BTreeMap::new(),
+            purpose_chain: BTreeMap::new(),
             fallback_when_all_cooling: true,
             fallback_horizon_ms: default_fallback_horizon(),
+            weights: RouteWeights::default(),
         }
     }
 }
@@ -782,6 +1190,19 @@ pub struct LogEntry {
     /// 只在粘性命中时为 true——用来解释「为什么明摆着更快的没用上」。
     #[serde(default, skip_serializing_if = "is_false")]
     pub sticky: bool,
+    /// 这次请求进了哪个账号池。
+    ///
+    /// 必须记：池过滤是静默的，不写下来的话，事后完全无法解释
+    /// 「为什么另一把更宽裕的 key 没被选中」。
+    #[serde(default)]
+    pub purpose: Purpose,
+    /// 用途是怎么判出来的（header / image / agent-key / default）
+    #[serde(
+        rename = "purposeSource",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub purpose_source: Option<PurposeSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -869,6 +1290,16 @@ pub struct FeedState {
     /// 不参与任何本地判断——客户端不因为自己是免费档就拒收某个快照。
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "servedTier")]
     pub served_tier: Option<String>,
+    /// 最近一次同步实际应用了哪些字段包（服务端按许可证 `feat` 下发的）。
+    ///
+    /// 同样是「服务端给了什么」的实录。许可证到期后**不主动清**：客户端不判档，
+    /// 服务端下次不给就是不再更新，已到手的知识留在目录里。
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "servedFeats")]
+    pub served_feats: Vec<String>,
+    /// 服务端列了但没能应用的字段包，形如 `model.scores（本版本不支持）`。
+    /// 静默丢弃会让「Pro 面板为什么是空的」变成一个查不出来的现象。
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "featsSkipped")]
+    pub feats_skipped: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "lastCheckAt")]
     pub last_check_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "lastOkAt")]
@@ -906,6 +1337,8 @@ impl Default for FeedState {
             seq: 0,
             version: String::new(),
             served_tier: None,
+            served_feats: Vec::new(),
+            feats_skipped: Vec::new(),
             last_check_at: None,
             last_ok_at: None,
             last_error: None,
@@ -931,14 +1364,25 @@ impl FeedState {
 
     /// 到点该拉了吗。`now_ms` 用毫秒时间戳，`last_check_at` 是 RFC3339。
     pub fn due(&self, now_ms: i64) -> bool {
+        self.due_for(now_ms, "free")
+    }
+
+    /// 按档位决定轮询间隔。
+    ///
+    /// 这只是**礼貌**，不是权限：免费档拿到的是月度快照，一小时问一次和一分钟
+    /// 问一次结果一样，只是后者白耗自己的带宽和服务端的日志。真正的时效差
+    /// 由服务端下发哪份快照决定（见 `crates/freeport-catalogd`）。
+    pub fn due_for(&self, now_ms: i64, tier: &str) -> bool {
         if !self.accepts_feed() {
             return false;
         }
         let Some(last) = self.last_check_at.as_deref() else {
             return true;
         };
+        let floor_min = if tier.eq_ignore_ascii_case("pro") { 1 } else { 30 };
+        let interval = self.check_minutes.max(floor_min);
         match parse_rfc3339_ms(last) {
-            Some(t) => now_ms - t >= (self.check_minutes.max(1) as i64) * 60_000,
+            Some(t) => now_ms - t >= (interval as i64) * 60_000,
             None => true,
         }
     }
@@ -975,7 +1419,7 @@ pub struct FeedPending {
 }
 
 /// 一条变更事件。UI 渲染事件，不渲染版本号——用户关心「多了什么」，不关心 `2026.10.19.3`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeedEvent {
     #[serde(default)]
     pub id: String,
@@ -1010,6 +1454,43 @@ fn default_check_minutes() -> u32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_proxy_survives_a_config_roundtrip_and_stays_absent_when_unset() {
+        let raw = r#"{"id":"p","name":"P","baseUrl":"https://x/v1","proxy":"http://127.0.0.1:7890"}"#;
+        let p: Provider = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        let back: Provider = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.proxy.as_deref(), Some("http://127.0.0.1:7890"));
+
+        let plain: Provider = serde_json::from_str(r#"{"id":"p","name":"P"}"#).unwrap();
+        assert!(plain.proxy.is_none());
+        assert!(
+            !serde_json::to_string(&plain).unwrap().contains("proxy"),
+            "没设代理就不该在配置里留一个空字段，否则用户会以为它被改过"
+        );
+    }
+
+    /// 免费档问得再勤也只会拿到月度快照，所以客户端自觉把节奏放到 30 分钟起；
+    /// Pro 才允许 1 分钟级轮询。这不是权限，是礼貌——真正的时效差在服务端。
+    #[test]
+    fn feed_cadence_follows_the_tier() {
+        let mut f = FeedState {
+            enabled: true,
+            url: "https://example.com/v1/latest".into(),
+            check_minutes: 1,
+            last_check_at: Some("2026-10-21T03:00:00Z".into()),
+            ..Default::default()
+        };
+        let now = parse_rfc3339_ms("2026-10-21T03:05:00Z").unwrap();
+        assert!(!f.due_for(now, "free"), "免费档 5 分钟内不该再问");
+        assert!(f.due_for(now, "pro"), "Pro 档 1 分钟就该问");
+
+        f.check_minutes = 60;
+        assert!(!f.due_for(now, "pro"), "用户自己配的更大间隔仍然生效");
+        let later = parse_rfc3339_ms("2026-10-21T04:01:00Z").unwrap();
+        assert!(f.due_for(later, "pro"));
+    }
+
     fn provider_with(healths: &[Option<Health>]) -> Provider {
         let accounts: Vec<Account> = healths
             .iter()
@@ -1022,6 +1503,7 @@ mod tests {
                 added_at: String::new(),
                 quota: None,
                 health: h.clone(),
+                purposes: Vec::new(),
             })
             .collect();
         Provider {
@@ -1037,6 +1519,7 @@ mod tests {
             models: Vec::new(),
             quota: None,
             accounts,
+            proxy: None,
             health: Health::default(),
         }
     }
@@ -1132,5 +1615,87 @@ mod tests {
         assert!(t.revive_provider("groq"), "显式加回来要清墓碑");
         assert!(!t.is_buried("groq"));
         assert!(!t.revive_provider("groq"), "没删过就不该报删过");
+    }
+
+    // ── 用途分池 ──────────────────────────────────────────────
+
+    /// 判定顺序不是随意的：显式声明 > 请求客观属性 > 发送方身份。
+    ///
+    /// 最容易写错的是「带图的 coding 请求」——它必须算 vision，
+    /// 因为用户标 vision 池就是为了让图片走特定账号。
+    #[test]
+    fn purpose_inference_order_is_declared_then_image_then_agent() {
+        // 显式声明压倒一切，包括图片
+        assert_eq!(
+            Purpose::infer(Some(Purpose::Coding), true, true),
+            Purpose::Coding
+        );
+        // 带图就是 vision，哪怕发送方是 coding agent
+        assert_eq!(Purpose::infer(None, true, true), Purpose::Vision);
+        // 没图但来自已注入的 Agent
+        assert_eq!(Purpose::infer(None, false, true), Purpose::Coding);
+        // 什么线索都没有
+        assert_eq!(Purpose::infer(None, false, false), Purpose::Chat);
+    }
+
+    #[test]
+    fn purpose_round_trips_through_json_as_lowercase() {
+        let a = Account {
+            purposes: vec![Purpose::Coding, Purpose::Vision],
+            ..Account::new("k", "sk-****")
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains("\"purposes\":[\"coding\",\"vision\"]"), "{s}");
+
+        // 老配置没有这个字段 → 空 = 不限，任何用途都接
+        let old: Account = serde_json::from_str(r#"{"id":"a1","name":"x"}"#).unwrap();
+        assert!(old.purposes.is_empty());
+        for p in Purpose::ALL {
+            assert!(old.admits(p));
+        }
+    }
+
+    #[test]
+    fn admits_is_empty_means_unrestricted() {
+        let mut a = Account::new("k", "sk-****");
+        assert!(a.admits(Purpose::Probe), "没打标签的号巡检也能用");
+
+        a.purposes = vec![Purpose::Coding];
+        assert!(a.admits(Purpose::Coding));
+        assert!(!a.admits(Purpose::Chat));
+        assert!(!a.admits(Purpose::Probe), "标了用途就不该被探针烧额度");
+    }
+
+    #[test]
+    fn purpose_parse_accepts_aliases_and_rejects_noise() {
+        assert_eq!(Purpose::parse(" Coding "), Some(Purpose::Coding));
+        assert_eq!(Purpose::parse("image"), Some(Purpose::Vision));
+        assert_eq!(Purpose::parse("patrol"), Some(Purpose::Probe));
+        assert_eq!(Purpose::parse("whatever"), None);
+        for p in Purpose::ALL {
+            assert_eq!(Purpose::parse(p.as_str()), Some(p));
+        }
+    }
+
+    #[test]
+    fn infer_reports_which_rule_won() {
+        // 顺序就是优先级：声明 > 图片 > Agent 身份 > 兜底
+        let cases = [
+            (Some(Purpose::Coding), true, true, PurposeSource::Header),
+            (None, true, true, PurposeSource::Image),
+            (None, false, true, PurposeSource::AgentKey),
+            (None, false, false, PurposeSource::Default),
+        ];
+        for (declared, image, agent, want) in cases {
+            let (p, src) = Purpose::infer_with_source(declared, image, agent);
+            assert_eq!(src, want, "{declared:?}/{image}/{agent}");
+            // 依据和结果必须是同一份判定，不能各算一遍
+            assert_eq!(p, Purpose::infer(declared, image, agent));
+        }
+        // 写进日志后能被前端直接读懂
+        assert_eq!(
+            serde_json::to_string(&PurposeSource::AgentKey).unwrap(),
+            "\"agent-key\""
+        );
     }
 }

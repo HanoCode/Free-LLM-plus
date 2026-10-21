@@ -1,16 +1,29 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Cookie, KeyRound, LogIn, Plus, RefreshCw, ShieldCheck, Trash2, TriangleAlert } from 'lucide-react';
-import { T } from '../lib/i18n';
-import { Badge, Status, Switch, toast } from '../components/ui';
+import {
+  Cookie,
+  Gauge,
+  KeyRound,
+  LogIn,
+  Plus,
+  RefreshCw,
+  ShieldCheck,
+  Trash2,
+  TriangleAlert,
+} from 'lucide-react';
+import { T, tx, useLang } from '../lib/i18n';
+import { Badge, Status, Switch, TierBadge, toast } from '../components/ui';
+import { BrandLogo } from '../components/BrandLogo';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
 import type {
+  AccountPurpose,
   GwAccount,
   GwCooldown,
   GwLoginStart,
   GwLoginState,
   GwProvider,
   GwQuota,
+  GwUsage,
   ProviderQuotaInput,
 } from '../lib/bridge';
 
@@ -119,6 +132,44 @@ function buildGroups(
 
 const HINTS = ['rpm', 'rpd', 'tpm', 'tpd'] as const;
 
+/**
+ * 用途标签。
+ *
+ * 语义是**收窄**不是切分：不打标签就什么活都接，打了才限定。
+ * 所以界面上写「留空 = 全部」，而不是让用户去猜空选中的含义。
+ */
+const PURPOSE_ORDER: AccountPurpose[] = ['chat', 'coding', 'vision', 'probe'];
+
+const PURPOSE_META: Record<
+  AccountPurpose,
+  { zh: string; en: string; hintZh: string; hintEn: string }
+> = {
+  chat: {
+    zh: '对话',
+    en: 'Chat',
+    hintZh: '普通对话，以及没有标注来源的手动调用',
+    hintEn: 'Plain conversations and unlabelled manual calls',
+  },
+  coding: {
+    zh: '编码',
+    en: 'Coding',
+    hintZh: '来自已注入 Agent 的流量（每个 Agent 一把独立 key，自动识别）',
+    hintEn: 'Traffic from injected agents (one key each, recognised automatically)',
+  },
+  vision: {
+    zh: '图像',
+    en: 'Vision',
+    hintZh: '带图片的请求。判定优先于编码：图片要的是视觉能力，不是身份',
+    hintEn: 'Requests carrying images. Checked before coding: images need vision, not identity',
+  },
+  probe: {
+    zh: '巡检',
+    en: 'Probe',
+    hintZh: '自动巡检探针。不勾就别让探针烧这条额度',
+    hintEn: 'Scheduled probes. Leave it off to keep probes away from this quota',
+  },
+};
+
 function limitDigits(q: ProviderQuotaInput | undefined): Record<string, string> {
   return {
     rpm: q?.rpm ? String(q.rpm) : '',
@@ -130,6 +181,7 @@ function limitDigits(q: ProviderQuotaInput | undefined): Record<string, string> 
 
 export function Accounts() {
   const { setPage } = useApp();
+  const lang = useLang();
   const providers = useGateway((s) => s.providers);
   const quota = useGateway((s) => s.quota);
   const status = useGateway((s) => s.status);
@@ -144,6 +196,8 @@ export function Accounts() {
   const [editing, setEditing] = useState<{ p: GwProvider; a: GwAccount } | null>(null);
   /** 设备码登录弹窗 */
   const [logging, setLogging] = useState<GwProvider | null>(null);
+  /** 正在查官方额度的凭据 */
+  const [usageOf, setUsageOf] = useState<{ p: GwProvider; a: GwAccount } | null>(null);
   /** 粘贴 web 会话的弹窗。`a` 有值表示是给已有凭据换会话。 */
   const [cookies, setCookies] = useState<{ p: GwProvider; a?: GwAccount } | null>(null);
 
@@ -156,6 +210,13 @@ export function Accounts() {
   const total = allRows.length;
   const ready = allRows.filter((r) => r.state === 'active').length;
   const needAction = allRows.filter((r) => r.state !== 'active' && r.state !== 'disabled');
+
+  // 一条凭据都不接 chat：用户可能刚把唯一那条标成了 coding-only。
+  // 这时任何非 Agent 的请求都会 503，而界面上看起来「有一条可用」——
+  // 不说出来的话，这个哑谜要查到日志里才能破。
+  const admitsChat = allRows.some(
+    (r) => r.a.enabled && ((r.a.purposes ?? []).length === 0 || (r.a.purposes ?? []).includes('chat')),
+  );
 
   return (
     <>
@@ -202,6 +263,22 @@ export function Accounts() {
         </div>
       )}
 
+      {total > 0 && !admitsChat && (
+        <div className="risk-note" style={{ marginBottom: 12 }}>
+          <TriangleAlert />
+          <p>
+            <b>
+              <T zh="没有凭据接「对话」用途" en="No credential admits Chat" />
+            </b>
+            {' — '}
+            <T
+              zh="普通对话和手动 curl 会直接 503（Agent 流量不受影响）。给某条凭据去掉用途标签，或勾上「对话」。"
+              en="Plain requests and manual curl will get 503 (agent traffic is unaffected). Clear a credential's tags, or check Chat."
+            />
+          </p>
+        </div>
+      )}
+
       {groups.length === 0 ? (
         <div className="card">
           <div className="card-body" style={{ color: 'var(--text-2)', fontSize: 12.5 }}>
@@ -217,9 +294,7 @@ export function Accounts() {
             <div className="card-head">
               <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 {g.p.name}
-                <Badge tone={g.p.tier === 'A' ? 'ok' : g.p.tier === 'B' ? 'accent' : 'warn'}>
-                  Tier {g.p.tier}
-                </Badge>
+                <TierBadge tier={g.p.tier} />
                 {g.p.freeTier && (
                   <Badge tone="accent">
                     <T zh="免费额度" en="free tier" />
@@ -292,7 +367,9 @@ export function Accounts() {
 
             {g.rows.map((r) => (
               <div className="acc-row" key={r.a.id}>
-                <div className="acc-ic">{(r.p.name.slice(0, 2) || '??').toUpperCase()}</div>
+                <div className="acc-ic">
+                  <BrandLogo id={r.p.id} name={r.p.name} size={15} />
+                </div>
 
                 <div className="acc-main">
                   <div className="acc-name">
@@ -324,7 +401,13 @@ export function Accounts() {
                     ) : (
                       r.a.auth && (
                         <span className="badge ok" title={expiryHint(r.a.expiresAt)}>
-                          {r.a.auth === 'copilot' ? 'GitHub 登录' : 'OAuth'}
+                          {r.a.auth === 'copilot'
+                            ? 'GitHub 登录'
+                            : r.a.auth === 'claude'
+                              ? 'Claude 订阅'
+                              : r.a.auth === 'codex'
+                                ? 'Codex 订阅'
+                                : 'OAuth'}
                         </span>
                       )
                     )}
@@ -332,6 +415,22 @@ export function Accounts() {
                       <span className="badge gray">
                         <T zh="已设限额" en="limited" />
                       </span>
+                    )}
+                    {/* 用途标签：空 = 不限，显式写出来，省得用户以为是「没配置」 */}
+                    {(r.a.purposes ?? []).length === 0 ? (
+                      <span className="badge gray" title="任何用途的请求都可以用这条凭据">
+                        <T zh="全部用途" en="all purposes" />
+                      </span>
+                    ) : (
+                      (r.a.purposes ?? []).map((p) => (
+                        <span
+                          key={p}
+                          className="badge accent"
+                          title={tx(lang, PURPOSE_META[p].hintZh, PURPOSE_META[p].hintEn)}
+                        >
+                          {tx(lang, PURPOSE_META[p].zh, PURPOSE_META[p].en)}
+                        </span>
+                      ))
                     )}
                   </div>
                   <div className="acc-sub">
@@ -429,6 +528,17 @@ export function Accounts() {
                   >
                     <RefreshCw size={11} />
                   </button>
+                  {/* 只有这两家有公开的 usage 端点；别的凭据点开也是「查不到」，
+                      所以干脆不出现，免得像个坏掉的按钮 */}
+                  {(r.a.auth === 'claude' || r.a.auth === 'codex') && (
+                    <button
+                      className="btn ghost sm"
+                      title="问厂商：这个订阅还剩多少额度"
+                      onClick={() => setUsageOf({ p: r.p, a: r.a })}
+                    >
+                      <Gauge size={11} />
+                    </button>
+                  )}
                   <button className="btn ghost sm" onClick={() => setEditing({ p: r.p, a: r.a })}>
                     <T zh="编辑" en="Edit" />
                   </button>
@@ -532,6 +642,14 @@ export function Accounts() {
             </div>
             <div className="kv">
               <span className="k">
+                <T zh="账号池" en="Account pool" />
+              </span>
+              <span className="v">
+                <T zh="按用途收窄，空 = 全部" en="narrow by purpose, empty = all" />
+              </span>
+            </div>
+            <div className="kv">
+              <span className="k">
                 <T zh="失败作用域" en="Failure scope" />
               </span>
               <span className="v">
@@ -586,6 +704,13 @@ export function Accounts() {
         />
       )}
       {logging && <LoginDialog provider={logging} onClose={() => setLogging(null)} />}
+      {usageOf && (
+        <UsageDialog
+          provider={usageOf.p}
+          account={usageOf.a}
+          onClose={() => setUsageOf(null)}
+        />
+      )}
       {cookies && (
         <CookieDialog
           provider={cookies.p}
@@ -609,11 +734,14 @@ function AccountDialog({
 }) {
   const addAccount = useGateway((s) => s.addAccount);
   const patchAccount = useGateway((s) => s.patchAccount);
+  const lang = useLang();
   const edit = !!account;
 
   const [name, setName] = useState(account?.name ?? '');
   const [apiKey, setApiKey] = useState('');
   const [limits, setLimits] = useState<Record<string, string>>(limitDigits(account?.quota));
+  /** 空数组 = 不限用途。默认值照抄后端，不自己发明「默认勾 chat」。 */
+  const [pool, setPool] = useState<AccountPurpose[]>(account?.purposes ?? []);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -647,6 +775,8 @@ function AccountDialog({
           // 编辑时把空限额显式清掉，否则「删掉数字」这个动作不会生效
           quota: q,
           clearQuota: !q,
+          // 空数组就是「不限」，能直接表达，不需要额外的 clear 开关
+          purposes: pool,
         });
         toast(`已更新 ${name.trim() || account.name}`);
       } else {
@@ -655,6 +785,7 @@ function AccountDialog({
           apiKey: apiKey.trim(),
           name: name.trim() || undefined,
           quota: q,
+          purposes: pool,
         });
         toast(`已追加一条凭据，额度独立记账`);
       }
@@ -712,6 +843,37 @@ function AccountDialog({
             />
           </div>
         )}
+
+        <div className="field">
+          <label>
+            <T zh="用途（一个都不勾 = 全部）" en="PURPOSE (none checked = all)" />
+          </label>
+          <div className="pool-pick">
+            {PURPOSE_ORDER.map((p) => {
+              const on = pool.includes(p);
+              return (
+                <button
+                  key={p}
+                  type="button"
+                  className={`badge ${on ? 'accent' : 'gray'}`}
+                  aria-pressed={on}
+                  title={tx(lang, PURPOSE_META[p].hintZh, PURPOSE_META[p].hintEn)}
+                  onClick={() =>
+                    setPool((s) => (on ? s.filter((x) => x !== p) : [...s, p]))
+                  }
+                >
+                  {tx(lang, PURPOSE_META[p].zh, PURPOSE_META[p].en)}
+                </button>
+              );
+            })}
+          </div>
+          <p className="hint-line" style={{ marginTop: 6 }}>
+            <T
+              zh="勾上就把这条凭据限定在勾选的用途里；全不勾表示什么活都接。巡检也遵守这个标签——不想让探针烧某个号，就别给它勾「巡检」。"
+              en="Checking a purpose restricts this credential to those request types; leaving all unchecked accepts everything. Probes honour the tag too — keep “Probe” off to keep them away from this quota."
+            />
+          </p>
+        </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           {HINTS.map((k) => (
@@ -790,9 +952,160 @@ function Bar({
   );
 }
 
-/* ── 设备码登录 ───────────────────────────────
-   用户在自己的浏览器里授权自己的账号：我们不收密码、不读 Cookie、
-   不内嵌 client_secret。界面只负责把 code 说清楚、把轮询节奏守住。 */
+/* ── 官方额度 ───────────────────────────────────
+   账本说的是「我们发出去多少」，这里问的是「厂商认为你还剩多少」。
+   两个数字可以不一样——用户要的是后者，因为限流是厂商执行的。 */
+
+const WINDOW_LABEL: Record<string, { zh: string; en: string }> = {
+  five_hour: { zh: '5 小时', en: '5 hours' },
+  seven_day: { zh: '7 天', en: '7 days' },
+  seven_day_opus: { zh: '7 天 · Opus', en: '7 days · Opus' },
+  seven_day_sonnet: { zh: '7 天 · Sonnet', en: '7 days · Sonnet' },
+  seven_day_fable: { zh: '7 天 · Fable', en: '7 days · Fable' },
+  thirty_day: { zh: '30 天', en: '30 days' },
+};
+
+function windowLabel(name: string, lang: string): string {
+  const hit = WINDOW_LABEL[name];
+  if (hit) return lang === 'zh' ? hit.zh : hit.en;
+  // 没见过的窗口名照原样显示：猜一个翻译比显示原始名更容易误导
+  return name;
+}
+
+function UsageDialog({
+  provider,
+  account,
+  onClose,
+}: {
+  provider: GwProvider;
+  account: GwAccount;
+  onClose: () => void;
+}) {
+  const fetchUsage = useGateway((s) => s.fetchUsage);
+  const lang = useLang();
+  const [data, setData] = useState<GwUsage | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [err, setErr] = useState('');
+
+  const load = async () => {
+    setBusy(true);
+    setErr('');
+    try {
+      setData(await fetchUsage(account.id));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+    // 只在打开时查一次；重查由按钮触发，别让它自己去轮询上游
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account.id]);
+
+  return (
+    <div className="modal-mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <h3>
+          <T zh={`${provider.name} · 官方额度`} en={`${provider.name} · Official usage`} />
+        </h3>
+
+        <div className="modal-body">
+          <p className="modal-note">
+            <T
+              zh="这是厂商自己给的数字，和「凭据」页那几条进度条（本机账本）不是一回事。只读查询，不消耗额度。"
+              en="These numbers come from the vendor. They are not the bars on this page, which are the local ledger. Read-only: this query costs no quota."
+            />
+          </p>
+
+          {busy && (
+            <div className="login-code">
+              <T zh="正在向厂商查询…" en="Asking the vendor…" />
+            </div>
+          )}
+
+          {!busy && data && !data.ok && (
+            <div className="modal-err">
+              {data.note ?? (lang === 'zh' ? '没拿到额度' : 'no usage returned')}
+            </div>
+          )}
+
+          {!busy && data?.ok && (
+            <>
+              {data.windows.length === 0 && (
+                <p className="modal-note">
+                  {data.note ??
+                    (lang === 'zh'
+                      ? '上游没有返回任何窗口，可能这个方案没有订阅额度'
+                      : 'No windows returned — this plan may not have subscription quota')}
+                </p>
+              )}
+              {data.windows.map((w) => (
+                <div className="usage-row" key={w.name}>
+                  <div className="usage-head">
+                    <span>{windowLabel(w.name, lang)}</span>
+                    <span className="mono">{w.usedPct.toFixed(1)}%</span>
+                  </div>
+                  <div className="usage-track">
+                    <i
+                      className={w.usedPct > 85 ? 'bad' : w.usedPct > 60 ? 'warn' : ''}
+                      style={{ width: `${Math.max(w.usedPct, 0.5)}%` }}
+                    />
+                  </div>
+                  {w.resetsAt && (
+                    <div className="usage-foot">
+                      {lang === 'zh' ? '重置于 ' : 'resets '}
+                      {new Date(w.resetsAt).toLocaleString()}
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {data.credits !== undefined && (
+                <div className="usage-row">
+                  <div className="usage-head">
+                    <span>{lang === 'zh' ? '余额' : 'Credits'}</span>
+                    <span className="mono">{data.credits.toLocaleString()}</span>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {err && <div className="modal-err">{err}</div>}
+
+          {data && (
+            <p className="modal-note" style={{ marginTop: 6 }}>
+              {lang === 'zh' ? '查询时间：' : 'checked '}
+              {new Date(data.checkedAt).toLocaleTimeString()}
+            </p>
+          )}
+        </div>
+
+        <div className="modal-actions">
+          <button className="btn ghost" disabled={busy} onClick={() => void load()}>
+            <RefreshCw size={12} />
+            <T zh="重新查询" en="Refresh" />
+          </button>
+          <button className="btn primary" onClick={onClose}>
+            <T zh="关闭" en="Close" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── 登录（设备码 / 授权码） ─────────────────────
+   用户在自己的浏览器里授权自己的账号：我们不收密码、不读系统浏览器的 Cookie、
+   不内嵌 client_secret。界面只负责把要做的事说清楚。
+
+   两条流程的交互完全不同，混在一个界面里用户不知道该点哪个：
+   - **设备码**：给一个短码 + 网址，我们按上游给的节奏轮询。
+   - **授权码**：给一条授权链接，浏览器跳回本机回环就自动完成；
+     端口绑不上（比如 1455 被官方 CLI 占着）时退回「粘贴回调地址」。 */
 
 function expiryHint(expiresAt?: number): string | undefined {
   if (!expiresAt) return undefined;
@@ -803,57 +1116,86 @@ function expiryHint(expiresAt?: number): string | undefined {
 function LoginDialog({ provider, onClose }: { provider: GwProvider; onClose: () => void }) {
   const loginStart = useGateway((s) => s.loginStart);
   const loginPoll = useGateway((s) => s.loginPoll);
+  const loginWait = useGateway((s) => s.loginWait);
+  const loginComplete = useGateway((s) => s.loginComplete);
+
   const [start, setStart] = useState<GwLoginStart | null>(null);
   const [state, setState] = useState<GwLoginState | null>(null);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(true);
-  const timer = useRef<number | null>(null);
+  const [pasted, setPasted] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
-  const stop = () => {
-    if (timer.current !== null) {
-      window.clearInterval(timer.current);
+  const timer = useRef<number | null>(null);
+  // 弹窗关掉之后后台的 promise 还会走到 setState；用 ref 拦住，
+  // 否则 React 会警告「在已卸载的组件上更新状态」
+  const alive = useRef(true);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      if (timer.current !== null) window.clearInterval(timer.current);
       timer.current = null;
+    };
+  }, []);
+
+  const done = (out: GwLoginState) => {
+    setState(out);
+    if (out.status === 'ready') {
+      toast(`已登录${out.login ? `为 ${out.login}` : ''}，凭据已加入 ${provider.name}`);
+      onClose();
+    }
+  };
+
+  /* 设备码：按上游给的 interval 轮询。自己拍一个更快的会被限流。 */
+  const pollLoop = (id: string) => {
+    timer.current = window.setInterval(() => {
+      void (async () => {
+        try {
+          const out = await loginPoll(id);
+          if (!alive.current) return;
+          setState(out);
+          if (out.status === 'pending') return;
+          if (timer.current !== null) window.clearInterval(timer.current);
+          timer.current = null;
+          done(out);
+        } catch (e) {
+          if (timer.current !== null) window.clearInterval(timer.current);
+          timer.current = null;
+          if (alive.current) setErr(e instanceof Error ? e.message : String(e));
+        }
+      })();
+    }, Math.max(1, start?.interval ?? 5) * 1000);
+  };
+
+  /* 授权码：一次调用最多等一会儿，超时返回 pending 就再来一次。
+     用户可能正在浏览器里慢慢输密码，把他踢回「失败」是最糟的处理。 */
+  const waitLoop = async (id: string) => {
+    for (;;) {
+      const out = await loginWait(id, 120);
+      if (!alive.current) return;
+      setState(out);
+      if (out.status === 'pending') continue;
+      done(out);
+      return;
     }
   };
 
   useEffect(() => {
-    let alive = true;
-
-    const poll = async (id: string) => {
-      try {
-        const out = await loginPoll(id);
-        if (!alive) return;
-        setState(out);
-        if (out.status === 'pending') return;
-        stop();
-        if (out.status === 'ready') {
-          toast(`已登录${out.login ? `为 ${out.login}` : ''}，凭据已加入 ${provider.name}`);
-          onClose();
-        }
-      } catch (e) {
-        stop();
-        if (alive) setErr(e instanceof Error ? e.message : String(e));
-      }
-    };
-
     void (async () => {
       try {
         const s = await loginStart(provider.id);
-        if (!alive) return;
+        if (!alive.current) return;
         setStart(s);
-        // 按上游给的 interval 轮询：自己拍一个更快的会被限流
-        timer.current = window.setInterval(() => void poll(s.loginId), Math.max(1, s.interval) * 1000);
+        if (s.kind === 'device') pollLoop(s.loginId);
+        else if (s.auto) void waitLoop(s.loginId);
       } catch (e) {
-        if (alive) setErr(e instanceof Error ? e.message : String(e));
+        if (alive.current) setErr(e instanceof Error ? e.message : String(e));
       } finally {
-        if (alive) setBusy(false);
+        if (alive.current) setBusy(false);
       }
     })();
-
-    return () => {
-      alive = false;
-      stop();
-    };
     // 只在打开时跑一次：provider 变了就是另一个弹窗了
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider.id]);
@@ -863,7 +1205,25 @@ function LoginDialog({ provider, onClose }: { provider: GwProvider; onClose: () 
     window.open(url, '_blank', 'noopener,noreferrer');
   };
 
-  const terminal = state && state.status !== 'pending';
+  const submitPaste = async () => {
+    if (!start || !pasted.trim()) return;
+    setSubmitting(true);
+    setErr('');
+    try {
+      const out = await loginComplete(start.loginId, pasted.trim());
+      if (alive.current) {
+        setState(out);
+        if (out.status === 'ready') done(out);
+      }
+    } catch (e) {
+      if (alive.current) setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (alive.current) setSubmitting(false);
+    }
+  };
+
+  const terminal = !!state && state.status !== 'pending';
+  const isDevice = start?.kind === 'device';
 
   return (
     <div className="modal-mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -882,11 +1242,12 @@ function LoginDialog({ provider, onClose }: { provider: GwProvider; onClose: () 
 
           {busy && (
             <div className="login-code">
-              <T zh="正在申请设备码…" en="Requesting a device code…" />
+              <T zh="正在申请登录…" en="Starting sign-in…" />
             </div>
           )}
 
-          {start && (
+          {/* ── 设备码 ── */}
+          {start && isDevice && (
             <>
               <div className="login-code" aria-label="device code">
                 <KeyRound size={14} />
@@ -894,7 +1255,7 @@ function LoginDialog({ provider, onClose }: { provider: GwProvider; onClose: () 
                 <button
                   className="btn ghost sm"
                   onClick={() => {
-                    void navigator.clipboard?.writeText(start.userCode);
+                    void navigator.clipboard?.writeText(start.userCode ?? '');
                     toast('设备码已复制');
                   }}
                 >
@@ -917,6 +1278,64 @@ function LoginDialog({ provider, onClose }: { provider: GwProvider; onClose: () 
                   {state.message ? ` ${state.message}` : ''}
                 </p>
               )}
+            </>
+          )}
+
+          {/* ── 授权码 ── */}
+          {start && !isDevice && (
+            <>
+              <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                <button className="btn primary" onClick={() => open(start.url)}>
+                  <LogIn size={12} />
+                  <T zh="打开授权页面" en="Open authorization page" />
+                </button>
+              </div>
+
+              <p className="modal-note">{start.instruction}</p>
+
+              {start.auto && state?.status === 'pending' && (
+                <p className="modal-note">
+                  <T zh="等待浏览器回调…" en="Waiting for the browser callback…" />
+                </p>
+              )}
+
+              {/* 自动收回调失败、或端口被占，都得留一条手工的路。
+                  一直显示而不是「失败后才出现」：用户可能提前就想贴。 */}
+              <div className="field">
+                <label>
+                  <T zh="回调地址" en="Callback URL" />
+                </label>
+                <textarea
+                  className="input"
+                  rows={2}
+                  value={pasted}
+                  placeholder={
+                    start.redirectUri
+                      ? `${start.redirectUri}?code=…&state=…`
+                      : 'code#state'
+                  }
+                  onChange={(e) => setPasted(e.target.value)}
+                />
+                <p className="modal-note">
+                  <T
+                    zh="登录并同意后浏览器会跳到上面这个地址（页面打不开是正常的）。把地址栏里那一整条复制回这里。"
+                    en="After approving, the browser jumps to the address above (it will not load — that is expected). Copy the whole address bar back here."
+                  />
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  className="btn primary"
+                  disabled={!pasted.trim() || submitting}
+                  onClick={() => void submitPaste()}
+                >
+                  {submitting ? (
+                    <T zh="正在换取凭据…" en="Exchanging…" />
+                  ) : (
+                    <T zh="完成授权" en="Complete sign-in" />
+                  )}
+                </button>
+              </div>
             </>
           )}
 

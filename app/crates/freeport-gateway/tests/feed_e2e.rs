@@ -50,6 +50,7 @@ fn manifest_bytes_with(
         url: snap_url.into(),
         tier: None,
         notes: None,
+        feat: Vec::new(),
         patches,
     };
     let payload = freeport_catalog::jcs::canonical(&m.signing_payload()).unwrap();

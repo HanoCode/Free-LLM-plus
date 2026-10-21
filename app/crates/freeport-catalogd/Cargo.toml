@@ -1,0 +1,25 @@
+[package]
+name = "freeport-catalogd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freeport 的目录服务端：按 tier 下发签名快照（Pro 实时 / 免费月度）。"
+
+[[bin]]
+name = "freeport-catalogd"
+path = "src/main.rs"
+
+[dependencies]
+freeport-catalog = { path = "../freeport-catalog" }
+freeport-license = { path = "../freeport-license" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core"] }

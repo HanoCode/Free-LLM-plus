@@ -92,7 +92,7 @@ impl Redactor {
     /// 拿别的厂商的 key 去替换本请求的文本，等于给无关内容打码。
     pub fn for_credential(cred: &Credential) -> Self {
         match cred {
-            Credential::Bearer(token) => Self::new([token.clone()]),
+            Credential::Bearer { token, .. } => Self::new([token.clone()]),
             Credential::Cookie { jar, .. } => {
                 Self::new(jar.entries.iter().map(|e| e.value.clone()))
             }

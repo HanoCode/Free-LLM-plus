@@ -18,13 +18,41 @@ use crate::secrets;
 
 #[derive(Debug, Clone)]
 pub enum Credential {
-    Bearer(String),
+    /// API key 或 OAuth token。`extras` 是个别厂商要求的**附加认证头**：
+    /// 它们不是密钥，但缺了整个号都调不通（Codex 的 `chatgpt-account-id`
+    /// 就在这里——它标的是「哪个工作区的额度」，不是「你是谁」）。
+    /// 放在 Bearer 上而不是按厂商硬编码，是因为它的值来自 token 本身。
+    Bearer {
+        token: String,
+        extras: Vec<(String, String)>,
+    },
     Cookie { account_id: String, jar: CookieJar },
 }
 
 impl Credential {
     pub fn bearer(token: impl Into<String>) -> Self {
-        Credential::Bearer(token.into())
+        Credential::Bearer {
+            token: token.into(),
+            extras: Vec::new(),
+        }
+    }
+
+    /// 挂一个附加认证头。重复设置同名头以最后一次为准。
+    pub fn with_extra(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        if let Credential::Bearer { extras, .. } = &mut self {
+            let name = name.into();
+            extras.retain(|(k, _)| k != &name);
+            extras.push((name, value.into()));
+        }
+        self
+    }
+
+    /// 这次请求要额外带的认证头。Cookie 形态永远为空。
+    pub fn extras(&self) -> &[(String, String)] {
+        match self {
+            Credential::Bearer { extras, .. } => extras,
+            Credential::Cookie { .. } => &[],
+        }
     }
 
     /// 从库里取一条能发请求的凭据。
@@ -44,13 +72,13 @@ impl Credential {
                 }
             }
         }
-        secrets::get_key(account_id).map(Credential::Bearer)
+        secrets::get_key(account_id).map(|k| Credential::bearer(k))
     }
 
     /// 界面上的形态标签
     pub fn kind(&self) -> &'static str {
         match self {
-            Credential::Bearer(_) => "key",
+            Credential::Bearer { .. } => "key",
             Credential::Cookie { .. } => "cookie",
         }
     }
@@ -63,7 +91,9 @@ impl Credential {
     /// 不同 cookie，提前拼好一个串等于把根路径的会话也发给子路径。
     pub fn auth_pair(&self, url: &str) -> Option<(&'static str, String)> {
         match self {
-            Credential::Bearer(t) => Some(("authorization", format!("Bearer {t}"))),
+            Credential::Bearer { token, .. } => {
+                Some(("authorization", format!("Bearer {token}")))
+            }
             Credential::Cookie { jar, .. } => jar
                 .header_for(url, Utc::now().timestamp())
                 .map(|v| ("cookie", v)),
@@ -109,7 +139,7 @@ impl Credential {
     /// 界面/日志用的摘要。绝不回显 cookie 值。
     pub fn summary(&self) -> String {
         match self {
-            Credential::Bearer(t) => crate::store::mask(t),
+            Credential::Bearer { token, .. } => crate::store::mask(token),
             Credential::Cookie { jar, .. } => format!("web 会话（{}）", jar.summary()),
         }
     }
@@ -177,7 +207,7 @@ mod tests {
 
     #[test]
     fn bearer_and_cookie_never_mix() {
-        let cred = Credential::Bearer("sk-1".into());
+        let cred = Credential::bearer("sk-1");
         assert_eq!(cred.header("https://x.com").as_deref(), Some("Bearer sk-1"));
         assert!(!cred.is_cookie());
     }

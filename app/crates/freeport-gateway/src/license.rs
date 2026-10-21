@@ -11,7 +11,6 @@ use freeport_license as verifier;
 use freeport_license::Status;
 
 use crate::server::Gateway;
-use crate::store;
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -112,7 +111,7 @@ impl Gateway {
         d.license = LicenseCfg {
             token: Some(token.to_string()),
         };
-        store::save(&d);
+        crate::server::save_here(&self.st, &d);
         tracing::info!(
             target: "license",
             status = l.status_str(),
@@ -125,7 +124,7 @@ impl Gateway {
     pub async fn clear_license(&self) -> GwLicense {
         let mut d = self.st.data.write().await;
         d.license = LicenseCfg::default();
-        store::save(&d);
+        crate::server::save_here(&self.st, &d);
         state(&d)
     }
 }

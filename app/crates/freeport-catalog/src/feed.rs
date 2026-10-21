@@ -80,10 +80,32 @@ pub struct Manifest {
     pub tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// 按 `feat` 下发的字段包清单。**快照本身不动**，所以 sha256 与补丁链
+    /// 原样有效；字段跟着名字与摘要单独下发。
+    ///
+    /// 名字与摘要都进签名：中间人既不能把包塞进来，也不能把地址换掉。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feat: Vec<FeatRef>,
     /// 增量补丁链。客户端本地 `seq` 落在其中某一环的 `fromSeq` 上时，可以只下补丁；
     /// 否则回退全量快照。**空表示发布端没做增量**，老客户端照旧。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patches: Vec<PatchRef>,
+}
+
+/// 一份字段包：某几个字段的值，按能力名下发。
+///
+/// 为什么不做成「快照的第三种切法」（free/pro 两份之外再切）：
+/// 快照摘要与增量补丁都钉在字节上，切一刀就要重新序列化、重新签名，
+/// 补丁链立刻作废。字段包是**旁路文档**，主链路一个字节都不用动。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatRef {
+    /// 与许可证 `feat` 同名：`quota.intel` 之类
+    pub name: String,
+    /// 可相对 manifest 所在目录
+    pub url: String,
+    /// 包文件原文的 sha256
+    pub sha256: String,
 }
 
 /// manifest 里的一环补丁。地址和摘要都进签名，否则中间人可以换补丁内容。
@@ -119,6 +141,11 @@ impl Manifest {
         // 交一份「只删模型、不加模型」的补丁——摘要校验挡不住，因为摘要也是他给的。
         if !self.patches.is_empty() {
             v["patches"] = json!(self.patches);
+        }
+        // 字段包同理。少了这一条，中间人可以在免费包的 manifest 里
+        // 塞一个 `quota.intel`——客户端只会验摘要，摘要正是他给的。
+        if !self.feat.is_empty() {
+            v["feat"] = json!(self.feat);
         }
         v
     }
@@ -246,6 +273,12 @@ pub struct Applied {
     pub active: Vec<String>,
     /// 服务端标注的档位，仅用于界面展示「这份目录是 Pro 档下发的」。
     pub tier: Option<String>,
+    /// 本次真正应用的字段包名。**这是「服务端给了什么」的实录**，
+    /// 不是本机判档的结果——客户端从来不按自己的档位决定收不收。
+    pub feats: Vec<String>,
+    /// 服务端给了但没应用的（不认识 / 摘要不符 / 形状不对），带原因。
+    /// 静默丢弃会让「Pro 面板为什么是空的」变成一个查不出来的现象。
+    pub feats_skipped: Vec<String>,
     /// 本次实际生效的完整快照（增量拼出来的也算完整）。
     /// 调用方或写入磁盘当下一轮的补丁基线，或什么都不做。
     pub snapshot: Snapshot,
@@ -827,8 +860,76 @@ pub fn apply_snapshot_with(
         version: snap.version.clone(),
         active,
         tier: None,
+        feats: Vec::new(),
+        feats_skipped: Vec::new(),
         snapshot: snap.clone(),
     })
+}
+
+/* ── 字段包（按 feat 下发） ─────────────────────
+ *
+ * 快照是「大家都能看到的那份事实」，字段包是「按能力开的那几项情报」。
+ * 分成两种文档而不是两份快照，是因为快照的字节被摘要和补丁链钉住了：
+ * 每多一种切法，就要多一套签名、多一条补丁链、多一次「给谁哪份」的判断。
+ *
+ * 客户端只认 manifest 里那份签名过的清单：不在清单里的包不会去拉，
+ * 清单里的包一律先验摘要再解析。**不看本机档位**——服务端给什么就是什么。
+ */
+
+/// 厂商级额度情报：`{"providers":{"groq":{"rpm":30,"rpd":1000}}}`
+pub const FEAT_QUOTA_INTEL: &str = "quota.intel";
+
+/// 本版本认识的字段包。不认识的包**不应用但记名字**：将来服务端先上、
+/// 客户端后升级时，用户看到的是「这个字段本版本还不支持」，而不是一片空白。
+pub const KNOWN_FEATS: &[&str] = &[FEAT_QUOTA_INTEL];
+
+/// 单个字段包的大小上限。情报是几十个数字，4MB 已经离谱到只可能是配置错了。
+const MAX_FEAT_BYTES: usize = 4 * 1024 * 1024;
+
+/// 把一份字段包合进目录。返回被改到的厂商数。
+///
+/// 只做「补齐既有条目」：包里点到目录里没有的厂商就跳过，不新建。
+/// 字段包是情报，不是目录本体——它不该有能力凭空造出一个厂商。
+pub fn apply_feat(cat: &mut Catalog, name: &str, v: &Value) -> Result<usize, String> {
+    match name {
+        FEAT_QUOTA_INTEL => {
+            let Some(map) = v.get("providers").and_then(Value::as_object) else {
+                return Err("缺少 providers 对象".into());
+            };
+            let mut touched = 0usize;
+            for (pid, q) in map {
+                let Some(p) = cat.providers.iter_mut().find(|p| &p.id == pid) else {
+                    continue;
+                };
+                let (rpm, rpd) = (
+                    q.get("rpm").and_then(as_count),
+                    q.get("rpd").and_then(as_count),
+                );
+                if rpm.is_none() && rpd.is_none() {
+                    continue;
+                }
+                let slot = p.quota.get_or_insert_with(Quota::default);
+                // 只覆盖包里明说的字段：少写一项不等于「那一项没有限制」
+                if rpm.is_some() {
+                    slot.rpm = rpm;
+                }
+                if rpd.is_some() {
+                    slot.rpd = rpd;
+                }
+                touched += 1;
+            }
+            Ok(touched)
+        }
+        other => Err(format!("本版本不认识字段包 {other}")),
+    }
+}
+
+fn as_count(v: &Value) -> Option<u32> {
+    let f = v.as_f64()?;
+    if !f.is_finite() || f < 0.0 || f > u32::MAX as f64 {
+        return None;
+    }
+    Some(f.round() as u32)
 }
 
 fn exceeds(count: usize, total: usize, ratio: f64, abs: usize) -> bool {
@@ -1030,7 +1131,63 @@ pub async fn poll(
     }
     let mut applied = apply_snapshot_with(current, &snap, cfg.force)?;
     applied.tier = manifest.tier.clone();
+    // 字段包放在快照之后：主链路先成，情报后到。任何一份包出问题
+    // 都只写进 `feats_skipped`，不推翻这次已经成功的目录更新。
+    if !manifest.feat.is_empty() {
+        apply_feats(client, cfg.url, &manifest, &id, &mut applied).await;
+    }
     Ok(Poll::Applied(Box::new(applied)))
+}
+
+/// 逐份拉取并应用字段包。
+///
+/// 每一份都单独算账：下载失败 / 摘要不符 / 形状不对 → 记原因跳过，
+/// 其余照常应用。这里刻意不用 `?`，因为「少一份情报」与「目录同步失败」
+/// 是两件严重程度完全不同的事。
+async fn apply_feats(
+    client: &reqwest::Client,
+    base: &str,
+    m: &Manifest,
+    id: &Identity<'_>,
+    applied: &mut Applied,
+) {
+    for f in &m.feat {
+        // manifest 里的名字已经过了签名，但客户端必须先确认自己懂它——
+        // 「先信后懂」等于把解析器交给发布方
+        if !KNOWN_FEATS.contains(&f.name.as_str()) {
+            applied.feats_skipped.push(format!("{}（本版本不支持）", f.name));
+            continue;
+        }
+        let url = resolve_url(base, &f.url);
+        let bytes = match fetch_verified(
+            client,
+            base,
+            &url,
+            &f.sha256,
+            MAX_FEAT_BYTES,
+            id,
+            "字段包",
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                applied.feats_skipped.push(format!("{}（{e}）", f.name));
+                continue;
+            }
+        };
+        let v: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                applied.feats_skipped.push(format!("{}（不是合法 JSON：{e}）", f.name));
+                continue;
+            }
+        };
+        match apply_feat(&mut applied.catalog, &f.name, &v) {
+            Ok(_) => applied.feats.push(f.name.clone()),
+            Err(e) => applied.feats_skipped.push(format!("{}（{e}）", f.name)),
+        }
+    }
 }
 
 async fn fetch_manifest(
@@ -1261,6 +1418,7 @@ mod tests {
             url: "snap.json".into(),
             tier: None,
             notes: None,
+            feat: Vec::new(),
             patches: Vec::new(),
         }
     }
@@ -1627,5 +1785,53 @@ mod tests {
         assert!(plan_chain(&all, 1, 5).is_none(), "走不到目标");
         assert!(plan_chain(&[p(1, 2), p(3, 4)], 1, 4).is_none(), "断链");
         assert!(plan_chain(&[p(1, 1)], 1, 2).is_none(), "空转环");
+    }
+
+    /* ── 字段包 ─────────────────────────────────── */
+
+    /// 情报只补既有条目：包里点到目录里没有的厂商，跳过就行。
+    /// 让它新建厂商等于给了数据面造目录本体的能力。
+    #[test]
+    fn quota_intel_never_invents_providers() {
+        let mut cat = catalog_with(1);
+        let pack = json!({
+            "providers": {
+                "p": { "rpm": 30, "rpd": 1000 },
+                "ghost": { "rpm": 999 }
+            }
+        });
+        assert_eq!(apply_feat(&mut cat, FEAT_QUOTA_INTEL, &pack).unwrap(), 1);
+        assert_eq!(cat.providers.len(), 1, "不能凭空多出一家");
+        let q = cat.providers[0].quota.as_ref().expect("额度情报该落进来");
+        assert_eq!((q.rpm, q.rpd), (Some(30), Some(1000)));
+    }
+
+    /// 包里少写一项 ≠ 那一项没有限制：只覆盖明说的字段。
+    #[test]
+    fn quota_intel_only_overwrites_the_fields_it_states() {
+        let mut cat = catalog_with(1);
+        cat.providers[0].quota = Some(Quota { rpm: Some(5), rpd: None });
+
+        let pack = json!({ "providers": { "p": { "rpd": 500 } } });
+        apply_feat(&mut cat, FEAT_QUOTA_INTEL, &pack).unwrap();
+        let q = cat.providers[0].quota.clone().unwrap();
+        assert_eq!(q.rpm, Some(5), "包没提 rpm，不能把它清掉");
+        assert_eq!(q.rpd, Some(500));
+
+        // 形状不对要报错，而不是「什么都没改但装作成功」
+        assert!(apply_feat(&mut cat, FEAT_QUOTA_INTEL, &json!({"x": 1})).is_err());
+        // 完全不认识的包名同样要报错，让调用方记进 featsSkipped
+        assert!(apply_feat(&mut cat, "model.scores", &json!({})).is_err());
+    }
+
+    /// 值可能是整数也可能是浮点（JSON 没区分）：都要能读，负数与非数要丢。
+    #[test]
+    fn quota_intel_accepts_json_numbers_and_rejects_nonsense() {
+        let mut cat = catalog_with(1);
+        let pack = json!({ "providers": { "p": { "rpm": 30.0, "rpd": -1 } } });
+        apply_feat(&mut cat, FEAT_QUOTA_INTEL, &pack).unwrap();
+        let q = cat.providers[0].quota.clone().unwrap();
+        assert_eq!(q.rpm, Some(30));
+        assert_eq!(q.rpd, None, "负数不是额度");
     }
 }

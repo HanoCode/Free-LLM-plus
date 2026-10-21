@@ -1,0 +1,12 @@
+# 构建上下文只需要 Rust 侧的东西。
+# 不挡掉 node_modules / target 的话，镜像构建会先花几分钟上传几 GB 无关文件。
+app/node_modules
+app/target
+app/dist
+app/src-tauri/target
+app/src-tauri/gen
+**/.git
+**/.DS_Store
+temp
+design
+docs

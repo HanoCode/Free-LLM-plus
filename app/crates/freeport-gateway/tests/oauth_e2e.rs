@@ -105,6 +105,7 @@ async fn device_login_refresh_and_single_flight() {
         key_mask: String::new(),
         enabled: true,
         added_at: chrono::Utc::now().to_rfc3339(),
+        proxy: None,
         models: Vec::new(),
         quota: None,
         accounts: Vec::new(),
@@ -117,7 +118,7 @@ async fn device_login_refresh_and_single_flight() {
 
     // ① 发起登录
     let start = gw.login_start("copilot").await.expect("应能发起登录");
-    assert_eq!(start.user_code, "TEST-1234");
+    assert_eq!(start.user_code.as_deref(), Some("TEST-1234"));
     assert!(start.instruction.contains("TEST-1234"));
 
     // ② 轮询到成功（第一次必然是 pending）

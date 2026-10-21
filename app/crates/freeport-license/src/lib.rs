@@ -323,6 +323,42 @@ pub fn verify_with(pubkey: &[u8], token: &str, now: i64, install_id: &str) -> Li
     }
 }
 
+/// 只验「是不是我们签的、有没有过期」，**不校验机器绑定**。
+///
+/// 目录服务端用这个：它手里没有（也不该有）客户端的 install_id，
+/// 只关心「这份 JWT 是我们签的、还在有效期内」。
+/// 机器绑定仍然由客户端自己验——那是防一号多机的，不是防服务端的。
+pub fn verify_claims(pubkey: &[u8], token: &str, now: i64) -> Option<Claims> {
+    let token = token.trim();
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let header: serde_json::Value = serde_json::from_slice(&B64.decode(parts[0]).ok()?).ok()?;
+    let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(alg, "EdDSA" | "Ed25519") {
+        return None;
+    }
+    let sig_raw = B64.decode(parts[2]).ok()?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_raw.as_slice().try_into().ok()?);
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pubkey.try_into().ok()?).ok()?;
+    vk.verify_strict(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
+        .ok()?;
+    let claims: Claims = serde_json::from_slice(&B64.decode(parts[1]).ok()?).ok()?;
+    if claims.exp <= 0 {
+        return None;
+    }
+    // 宽限期仍然算数：付费用户在到期后 7 天内不该被停掉实时目录
+    if now > claims.exp + GRACE_SECS {
+        return None;
+    }
+    // 时间倒流（比签发还早一天以上）判无效，否则改系统时间就能续命
+    if now + 86400 < claims.iat {
+        return None;
+    }
+    Some(claims)
+}
+
 /// 设备指纹：稳定、不采集硬件序列号。用安装 id + 主机名 + OS 拼一个短哈希。
 ///
 /// 不读 MAC / 磁盘序列号是刻意的——那些既不稳定（换网卡就变），

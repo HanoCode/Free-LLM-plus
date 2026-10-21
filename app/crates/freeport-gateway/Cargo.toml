@@ -11,6 +11,7 @@ freeport-catalog = { path = "../freeport-catalog" }
 freeport-probe = { path = "../freeport-probe" }
 freeport-auth = { path = "../freeport-auth" }
 freeport-license = { path = "../freeport-license" }
+freeport-ext = { path = "../freeport-ext" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -36,3 +37,7 @@ hex = { workspace = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 # 测试要能自己签发许可证；`issuer` 只在这个测试构建里打开
 freeport-license = { path = "../freeport-license", features = ["issuer"] }
+# 端到端跑真实的目录服务端：客户端与服务端的判定必须对得上，
+# 各测各的等于两份实现互相背书
+freeport-catalogd = { path = "../freeport-catalogd" }
+axum = { workspace = true }

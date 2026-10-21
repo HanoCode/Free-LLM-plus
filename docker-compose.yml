@@ -1,0 +1,42 @@
+# 本机跑 Freeport 网关（NAS / 小主机 / 长期开着的机器）。
+#
+#   cp .env.example .env      # 填要接的厂商和 key
+#   docker compose up -d
+#   curl http://127.0.0.1:8787/v1/models
+#
+# 端口发布写成 127.0.0.1:8787:8787 —— 冒号左边那一半是**主机侧**的绑定地址。
+# 少了它就等于把网关开到局域网，而这条产品线一直是「只对内」。
+
+services:
+  freeport:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: freeport:local
+    container_name: freeport
+    restart: unless-stopped
+    # 把本地鉴权 token 打到日志里，`docker compose logs freeport | grep FREEPORT_TOKEN`
+    # 就能拿到。默认不要求鉴权（只绑回环），开了鉴权才需要它
+    command: ["--print-token"]
+    ports:
+      # 只发到主机回环。想让同一台机器上的其他容器连，改成 `expose` + 共享网络
+      - "127.0.0.1:8787:8787"
+    environment:
+      # `groq=gsk_xxx,cerebras=cs_yyy`：启动时写进去，之后可以删掉这行，
+      # 凭据已经落在卷里了
+      FREEPORT_ADD: ${FREEPORT_ADD:-}
+      # 压缩会丢信息，默认关；确实想省 token 再开
+      FREEPORT_COMPRESS: ${FREEPORT_COMPRESS:-0}
+      RUST_LOG: ${RUST_LOG:-info,freeport_probe=warn}
+    volumes:
+      # 配置、vault.key、secrets.json 都在这里。备份这个目录 = 备份全部凭据
+      - freeport-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/health > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  freeport-data:

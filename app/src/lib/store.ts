@@ -10,7 +10,8 @@ export type PageId =
   | 'agents'
   | 'extensions'
   | 'logs'
-  | 'settings';
+  | 'settings'
+  | 'playground';
 
 export type Lang = 'zh' | 'en';
 export type Theme = 'light' | 'dark';
@@ -19,9 +20,12 @@ interface AppState {
   page: PageId;
   lang: Lang;
   theme: Theme;
+  /** Pro 激活弹窗。放全局 store：侧边栏、设置页都能叫开它 */
+  licenseDialog: boolean;
   setPage: (p: PageId) => void;
   setLang: (l: Lang) => void;
   setTheme: (t: Theme) => void;
+  setLicenseDialog: (v: boolean) => void;
 }
 
 const savedLang = (localStorage.getItem('fp.lang') as Lang) || 'zh';
@@ -40,6 +44,7 @@ const validPages: PageId[] = [
   'extensions',
   'logs',
   'settings',
+  'playground',
 ];
 
 function initialPage(): PageId {
@@ -51,6 +56,7 @@ export const useApp = create<AppState>((set) => ({
   page: initialPage(),
   lang: savedLang,
   theme: savedTheme,
+  licenseDialog: false,
   setPage: (page) => {
     history.replaceState(null, '', `#/${page}`);
     set({ page });
@@ -63,6 +69,7 @@ export const useApp = create<AppState>((set) => ({
     localStorage.setItem('fp.theme', theme);
     set({ theme });
   },
+  setLicenseDialog: (licenseDialog) => set({ licenseDialog }),
 }));
 
 export const applyTheme = (theme: Theme) => {

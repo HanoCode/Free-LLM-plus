@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::cooldown::CooldownSnapshot;
 use crate::model::{
     Account, AppData, CatalogMeta, FeedEvent, FeedPending, Health, ModelCaps, ModelHealth, ModelInfo,
-    Provider, ProviderQuota,
+    Provider, ProviderQuota, Purpose,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +31,20 @@ pub struct GwStatus {
     #[serde(rename = "tokensOut")]
     pub tokens_out: u64,
     pub errors: u64,
+    /// 工具输出压缩是否开启
+    pub compress: bool,
+    #[serde(rename = "compressMaxToolChars")]
+    pub compress_max_tool_chars: usize,
+    /// 内容感知过滤：认出 diff / grep / 日志后按结构裁
+    #[serde(rename = "compressSmart")]
+    pub compress_smart: bool,
+    /// 同一来源每分钟的请求上限；0 = 不限
+    #[serde(rename = "identifierLimit")]
+    pub identifier_limit: u32,
+    /// 非流式响应的精确匹配缓存
+    pub cache: bool,
+    #[serde(rename = "cacheTtlSecs")]
+    pub cache_ttl_secs: u64,
     pub cooldowns: Vec<CooldownSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -100,6 +114,41 @@ pub struct GwProvider {
     pub free_tier: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "freeNote")]
     pub free_note: Option<String>,
+    /// 厂商级代理地址；空 = 跟随环境变量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+}
+
+/// 一个额度窗口的**官方**数值（不是账本里那本推测账）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwUsageWindow {
+    /// `five_hour` / `seven_day` / `seven_day_opus` …，界面自己翻译
+    pub name: String,
+    /// 已用百分比 0..100。上游给什么就是什么，不做二次加工
+    pub used_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+/// 官方额度查询结果。
+///
+/// `ok=false` 时 `note` 一定非空：查额度失败不该是一个需要单独处理的错误，
+/// 它就是「这次没拿到数字 + 一句原因」，界面照常渲染。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwUsage {
+    /// `claude` / `codex` / 其他（其他意味着这条凭据没有订阅额度）
+    pub kind: String,
+    pub ok: bool,
+    pub windows: Vec<GwUsageWindow>,
+    /// 余额（Codex 的 credits）。`None` = 没有这个概念或不限量，**不是 0**
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(rename = "checkedAt")]
+    pub checked_at: String,
 }
 
 /// 下发给 UI 的凭据视图。**不带明文**：明文只在本机密文库里。
@@ -124,6 +173,11 @@ pub struct GwAccount {
     /// OAuth token 的到期时间（unix 秒），用来显示「还剩 xx 分钟」。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// 这条凭据只接哪些用途的活。空数组 = 不限用途，界面显示「全部」。
+    ///
+    /// 始终下发（不 skip）：界面要用它渲染标签，`undefined` 与「不限」
+    /// 在 TS 里容易写错分支，空数组只有一个含义。
+    pub purposes: Vec<Purpose>,
 }
 
 impl GwAccount {
@@ -138,6 +192,7 @@ impl GwAccount {
             health: a.health.clone(),
             auth: None,
             expires_at: None,
+            purposes: a.purposes.clone(),
         }
     }
 
@@ -173,6 +228,7 @@ impl GwProvider {
             health: p.health.clone(),
             free_tier: false,
             free_note: None,
+            proxy: p.proxy.clone(),
         }
     }
 
@@ -228,6 +284,10 @@ pub struct FreeportMeta {
     /// canary 进度（连续成功次数 / 门槛）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canary: Option<u32>,
+    /// 模型组：同名模型还有哪几家也能跑（不含本行这家；只有成组才出现）。
+    /// 「5 家都能跑」这句话必须能在界面上核实，否则组语义对用户不可见。
+    #[serde(skip_serializing_if = "Option::is_none", rename = "alsoOn")]
+    pub also_on: Option<Vec<String>>,
 }
 
 /// `freeport/auto` 这类虚拟模型：不指向任何真实上游。
@@ -246,6 +306,7 @@ impl FreeportMeta {
             latency_ms: None,
             candidate: None,
             canary: None,
+            also_on: None,
         }
     }
 }
@@ -254,6 +315,19 @@ impl FreeportMeta {
 pub struct GwRouting {
     pub strategy: String,
     pub chain: Vec<String>,
+    /// 命名链：`auto:<名字>` 用。空的 profile 不会存进来。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub chains: std::collections::BTreeMap<String, Vec<String>>,
+    /// 用途 → 命名链名。
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty",
+        rename = "purposeChain"
+    )]
+    pub purpose_chain: std::collections::BTreeMap<String, String>,
+    /// 三维评分权重。始终下发（含 `enabled = false` 的默认值），
+    /// 界面才有东西可渲染——不给的话开关会显示成「未知」。
+    pub weights: crate::model::RouteWeights,
     pub cooldowns: Vec<CooldownSnapshot>,
 }
 
@@ -283,9 +357,17 @@ pub struct RoutingPatch {
     pub strategy: Option<String>,
     #[serde(default)]
     pub chain: Option<Vec<String>>,
+    /// 命名链整体替换（`None` = 不动）。传空对象即清空。
+    #[serde(default)]
+    pub chains: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    #[serde(default, rename = "purposeChain")]
+    pub purpose_chain: Option<std::collections::BTreeMap<String, String>>,
+    /// 三维权重整体替换。`None` = 不动；`enabled = false` 即退回旧公式。
+    #[serde(default)]
+    pub weights: Option<crate::model::RouteWeights>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigPatch {
     #[serde(default)]
@@ -295,6 +377,21 @@ pub struct ConfigPatch {
     /// 单次请求的总预算（毫秒）。落库后下一次请求立即生效。
     #[serde(default, rename = "requestBudgetMs")]
     pub request_budget_ms: Option<u64>,
+    /// 工具输出压缩开关
+    #[serde(default)]
+    pub compress: Option<bool>,
+    /// 超过多少字符才压。给下限，否则用户填 50 会把所有工具输出都剪掉。
+    #[serde(default)]
+    pub compress_max_tool_chars: Option<usize>,
+    /// 每个调用方标识的每分钟请求上限。0 = 关闭。
+    #[serde(default, rename = "identifierLimit")]
+    pub identifier_limit: Option<u32>,
+    /// 响应缓存开关
+    #[serde(default)]
+    pub cache: Option<bool>,
+    /// 响应缓存生存期（秒）
+    #[serde(default, rename = "cacheTtlSecs")]
+    pub cache_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,6 +416,21 @@ pub fn aggregate_models(data: &AppData) -> Vec<GwModel> {
         freeport: Some(FreeportMeta::virtual_model("按当前路由链自动选择")),
     }];
 
+    // 模型组：同一个模型 id 有几家在跑。路由把裸模型名当组处理，
+    // 这里的 `alsoOn` 就是把同一件事告诉界面，用户能核实「N 家都能跑」。
+    let mut offers: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
+    for p in data.providers.iter().filter(|p| p.enabled) {
+        for m in &p.models {
+            if data.feed.tombstoned(&p.id, &m.id) {
+                continue;
+            }
+            let e = offers.entry(m.id.as_str()).or_default();
+            if !e.iter().any(|x| x == &p.id) {
+                e.push(p.id.clone());
+            }
+        }
+    }
+
     for p in data.providers.iter().filter(|p| p.enabled) {
         for m in &p.models {
             // 已被 feed 下架的模型不再对外宣告：Gate 会拒，列出来只会让 Agent
@@ -327,17 +439,29 @@ pub fn aggregate_models(data: &AppData) -> Vec<GwModel> {
                 continue;
             }
             let health = data.model_health.get(&format!("{}:{}", p.id, m.id));
-            out.push(model_row(p, m, true, health));
+            let also = {
+                let mut v = offers.get(m.id.as_str()).cloned().unwrap_or_default();
+                v.retain(|x| x != &p.id);
+                // 去掉自己之后还剩几家 = 组里还有谁；空数组不出现（不是组）
+                (!v.is_empty()).then_some(v)
+            };
+            out.push(model_row(p, m, true, health, also.clone()));
             // 同时暴露裸 id，方便直接填 gpt-4o-mini 这类名字
             if !out.iter().any(|x| x.id == m.id) {
-                out.push(model_row(p, m, false, health));
+                out.push(model_row(p, m, false, health, also));
             }
         }
     }
     out
 }
 
-fn model_row(p: &Provider, m: &ModelInfo, prefixed: bool, health: Option<&ModelHealth>) -> GwModel {
+fn model_row(
+    p: &Provider,
+    m: &ModelInfo,
+    prefixed: bool,
+    health: Option<&ModelHealth>,
+    also_on: Option<Vec<String>>,
+) -> GwModel {
     let measured = health.map(|h| h.caps).unwrap_or_default();
     let caps = m.caps.merge_measured(measured);
     GwModel {
@@ -371,6 +495,7 @@ fn model_row(p: &Provider, m: &ModelInfo, prefixed: bool, health: Option<&ModelH
             } else {
                 None
             },
+            also_on,
         }),
     }
 }
@@ -469,6 +594,17 @@ pub struct GwKey {
     pub rpm_limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "dailyLimit")]
     pub daily_req_limit: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "dailyTokenLimit"
+    )]
+    pub daily_token_limit: Option<u64>,
+    /// 始终下发（不 skip）：空数组只有一个含义「不限」，
+    /// 省成 `undefined` 会让界面多一条「到底是没配还是不限」的分支。
+    #[serde(rename = "allowedModels")]
+    pub allowed_models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "expiresAt")]
+    pub expires_at: Option<String>,
     pub enabled: bool,
     #[serde(rename = "createdAt")]
     pub created_at: String,
@@ -477,6 +613,9 @@ pub struct GwKey {
     /// 今日已用请求数（跨天读作 0）
     #[serde(rename = "usedToday")]
     pub used_today: u32,
+    /// 今日已用 token（跨天读作 0）
+    #[serde(rename = "usedTokensToday")]
+    pub used_tokens_today: u64,
 }
 
 impl GwKey {
@@ -487,22 +626,31 @@ impl GwKey {
         } else {
             0
         };
+        let used_tokens = if k.usage.day == today {
+            k.usage.day_tokens
+        } else {
+            0
+        };
         Self {
             id: k.id.clone(),
             name: k.name.clone(),
             prefix: k.prefix.clone(),
             rpm_limit: k.rpm_limit,
             daily_req_limit: k.daily_req_limit,
+            daily_token_limit: k.daily_token_limit,
+            allowed_models: k.allowed_models.clone(),
+            expires_at: k.expires_at.clone(),
             enabled: k.enabled,
             created_at: k.created_at.clone(),
             last_used_at: k.last_used_at.clone(),
             used_today: used,
+            used_tokens_today: used_tokens,
         }
     }
 }
 
 /// 新建 key 的入参
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyInput {
     pub name: String,
@@ -510,6 +658,15 @@ pub struct KeyInput {
     pub rpm_limit: Option<u32>,
     #[serde(default)]
     pub daily_limit: Option<u32>,
+    /// 每日 token 上限（输入 + 输出）
+    #[serde(default, rename = "dailyTokenLimit")]
+    pub daily_token_limit: Option<u64>,
+    /// 模型白名单，空 = 不限
+    #[serde(default, rename = "allowedModels")]
+    pub allowed_models: Vec<String>,
+    /// RFC3339 过期时刻
+    #[serde(default, rename = "expiresAt")]
+    pub expires_at: Option<String>,
 }
 
 /// 新建结果：明文只在这里出现一次。
@@ -632,6 +789,9 @@ pub struct AccountInput {
     pub name: Option<String>,
     #[serde(default)]
     pub quota: Option<ProviderQuota>,
+    /// 追加时就能指定用途，省得「先加再编辑」两步。空 = 不限用途。
+    #[serde(default)]
+    pub purposes: Vec<Purpose>,
 }
 
 /// 改一条凭据的名字 / 开关 / 限额。`None` 表示不动。
@@ -647,6 +807,9 @@ pub struct AccountPatch {
     pub quota: Option<ProviderQuota>,
     #[serde(default, rename = "clearQuota")]
     pub clear_quota: bool,
+    /// 用途标签。传空数组 = 清成「不限用途」，能表达，所以不需要 clear 开关。
+    #[serde(default)]
+    pub purposes: Option<Vec<Purpose>>,
 }
 
 /* ── 目录 feed ────────────────────────────────────── */
@@ -671,6 +834,13 @@ pub struct GwFeed {
     /// 纯展示用：说明这份目录是服务端按哪个档下发的，客户端不据此拦功能。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_tier: Option<String>,
+    /// 本次同步实际应用了哪些字段包（`quota.intel` 之类）。
+    /// 同样是「服务端给了什么」，不是「本机够不够档」。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub served_feats: Vec<String>,
+    /// 服务端列了但没应用的字段包与原因，界面照实说「这次少了什么」
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub feats_skipped: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_check_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -710,18 +880,41 @@ pub struct FeedPatch {
 /* ── 登录（设备码） ─────────────────────────────── */
 
 /// 发起登录后给界面的东西：把用户要做的事说清楚，别让人自己拼 URL。
+///
+/// 有两条完全不同的路子，界面必须按 `kind` 分开渲染——混在一个表单里
+/// 会让用户不知道该点哪个按钮：
+///
+/// - `device`：设备码。给一个短码 + 网址，用户在浏览器里输码。
+/// - `pkce`：授权码。直接给一条授权 URL，点开、登录、回调自动完成。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GwLoginStart {
+    /// `device` / `pkce`
+    pub kind: String,
     pub login_id: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verification_uri_complete: Option<String>,
-    pub interval: u64,
     pub expires_in: u64,
     /// 「在浏览器打开 X 并输入 Y」——界面直接显示这句
     pub instruction: String,
+
+    /* 设备码流程 */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u64>,
+
+    /* 授权码流程 */
+    /// 点开就走的授权地址
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// 授权完成后浏览器会跳回的地址。界面要用它做「手工粘贴」的提示。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+    /// 回环端口是否就位。`false` = 自动收回调不可能，只能手工粘贴。
+    pub auto: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -758,6 +951,52 @@ impl GwLoginState {
     }
 }
 
+/// 近期观测：把内存日志环折成「快不快、花了多少、谁在烧」。
+///
+/// 与 `/v1/freeport/inspect` 的 `window` 段同源——两边都调
+/// `observe::summarize` / `observe::bucket`，只是这里给桌面端直接返回结构体。
+/// **不要在这里另算一套**：口径一旦分叉，界面和 MCP 会各说一套数字。
+#[derive(Debug, Clone, Serialize)]
+pub struct GwObserved {
+    /// 统计窗口的起点（毫秒）。目前固定 24h，由调用方决定。
+    #[serde(rename = "sinceMs")]
+    pub since_ms: i64,
+    pub requests: usize,
+    pub ok: usize,
+    pub errors: usize,
+    /// 只统计成功请求的耗时：超时的 90s 会把分位数带偏
+    #[serde(rename = "p50Ms")]
+    pub p50_ms: Option<u64>,
+    #[serde(rename = "p95Ms")]
+    pub p95_ms: Option<u64>,
+    #[serde(rename = "maxMs")]
+    pub max_ms: Option<u64>,
+    #[serde(rename = "tokensIn")]
+    pub tokens_in: u64,
+    #[serde(rename = "tokensOut")]
+    pub tokens_out: u64,
+    /// 按目录价折算的美元
+    #[serde(rename = "costUsd")]
+    pub cost_usd: f64,
+    /// 目录里没有价格的请求数：这部分钱是「不知道」，不是 0
+    #[serde(rename = "costUnknown")]
+    pub cost_unknown: usize,
+    #[serde(rename = "byProvider")]
+    pub by_provider: Vec<GwBucket>,
+    #[serde(rename = "byPurpose")]
+    pub by_purpose: Vec<GwBucket>,
+}
+
+/// 一维分桶：请求数与成功请求的平均耗时。
+#[derive(Debug, Clone, Serialize)]
+pub struct GwBucket {
+    /// 厂商 id 或用途名
+    pub key: String,
+    pub requests: usize,
+    #[serde(rename = "avgOkMs")]
+    pub avg_ok_ms: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +1011,7 @@ mod tests {
             key_mask: "fp-****".into(),
             enabled: true,
             added_at: String::new(),
+            proxy: None,
             models: ids
                 .iter()
                 .map(|id| ModelInfo {
@@ -793,6 +1033,7 @@ mod tests {
                 added_at: String::new(),
                 quota: None,
                 health: None,
+                purposes: Vec::new(),
             }],
             health: Default::default(),
         }
@@ -819,5 +1060,74 @@ mod tests {
 
         let ids: Vec<String> = aggregate_models(&data).into_iter().map(|m| m.id).collect();
         assert!(ids.contains(&"acme:gone".to_string()));
+    }
+
+    /// 前端 `GwObserved` 逐字依赖这些键名。少一个 rename 就会变成
+    /// `undefined`——不报错，只是概览页安静地显示空白（额度条 NaN 那次就是这么来的）。
+    #[test]
+    fn observed_keeps_the_field_names_the_ui_reads() {
+        let o = GwObserved {
+            since_ms: 1,
+            requests: 2,
+            ok: 1,
+            errors: 1,
+            p50_ms: Some(10),
+            p95_ms: None,
+            max_ms: Some(20),
+            tokens_in: 3,
+            tokens_out: 4,
+            cost_usd: 0.5,
+            cost_unknown: 1,
+            by_provider: vec![GwBucket {
+                key: "groq".into(),
+                requests: 2,
+                avg_ok_ms: 10,
+            }],
+            by_purpose: Vec::new(),
+        };
+        let v = serde_json::to_value(&o).unwrap();
+        for k in [
+            "sinceMs", "requests", "ok", "errors", "p50Ms", "p95Ms", "maxMs", "tokensIn",
+            "tokensOut", "costUsd", "costUnknown", "byProvider", "byPurpose",
+        ] {
+            assert!(v.get(k).is_some(), "缺字段 {k}");
+        }
+        assert_eq!(v["byProvider"][0]["avgOkMs"], 10);
+        // null 要留下来：前端靠它区分「样本不足」与 0
+        assert!(v["p95Ms"].is_null());
+    }
+
+    /// 模型组要在模型列表里可见：同名模型在 ≥2 家时带 `alsoOn`，
+    /// 只有一家时不带（那时「哪一家」本身就是全部信息）。
+    /// 键名是 camelCase，前端逐字读。
+    #[test]
+    fn model_groups_show_also_on() {
+        let mut data = AppData::default();
+        let mut other = provider_with_models(&["shared", "solo"]);
+        other.id = "other".into();
+        for m in other.models.iter_mut() {
+            m.owned_by = "other".into();
+        }
+        data.providers = vec![provider_with_models(&["shared"]), other];
+
+        let rows = aggregate_models(&data);
+        let acme_shared = rows
+            .iter()
+            .find(|m| m.id == "acme:shared")
+            .expect("acme:shared 要在列表里");
+        let meta = acme_shared.freeport.as_ref().unwrap();
+        assert_eq!(
+            meta.also_on.as_deref(),
+            Some(&["other".to_string()][..]),
+            "两家都有 shared，要列出另一家"
+        );
+        let other_solo = rows.iter().find(|m| m.id == "other:solo").unwrap();
+        assert!(
+            other_solo.freeport.as_ref().unwrap().also_on.is_none(),
+            "只有一家的模型不是组"
+        );
+        // camelCase 键名锁
+        let v = serde_json::to_value(acme_shared).unwrap();
+        assert!(v["freeport"]["alsoOn"].is_array());
     }
 }

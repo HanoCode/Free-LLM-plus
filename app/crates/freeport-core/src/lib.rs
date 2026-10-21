@@ -6,12 +6,15 @@
 
 pub mod affinity;
 pub mod cooldown;
+pub mod digest;
 pub mod dto;
 pub mod error;
 pub mod model;
+pub mod observe;
 pub mod presets;
 pub mod quota;
 pub mod route;
+pub mod score;
 
 pub use affinity::{Affinity, Stick};
 pub use cooldown::{CooldownSnapshot, Cooldowns};
@@ -19,5 +22,7 @@ pub use error::{classify, ErrorClass, Scope};
 pub use model::*;
 pub use quota::{Ledger, WindowKind};
 pub use route::{
-    canary_factor, plan, stick_to_front, weight_factors, weight_of, Candidate, Plan, Rejected, Swrr,
+    blend_score, canary_factor, intelligence_factor, plan, reliability_factor, speed_factor,
+    stick_to_front, weight_factors, weight_of, weight_of_model, Candidate, Plan, Rejected,
+    Strategy, Swrr,
 };

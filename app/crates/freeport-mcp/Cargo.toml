@@ -1,0 +1,18 @@
+[package]
+name = "freeport-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freeport 的 MCP server：让 agent 自省可用模型、链路与失败原因（stdio，只读）。"
+
+[dependencies]
+freeport-core = { path = "../freeport-core" }
+freeport-gateway = { path = "../freeport-gateway" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-std", "io-util"] }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+# e2e 要真的往网关发一单，才能验证「MCP 进程看得见活网关的日志」
+reqwest = { workspace = true }

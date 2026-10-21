@@ -127,6 +127,7 @@ async fn main() -> Result<(), String> {
             models: Vec::new(),
             quota: None,
             accounts: Vec::new(),
+            proxy: None,
             health: Default::default(),
         },
         &cred,

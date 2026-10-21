@@ -12,6 +12,7 @@ pub mod cookie;
 pub mod copilot;
 pub mod device;
 pub mod pkce;
+pub mod sub;
 
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,11 @@ pub struct TokenSet {
     /// 上游账号标识（登录名、用户名），用于界面上区分「这是谁的号」
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// 上游**租户/工作区**标识。和 `account` 不是一回事：一个是「谁」，
+    /// 一个是「哪个组织下的额度」。有些厂商把它当请求头（Codex 的
+    /// `chatgpt-account-id` 就在这里），缺了整个号都调不通。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl TokenSet {

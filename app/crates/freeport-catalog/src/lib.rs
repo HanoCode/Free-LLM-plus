@@ -14,7 +14,7 @@ pub mod types;
 
 use std::time::Duration;
 
-pub use feed::{Applied, Manifest, PatchFile, PatchRef, Poll, PollCfg, Reject, Snapshot};
+pub use feed::{Applied, FeatRef, Manifest, PatchFile, PatchRef, Poll, PollCfg, Reject, Snapshot};
 pub use types::{
     model_is_free, Catalog, CatalogModel, CatalogProvider, Quota, MODELS_DEV_URL,
 };
