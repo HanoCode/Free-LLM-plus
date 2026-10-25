@@ -469,9 +469,7 @@ async fn updater_check(app: tauri::AppHandle) -> Result<serde_json::Value, Strin
 /// 必须由用户在设置页显式点「安装」才进来——不弹窗、不静默升级。
 #[tauri::command]
 async fn updater_install(app: tauri::AppHandle) -> Result<bool, String> {
-    use tauri_plugin_updater::UpdaterExt as _;
-
-    let mut update = use_updater(&app)?
+    let update = use_updater(&app)?
         .check()
         .await
         .map_err(|e| format!("更新通道不可用：{e}"))?

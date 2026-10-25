@@ -21,8 +21,7 @@
 //! - **默认关**：这会把请求元数据发往网络，必须用户显式开并填端点。
 //!   span 里只有元数据，没有 prompt / 回复内容。
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
