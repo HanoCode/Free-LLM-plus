@@ -50,7 +50,7 @@ export function QuotaPanel({ quota }: { quota: GwQuota[] }) {
     <div className="card" style={{ marginBottom: 14 }}>
       <div className="card-head">
         <h3>
-          <T zh="额度账本" en="Quota ledger" />
+          <T zh="额度记录" en="Quota" />
         </h3>
         <span className="sub">
           <T
@@ -89,7 +89,7 @@ export function QuotaPanel({ quota }: { quota: GwQuota[] }) {
                 {tracked.length === 0 ? (
                   <T zh="仅记账" en="track only" />
                 ) : (
-                  <T zh={`余量 ${Math.round(q.headroom * 100)}%`} en={`${Math.round(q.headroom * 100)}% left`} />
+                  <T zh={`剩余 ${Math.round(q.headroom * 100)}%`} en={`${Math.round(q.headroom * 100)}% left`} />
                 )}
               </span>
             </div>

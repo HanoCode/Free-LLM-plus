@@ -1,4 +1,17 @@
-import { Activity, ArrowRight, Gauge, Radar, ShieldCheck, Zap } from 'lucide-react';
+import { useState } from 'react';
+import {
+  Activity,
+  ArrowRight,
+  Check,
+  ChevronDown,
+  Gauge,
+  KeyRound,
+  MessageSquare,
+  Plug,
+  Radar,
+  ShieldCheck,
+  Zap,
+} from 'lucide-react';
 import { T } from '../lib/i18n';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
@@ -37,9 +50,12 @@ function money(usd: number): string {
   return usd < 0.01 ? usd.toFixed(4) : usd.toFixed(2);
 }
 
+/** 三步任务卡的收起状态。用户明确收起后就不再打扰，存本地。 */
+const TASKS_HIDDEN_KEY = 'fp.tasks.hidden';
+
 export function Overview() {
   const { setPage } = useApp();
-  const { status, providers, models, logs, patrol, quota, digest, observed, runPatrol } =
+  const { status, providers, models, logs, patrol, quota, digest, observed, agents, runPatrol } =
     useGateway();
 
   const connected = providers.filter((p) => p.hasKey);
@@ -51,6 +67,22 @@ export function Overview() {
   const rows = models.filter((m) => m.freeport?.upstreamModel);
   const ready = rows.filter((m) => m.freeport?.health === 'healthy').length;
   const addr = `http://${status?.bind ?? '127.0.0.1'}:${status?.port ?? 8787}/v1`;
+
+  // ── 三步任务卡：只依据真实状态，不编进度 ──
+  // 1) 接了模型源：有任一可用凭据
+  // 2) 接上工具：有 Agent 已注入；或已经有请求进来（说明已经在用）
+  // 3) 发出过请求：日志环里有记录
+  const step1 = connected.length > 0;
+  const injected = agents.filter((a) => a.state === 'injected').length;
+  const step2 = injected > 0 || logs.length > 0;
+  const step3 = logs.length > 0;
+  const [tasksHidden, setTasksHidden] = useState(
+    () => localStorage.getItem(TASKS_HIDDEN_KEY) === '1',
+  );
+  /** 巡检控制台默认折叠：它是运维工具，不是首屏内容 */
+  const [patrolOpen, setPatrolOpen] = useState(
+    () => localStorage.getItem('fp.patrol.open') === '1',
+  );
 
   const requests = status?.requests24h ?? 0;
   const tokens = (status?.tokensIn ?? 0) + (status?.tokensOut ?? 0);
@@ -101,7 +133,7 @@ export function Overview() {
         </div>
         <div className="addr-pill">
           <span>{addr}</span>
-          <CopyBtn value={addr} label="" />
+          <CopyBtn value={addr} label="" tip="复制网关地址 / Copy address" />
         </div>
         <div className="hero-stats">
           <div className="hero-stat">
@@ -124,6 +156,125 @@ export function Overview() {
           </div>
         </div>
       </div>
+
+      {/* 三步任务卡：新用户的主路。三步全做完自动收成一行，也可手动收起 */}
+      {(!step1 || !step2 || !step3) && !tasksHidden && (
+        <div className="card tasks-card" style={{ marginBottom: 14 }}>
+          <div className="card-head">
+            <h3>
+              <T zh="开始使用" en="Get started" />
+            </h3>
+            <span className="sub">
+              <T zh="三步就能用起来" en="three steps to your first reply" />
+            </span>
+            <button
+              className="btn ghost sm"
+              style={{ marginLeft: 'auto' }}
+              aria-label="collapse"
+              onClick={() => {
+                localStorage.setItem(TASKS_HIDDEN_KEY, '1');
+                setTasksHidden(true);
+              }}
+            >
+              <T zh="收起" en="Hide" />
+              <ChevronDown size={12} />
+            </button>
+          </div>
+          <div className="card-body" style={{ padding: '10px 16px' }}>
+            <div className={`task-row ${step1 ? 'done' : ''}`}>
+              <span className="task-dot">
+                <Check size={11} />
+              </span>
+              <div className="task-txt">
+                <b>
+                  <T zh="接一个模型源" en="Connect a model source" />
+                </b>
+                <span>
+                  {step1 ? (
+                    <T
+                      zh={`${connected.length} 个厂商 · ${credentials} 条凭据已就绪`}
+                      en={`${connected.length} providers · ${credentials} credentials ready`}
+                    />
+                  ) : (
+                    <T
+                      zh="粘一个免费 Key，或直接启用免 Key 的匿名源"
+                      en="paste a free API key, or enable a keyless source"
+                    />
+                  )}
+                </span>
+              </div>
+              {!step1 && (
+                <button className="btn primary sm" onClick={() => setPage('connect')}>
+                  <KeyRound size={12} />
+                  <T zh="去接入" en="Connect" />
+                </button>
+              )}
+            </div>
+            <div className={`task-row ${step2 ? 'done' : ''}`}>
+              <span className="task-dot">
+                <Check size={11} />
+              </span>
+              <div className="task-txt">
+                <b>
+                  <T zh="接到你正在用的工具" en="Plug into your tools" />
+                </b>
+                <span>
+                  {step2 ? (
+                    injected > 0 ? (
+                      <T zh={`已注入 ${injected} 个 Agent`} en={`${injected} agents injected`} />
+                    ) : (
+                      <T zh="已有请求经网关转出" en="requests already flowing through" />
+                    )
+                  ) : (
+                    <T
+                      zh="一键注入 Claude Code / Codex 等，或复制网关地址手动接入"
+                      en="inject Claude Code / Codex in one click, or copy the gateway address"
+                    />
+                  )}
+                </span>
+              </div>
+              {!step2 && (
+                <>
+                  <CopyBtn value={addr} label="" tip="复制网关地址 / Copy address" />
+                  <button className="btn primary sm" onClick={() => setPage('agents')}>
+                    <Plug size={12} />
+                    <T zh="一键注入" en="Inject" />
+                  </button>
+                </>
+              )}
+            </div>
+            <div className={`task-row ${step3 ? 'done' : ''}`}>
+              <span className="task-dot">
+                <Check size={11} />
+              </span>
+              <div className="task-txt">
+                <b>
+                  <T zh="发第一条消息" en="Send your first message" />
+                </b>
+                <span>
+                  {step3 ? (
+                    <T zh="链路已通，对话会出现在下方" en="pipeline works — chats show up below" />
+                  ) : (
+                    <T
+                      zh="在试验场直接对话，验证整条链路"
+                      en="chat in the Playground to verify the pipeline"
+                    />
+                  )}
+                </span>
+              </div>
+              {!step3 && (
+                <button
+                  className="btn primary sm"
+                  onClick={() => setPage(step1 ? 'playground' : 'connect')}
+                >
+                  <MessageSquare size={12} />
+                  <T zh="打开试验场" en="Open Playground" />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {digest && (
         <div className="card" style={{ marginBottom: 14 }}>
@@ -367,72 +518,114 @@ export function Overview() {
 
       <QuotaPanel quota={quota} />
 
+      {/* 巡检控制台：运维工具，默认折叠成一行；展开后才是完整控制台 */}
       <div className="card" style={{ marginBottom: 14 }}>
-        <div className="card-head">
+        <div
+          className="card-head"
+          style={{ cursor: 'pointer', userSelect: 'none' }}
+          onClick={() => {
+            const v = !patrolOpen;
+            setPatrolOpen(v);
+            localStorage.setItem('fp.patrol.open', v ? '1' : '0');
+          }}
+        >
           <h3>
             <T zh="巡检" en="Patrol" />
           </h3>
           <span className="sub">
-            {patrol?.enabled ? (
-              <T
-                zh={`热 ${patrol.hotHours}h / 冷 ${patrol.coldHours}h · 每日 ${patrol.sweepAt} 全量`}
-                en={`hot ${patrol.hotHours}h / cold ${patrol.coldHours}h · full sweep ${patrol.sweepAt}`}
-              />
-            ) : (
-              <T zh="已关闭" en="disabled" />
-            )}
+            {patrol?.enabled
+              ? patrol?.dueNow
+                ? `${patrol.dueNow} 个模型待体检`
+                : '自动巡检中，无需处理'
+              : '已关闭'}
           </span>
-          <button
-            className="btn ghost sm"
-            style={{ marginLeft: 'auto' }}
-            onClick={() => void probe(false)}
-            disabled={(patrol?.remaining ?? 0) === 0}
+          <span
+            style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}
+            onClick={(e) => e.stopPropagation()}
           >
-            <T zh="立即巡检" en="Run now" />
-          </button>
-          <button className="btn ghost sm" onClick={() => void probe(true)}>
-            <T zh="全量体检" en="Full sweep" />
-          </button>
-          <button className="btn ghost sm" onClick={() => setPage('settings')}>
-            <T zh="设置" en="Settings" />
-            <ArrowRight size={12} />
-          </button>
-        </div>
-        <div className="src-row">
-          <span className="nm">
-            <T zh="到期队列" en="Queue" />
-          </span>
-          <span className="meta">
-            <T
-              zh={`${patrol?.dueNow ?? 0} 个模型到期，今日还剩 ${patrol?.remaining ?? 0} 次预算`}
-              en={`${patrol?.dueNow ?? 0} models due, ${patrol?.remaining ?? 0} probes left today`}
+            {patrolOpen && (
+              <>
+                <button
+                  className="btn ghost sm"
+                  onClick={() => void probe(false)}
+                  disabled={(patrol?.remaining ?? 0) === 0}
+                >
+                  <T zh="立即巡检" en="Run now" />
+                </button>
+                <button className="btn ghost sm" onClick={() => void probe(true)}>
+                  <T zh="全量体检" en="Full sweep" />
+                </button>
+                <button className="btn ghost sm" onClick={() => setPage('settings')}>
+                  <T zh="设置" en="Settings" />
+                  <ArrowRight size={12} />
+                </button>
+              </>
+            )}
+            <ChevronDown
+              size={14}
+              style={{
+                alignSelf: 'center',
+                transform: patrolOpen ? 'rotate(180deg)' : undefined,
+                transition: 'transform .15s',
+              }}
             />
           </span>
-          <span className="right">
-            <Badge tone={(patrol?.remaining ?? 0) > 0 ? 'ok' : 'warn'}>
-              {patrol?.usedToday ?? 0} / {patrol?.budgetToday ?? 0}
-            </Badge>
-            <span className="ev-time">{hhmm(patrol?.lastRunAt)}</span>
-          </span>
         </div>
-        <div className="src-row">
-          <span className="nm">
-            <T zh="让路规则" en="Yielding" />
-          </span>
-          <span className="meta">
-            <T
-              zh="有真实请求在途时巡检暂停；预算按日配额 1% 计算，下限 60 上限 800"
-              en="Patrol pauses while real requests are in flight; budget is 1% of daily quota, clamped to 60–800"
-            />
-          </span>
-          <span className="right">
-            <Status tone={(patrol?.inflight ?? 0) > 0 ? 'warn' : 'ok'}>
-              {(patrol?.inflight ?? 0) > 0
-                ? `${patrol?.inflight} 个请求在途`
-                : 'idle'}
-            </Status>
-          </span>
-        </div>
+        {patrolOpen && (
+          <>
+            <div className="src-row">
+              <span className="nm">
+                <T zh="节奏" en="Cadence" />
+              </span>
+              <span className="meta">
+                {patrol?.enabled ? (
+                  <T
+                    zh={`热 ${patrol.hotHours}h / 冷 ${patrol.coldHours}h · 每日 ${patrol.sweepAt} 全量`}
+                    en={`hot ${patrol.hotHours}h / cold ${patrol.coldHours}h · full sweep ${patrol.sweepAt}`}
+                  />
+                ) : (
+                  <T zh="已关闭" en="disabled" />
+                )}
+              </span>
+              <span className="right" />
+            </div>
+            <div className="src-row">
+              <span className="nm">
+                <T zh="到期队列" en="Queue" />
+              </span>
+              <span className="meta">
+                <T
+                  zh={`${patrol?.dueNow ?? 0} 个模型到期，今日还剩 ${patrol?.remaining ?? 0} 次预算`}
+                  en={`${patrol?.dueNow ?? 0} models due, ${patrol?.remaining ?? 0} probes left today`}
+                />
+              </span>
+              <span className="right">
+                <Badge tone={(patrol?.remaining ?? 0) > 0 ? 'ok' : 'warn'}>
+                  {patrol?.usedToday ?? 0} / {patrol?.budgetToday ?? 0}
+                </Badge>
+                <span className="ev-time">{hhmm(patrol?.lastRunAt)}</span>
+              </span>
+            </div>
+            <div className="src-row">
+              <span className="nm">
+                <T zh="让路规则" en="Yielding" />
+              </span>
+              <span className="meta">
+                <T
+                  zh="有真实请求在途时巡检暂停；免费版每天 5 次探针，Pro 按日配额 1% 自动扩展至 2400"
+                  en="Patrol pauses while real requests are in flight; 5 probes/day on free, Pro scales to 2400"
+                />
+              </span>
+              <span className="right">
+                <Status tone={(patrol?.inflight ?? 0) > 0 ? 'warn' : 'ok'}>
+                  {(patrol?.inflight ?? 0) > 0
+                    ? `${patrol?.inflight} 个请求在途`
+                    : 'idle'}
+                </Status>
+              </span>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="card">
@@ -454,16 +647,20 @@ export function Overview() {
               <th style={{ width: 78 }}>
                 <T zh="时间" en="TIME" />
               </th>
-              <th>MODEL</th>
-              <th style={{ width: 110 }}>PROVIDER</th>
+              <th>
+                <T zh="模型" en="MODEL" />
+              </th>
+              <th style={{ width: 110 }}>
+                <T zh="厂商" en="PROVIDER" />
+              </th>
               <th style={{ width: 86 }}>
                 <T zh="状态" en="STATUS" />
               </th>
               <th style={{ width: 80 }} className="right">
-                TOKENS
+                <T zh="Token" en="TOKENS" />
               </th>
               <th style={{ width: 76 }} className="right">
-                TTFB
+                <T zh="首字延迟" en="TTFB" />
               </th>
             </tr>
           </thead>

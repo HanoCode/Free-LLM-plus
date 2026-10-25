@@ -1,27 +1,28 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Check, ExternalLink, RefreshCw, Radar, KeyRound, Radio, TriangleAlert, ShieldCheck } from 'lucide-react';
-import { T } from '../lib/i18n';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Check, ChevronDown, ExternalLink, RefreshCw, Radar, KeyRound, Radio, TriangleAlert, ShieldCheck } from 'lucide-react';
+import { T, tx, useLang } from '../lib/i18n';
 import { Badge, Status, TierBadge, toast } from '../components/ui';
 import { BrandLogo } from '../components/BrandLogo';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
 import type { GwCatalogProvider, GwFeed } from '../lib/bridge';
 
-function ago(iso?: string): string {
+function ago(iso: string | undefined, lang: 'zh' | 'en'): string {
   if (!iso) return '—';
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return '—';
   const min = Math.max(0, Math.round((Date.now() - t) / 60000));
-  if (min < 1) return '刚刚';
-  if (min < 60) return `${min} 分钟前`;
+  if (min < 1) return tx(lang, '刚刚', 'just now');
+  if (min < 60) return tx(lang, `${min} 分钟前`, `${min} min ago`);
   const h = Math.round(min / 60);
-  if (h < 24) return `${h} 小时前`;
-  return `${Math.round(h / 24)} 天前`;
+  if (h < 24) return tx(lang, `${h} 小时前`, `${h} h ago`);
+  return tx(lang, `${Math.round(h / 24)} 天前`, `${Math.round(h / 24)} d ago`);
 }
 
 export function Discover() {
   const { catalog, providers, refreshCatalog, addProvider, feed } = useGateway();
   const { setPage } = useApp();
+  const lang = useLang();
   const [scanning, setScanning] = useState(false);
   const [adding, setAdding] = useState<GwCatalogProvider | null>(null);
 
@@ -51,10 +52,14 @@ export function Discover() {
     try {
       const fresh = await refreshCatalog();
       toast(
-        `目录已更新：${fresh.meta.providers} 家厂商 · ${fresh.meta.models} 个模型 · ${fresh.meta.freeModels} 个零价`,
+        tx(
+          lang,
+          `目录已更新：${fresh.meta.providers} 家厂商 · ${fresh.meta.models} 个模型 · ${fresh.meta.freeModels} 个零价`,
+          `Catalog updated: ${fresh.meta.providers} providers · ${fresh.meta.models} models · ${fresh.meta.freeModels} zero-priced`,
+        ),
       );
     } catch (e) {
-      toast(`同步失败：${e instanceof Error ? e.message : String(e)}`);
+      toast(tx(lang, `同步失败：${e instanceof Error ? e.message : String(e)}`, `Sync failed: ${e instanceof Error ? e.message : String(e)}`));
     } finally {
       setScanning(false);
     }
@@ -70,9 +75,9 @@ export function Discover() {
         apiKey: '',
         tier: 'B',
       });
-      toast(`已启用 ${p.name}：${res.modelCount} 个模型 / enabled`);
+      toast(tx(lang, `已启用 ${p.name}：${res.modelCount} 个模型`, `Enabled ${p.name}: ${res.modelCount} models`));
     } catch (e) {
-      toast(`启用失败：${e instanceof Error ? e.message : String(e)}`);
+      toast(tx(lang, `启用失败：${e instanceof Error ? e.message : String(e)}`, `Enable failed: ${e instanceof Error ? e.message : String(e)}`));
     }
   };
 
@@ -93,7 +98,7 @@ export function Discover() {
         <div className="head-actions">
           <span className="badge info">
             {meta?.fetchedAt ? (
-              <T zh={`同步于 ${ago(meta.fetchedAt)}`} en={`synced ${ago(meta.fetchedAt)}`} />
+              <T zh={`同步于 ${ago(meta.fetchedAt, lang)}`} en={`synced ${ago(meta.fetchedAt, lang)}`} />
             ) : (
               <T zh="仅内置基线" en="baseline only" />
             )}
@@ -136,7 +141,7 @@ export function Discover() {
                 {meta?.source === 'models.dev' ? '200 OK' : '未同步'}
               </Status>
             )}
-            <span className="ev-time">{ago(meta?.fetchedAt)}</span>
+            <span className="ev-time">{ago(meta?.fetchedAt, lang)}</span>
           </span>
         </div>
         <div className="src-row">
@@ -166,7 +171,7 @@ export function Discover() {
                 <T zh="未配置" en="not set" />
               </Status>
             )}
-            <span className="ev-time">{feed?.configured ? ago(feed.lastCheckAt) : '—'}</span>
+            <span className="ev-time">{feed?.configured ? ago(feed.lastCheckAt, lang) : '—'}</span>
           </span>
         </div>
       </div>
@@ -192,7 +197,7 @@ export function Discover() {
             tier={p.tier}
             meta_zh={`${p.models} 个模型 · ${p.freeModels} 个零价\n${p.freeNote ?? '匿名公开端点'}`}
             meta_en={`${p.models} models · ${p.freeModels} free\n${p.freeNote ?? 'anonymous endpoint'}`}
-            foot={p.quota?.rpd ? `${p.quota.rpm ?? '—'} RPM / ${p.quota.rpd} RPD` : 'unverified'}
+            foot={p.quota?.rpd ? `${p.quota.rpm ?? '—'} RPM / ${p.quota.rpd} RPD` : <T zh="未核验" en="unverified" />}
           >
             <button className="btn primary sm" onClick={() => void enable(p)}>
               <T zh="启用" en="Enable" />
@@ -220,7 +225,13 @@ export function Discover() {
             tier={p.tier}
             meta_zh={`${p.freeModels} 个零价模型 · 共 ${p.models} 个\n${p.freeNote ?? '官方免费档'}`}
             meta_en={`${p.freeModels} zero-price · ${p.models} total\n${p.freeNote ?? 'official free tier'}`}
-            foot={p.quota?.rpd ? `${p.quota.rpm ?? '—'} RPM / ${p.quota.rpd} RPD` : 'quota unknown'}
+            foot={
+              p.quota?.rpd ? (
+                `${p.quota.rpm ?? '—'} RPM / ${p.quota.rpd} RPD`
+              ) : (
+                <T zh="额度未知" en="quota unknown" />
+              )
+            }
           >
             {p.docs && (
               <button
@@ -247,8 +258,12 @@ export function Discover() {
         <table>
           <thead>
             <tr>
-              <th>PROVIDER</th>
-              <th style={{ width: 150 }}>SOURCE</th>
+              <th>
+                <T zh="厂商" en="PROVIDER" />
+              </th>
+              <th style={{ width: 150 }}>
+                <T zh="来源" en="SOURCE" />
+              </th>
               <th style={{ width: 150 }}>
                 <T zh="状态" en="STATE" />
               </th>
@@ -339,7 +354,7 @@ function DiscCard({
   tier: string;
   meta_zh: string;
   meta_en: string;
-  foot: string;
+  foot: ReactNode;
   children: React.ReactNode;
 }) {
   return (
@@ -427,11 +442,15 @@ function ConnectDialog({
         </p>
 
         <div className="field">
-          <label>BASE URL</label>
+          <label>
+            <T zh="接口地址" en="BASE URL" />
+          </label>
           <input value={provider.api ?? ''} disabled />
         </div>
         <div className="field">
-          <label>API KEY</label>
+          <label>
+            <T zh="API 密钥" en="API KEY" />
+          </label>
           <input
             type="password"
             autoFocus
@@ -480,12 +499,15 @@ const EVENT_LABEL: Record<string, { zh: string; en: string; tone: string }> = {
 };
 
 function FeedCard({ feed }: { feed: GwFeed | null }) {
+  const lang = useLang();
   const { setFeed, checkFeed, applyFeed } = useGateway();
   const [url, setUrl] = useState('');
   const [pubkey, setPubkey] = useState('');
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState<'' | 'save' | 'check' | 'apply'>('');
   const [synced, setSynced] = useState(false);
+  /** 目录源设置默认折叠：普通用户只需要知道「模型目录自动更新」 */
+  const [open, setOpen] = useState(() => localStorage.getItem('fp.feed.open') === '1');
 
   // 只在第一次拿到状态时回填输入框，之后不覆盖用户正在输入的内容
   useEffect(() => {
@@ -545,17 +567,71 @@ function FeedCard({ feed }: { feed: GwFeed | null }) {
 
   return (
     <div className="card feed-card">
-      <div className="card-head">
+      <div
+        className="card-head"
+        style={{ cursor: 'pointer', userSelect: 'none' }}
+        onClick={() => {
+          const v = !open;
+          setOpen(v);
+          localStorage.setItem('fp.feed.open', v ? '1' : '0');
+        }}
+      >
         <h3>
           <Radio size={13} style={{ verticalAlign: -2, marginRight: 6 }} />
-          <T zh="目录 feed" en="Catalog feed" />
+          <T zh="模型目录" en="Model catalog" />
         </h3>
         <span className="sub">
-          {feed?.version ? `${feed.version} · seq ${feed.seq}` : 'seq —'}
-          {feed?.tombstones.length ? ` · ${feed.tombstones.length} 个已下架` : ''}
+          {!open ? (
+            feed?.halted ? (
+              <T zh="有更新等你确认" en="update awaiting review" />
+            ) : feed?.lastError ? (
+              <T zh="目录更新检查失败" en="catalog update check failed" />
+            ) : (
+              <T zh="自动更新，无需处理" en="updates automatically" />
+            )
+          ) : (
+            <>
+              {feed?.version ? `${feed.version} · seq ${feed.seq}` : 'seq —'}
+              {feed?.tombstones.length ? ` · ${feed.tombstones.length} 个已下架` : ''}
+            </>
+          )}
         </span>
+        <span
+          style={{ marginLeft: 'auto', alignSelf: 'center', display: 'flex' }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {!open && (
+            <button
+              className="btn ghost sm"
+              onClick={() => void check()}
+              disabled={busy !== '' || !feed?.configured}
+            >
+              <RefreshCw size={12} className={busy === 'check' ? 'spin' : ''} />
+              <T zh="检查更新" en="Check" />
+            </button>
+          )}
+        </span>
+        <ChevronDown
+          size={14}
+          style={{
+            alignSelf: 'center',
+            marginLeft: 8,
+            transform: open ? 'rotate(180deg)' : undefined,
+            transition: 'transform .15s',
+          }}
+        />
       </div>
 
+      {!open && (feed?.halted || feed?.lastError) && (
+        <div className="card-body" style={{ paddingTop: 0 }}>
+          <div className={`feed-alert ${feed.halted ? 'warn' : 'bad'}`}>
+            <TriangleAlert size={12} />
+            <span>{feed.halted ?? feed.lastError}</span>
+          </div>
+        </div>
+      )}
+
+      {open && (
       <div className="card-body">
       <div className="feed-bar">
         <Status tone={tone}>
@@ -575,7 +651,7 @@ function FeedCard({ feed }: { feed: GwFeed | null }) {
           )}
         </Status>
         <span className="feed-at">
-          <T zh="上次检查" en="checked" /> {ago(feed?.lastCheckAt)}
+          <T zh="上次检查" en="checked" /> {ago(feed?.lastCheckAt, lang)}
         </span>
         {feed?.hasPubkey ? (
           <span className="feed-at ok">
@@ -618,7 +694,9 @@ function FeedCard({ feed }: { feed: GwFeed | null }) {
 
       <div className="feed-form">
         <label>
-          <span>FEED URL</span>
+          <span>
+            <T zh="feed 地址" en="FEED URL" />
+          </span>
           <input
             value={url}
             placeholder="https://feed.example.com/catalog/latest.json"
@@ -686,12 +764,17 @@ function FeedCard({ feed }: { feed: GwFeed | null }) {
       </div>
 
       <button className="link-mini feed-adv" onClick={() => setAdvanced((v) => !v)}>
-        {advanced ? '隐藏自建公钥' : '自建 / 私有 feed：填公钥'}
+        <T
+          zh={advanced ? '隐藏自建公钥' : '自建 / 私有 feed：填公钥'}
+          en={advanced ? 'Hide custom pubkey' : 'Private feed: add public key'}
+        />
       </button>
       {advanced && (
         <div className="feed-form" style={{ gridTemplateColumns: '1fr auto' }}>
           <label>
-            <span>PUBKEY (hex, 32 bytes)</span>
+            <span>
+              <T zh="公钥（hex，32 字节）" en="PUBKEY (hex, 32 bytes)" />
+            </span>
             <input
               value={pubkey}
               placeholder="c78a1596cfbfcb2e…"
@@ -711,8 +794,8 @@ function FeedCard({ feed }: { feed: GwFeed | null }) {
 
       <div className="feed-note">
         <T
-          zh="每次检查都会带上本机档位；激活 Pro 后还会带上许可证签名（仅 https 或本机地址）。下发什么内容由服务端按档位决定，本机只负责验签——所以许可证过期也不会让转发停摆。"
-          en="Every check reports this machine's tier; with Pro it also carries the license signature (https or loopback only). What comes back is decided server-side by tier — the client only verifies the signature, so an expired license never stops routing."
+          zh="每次检查都会带上本机档位；持有许可证的机器还会附带许可证签名（仅 https 或本机地址）。下发什么内容由服务端按档位决定，本机只负责验签——许可证状态不会影响转发。"
+          en="Every check reports this machine's tier; licensed machines also attach a license signature (https or loopback only). What comes back is decided server-side by tier — the client only verifies the signature, so license state never stops routing."
         />
       </div>
 
@@ -734,13 +817,14 @@ function FeedCard({ feed }: { feed: GwFeed | null }) {
                   <div className="ev-title">{e.title || e.kind}</div>
                   {e.detail && <div className="ev-detail">{e.detail}</div>}
                 </div>
-                <span className="ev-time">{ago(e.at)}</span>
+                <span className="ev-time">{ago(e.at, lang)}</span>
               </div>
             );
           })
         )}
       </div>
       </div>
+      )}
     </div>
   );
 }

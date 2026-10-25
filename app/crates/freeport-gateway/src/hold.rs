@@ -215,6 +215,25 @@ fn scan_native(buf: &str, wire: crate::upwire::Wire) -> Scan {
                 }
                 _ => false,
             },
+            // Gemini 的流式帧没有 type 字段，整个帧就是 GenerateContentResponse
+            crate::upwire::Wire::Gemini => {
+                if v.get("error").is_some() {
+                    return Scan::Error("upstream_body", first_message(&v));
+                }
+                v.pointer("/candidates/0/content/parts")
+                    .and_then(|p| p.as_array())
+                    .map(|parts| {
+                        parts.iter().any(|p| {
+                            p.get("functionCall").is_some()
+                                || p.get("thought").and_then(|t| t.as_bool()).unwrap_or(false)
+                                || p.get("text")
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| !s.is_empty())
+                                    .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            }
             crate::upwire::Wire::Openai => false,
         };
         if hit {

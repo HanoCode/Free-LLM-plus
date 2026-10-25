@@ -1,14 +1,16 @@
 import { useState } from 'react';
 import { ExternalLink, Network, Plus, RefreshCw, ShieldAlert, Trash2, Unplug } from 'lucide-react';
-import { T, tierLabel } from '../lib/i18n';
-import { Empty, Status, TierBadge, toast } from '../components/ui';
+import { T, tierLabel, tx, useLang } from '../lib/i18n';
+import { Empty, Status, TierBadge, confirmDanger, toast } from '../components/ui';
 import { BrandLogo } from '../components/BrandLogo';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
 import type { GwProvider, ProviderPreset } from '../lib/bridge';
+import { LoginDialog } from './Accounts';
 
 export function Providers() {
   const { setPage } = useApp();
+  const lang = useLang();
   const online = useGateway((s) => s.available);
   const real = useGateway((s) => s.providers);
   const presets = useGateway((s) => s.presets);
@@ -18,6 +20,8 @@ export function Providers() {
   const [target, setTarget] = useState<ProviderPreset | null>(null);
   /* 档位筛选：同一组控件作用于「已接入」与「可接入」两张列表 */
   const [tier, setTier] = useState<'all' | 'A' | 'B' | 'C'>('all');
+  /** 订阅类接入成功后直接接着弹的登录框（免得用户跨页找「登录」按钮） */
+  const [loginFor, setLoginFor] = useState<GwProvider | null>(null);
 
   if (!online) return <NoGateway onDiscover={() => setPage('discover')} />;
 
@@ -132,8 +136,16 @@ export function Providers() {
                 );
               }}
               onRemove={async () => {
+                if (
+                  !(await confirmDanger({
+                    zh: `移除厂商「${p.name}」？它的密钥与额度账本会一并删除，此操作不可撤销。`,
+                    en: `Remove provider "${p.name}"? Its key and quota ledger will be deleted. This cannot be undone.`,
+                    confirmWord: '删除',
+                  }))
+                )
+                  return;
                 await removeProvider(p.id);
-                toast(`已移除 ${p.name}，密钥同时删除`);
+                toast(tx(lang, `已移除 ${p.name}，密钥同时删除`, `Removed ${p.name}; its key was deleted too`));
               }}
             />
           ))}
@@ -179,7 +191,20 @@ export function Providers() {
         />
       </div>
 
-      {target && <ConnectDialog preset={target} onClose={() => setTarget(null)} />}
+      {target && (
+        <ConnectDialog
+          preset={target}
+          onClose={() => setTarget(null)}
+          onLogin={(id) => {
+            // addProvider 内部已 refresh，凭据列表里现在应该有它
+            const p = useGateway.getState().providers.find((x) => x.id === id);
+            if (p) setLoginFor(p);
+          }}
+        />
+      )}
+      {loginFor && (
+        <LoginDialog provider={loginFor} onClose={() => setLoginFor(null)} />
+      )}
     </>
   );
 }
@@ -228,7 +253,9 @@ function RealCard({
         </div>
         <div>
           <b>{p.health.latencyMs ? `${p.health.latencyMs}ms` : '—'}</b>
-          <span>LATENCY</span>
+          <span>
+            <T zh="延迟" en="LATENCY" />
+          </span>
         </div>
         <div>
           <b className="mono" style={{ fontSize: 11 }}>
@@ -360,7 +387,9 @@ function PresetCard({ p, onConnect }: { p: ProviderPreset; onConnect: () => void
           </span>
         </div>
         <div>
-          <b>{p.tier === 'A' ? '免费' : '自定'}</b>
+          <b>
+            <T zh={p.tier === 'A' ? '免费' : '自定'} en={p.tier === 'A' ? 'Free' : 'Custom'} />
+          </b>
           <span>
             <T zh="额度" en="QUOTA" />
           </span>
@@ -399,27 +428,37 @@ function PresetCard({ p, onConnect }: { p: ProviderPreset; onConnect: () => void
  */
 const LOGIN_ONLY = new Set(['claude-sub', 'codex-sub']);
 
-function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: () => void }) {
+function ConnectDialog({
+  preset,
+  onClose,
+  onLogin,
+}: {
+  preset: ProviderPreset;
+  onClose: () => void;
+  /** 订阅类接入成功后调用：把用户直接带进登录流程 */
+  onLogin?: (providerId: string) => void;
+}) {
   const addProvider = useGateway((s) => s.addProvider);
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState(preset.baseUrl);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const lang = useLang();
 
   const isCustom = preset.id === 'custom';
   const loginOnly = LOGIN_ONLY.has(preset.id);
 
   const submit = async () => {
     setErr('');
-    if (!loginOnly && !apiKey.trim()) return setErr('请填入 API Key');
-    if (!baseUrl.trim()) return setErr('请填入 baseUrl');
+    if (!loginOnly && !apiKey.trim()) return setErr(tx(lang, '请填入 API Key', 'Enter an API key'));
+    if (!baseUrl.trim()) return setErr(tx(lang, '请填入 baseUrl', 'Enter a baseUrl'));
 
     let id = preset.id;
     if (isCustom) {
       try {
         id = 'custom-' + new URL(baseUrl).hostname.replace(/[^a-z0-9]/gi, '-').toLowerCase();
       } catch {
-        return setErr('baseUrl 不是合法 URL');
+        return setErr(tx(lang, 'baseUrl 不是合法 URL', 'baseUrl is not a valid URL'));
       }
     }
 
@@ -432,11 +471,14 @@ function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: (
         apiKey: apiKey.trim(),
         tier: preset.tier,
       });
-      toast(
-        loginOnly
-          ? `已接入 ${preset.name}。现在去「凭据」页点「登录」完成授权，凭据才会生效。`
-          : `已接入，校验通过：${res.modelCount} 个模型 / connected`,
-      );
+      if (loginOnly) {
+        // 接入只是第一步，凭据要登录才产生——直接把登录弹窗接着打开
+        toast(tx(lang, `已接入 ${preset.name}，继续完成登录授权`, `Connected ${preset.name}; continue with sign-in`));
+        onClose();
+        onLogin?.(id);
+        return;
+      }
+      toast(tx(lang, `已接入，校验通过：${res.modelCount} 个模型`, `Connected: ${res.modelCount} models verified`));
       onClose();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -459,17 +501,21 @@ function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: (
         </p>
 
         <div className="field">
-          <label>BASE URL</label>
+          <label>
+            <T zh="接口地址" en="BASE URL" />
+          </label>
           <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} disabled={!isCustom} />
         </div>
         {loginOnly ? (
           /* 订阅号不填 key：额度来自你自己的订阅，凭据由登录产生 */
           <div className="field">
-            <label>凭据</label>
+            <label>
+              <T zh="凭据" en="AUTH" />
+            </label>
             <p className="modal-note">
               <T
-                zh="这一项不用填 Key。接入之后到「凭据」页点「登录」，用你自己的订阅账号授权即可。"
-                en="No key needed. After connecting, open the Credentials page and click Sign in to authorize with your own subscription."
+                zh="这一项不用填 Key。点下面的按钮接入，登录授权会在下一步直接弹出。"
+                en="No key needed. Click the button below — the sign-in step opens right after connecting."
               />
             </p>
             <p className="modal-note" style={{ color: 'var(--warn)' }}>
@@ -481,7 +527,9 @@ function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: (
           </div>
         ) : (
           <div className="field">
-            <label>API KEY</label>
+            <label>
+              <T zh="API 密钥" en="API KEY" />
+            </label>
             <input
               type="password"
               autoFocus
@@ -510,7 +558,13 @@ function ConnectDialog({ preset, onClose }: { preset: ProviderPreset; onClose: (
             <T zh="取消" en="Cancel" />
           </button>
           <button className="btn primary" onClick={() => void submit()} disabled={busy}>
-            {busy ? <T zh="校验中…" en="Validating…" /> : <T zh="接入并校验" en="Connect" />}
+            {busy ? (
+              <T zh="校验中…" en="Validating…" />
+            ) : loginOnly ? (
+              <T zh="接入并登录" en="Connect & sign in" />
+            ) : (
+              <T zh="接入并校验" en="Connect" />
+            )}
           </button>
         </div>
       </div>

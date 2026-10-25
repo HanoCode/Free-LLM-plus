@@ -188,8 +188,8 @@ export function ApiKeys({ desktop }: { desktop: boolean }) {
                 }}
               />
               <button
-                className="copy-mini"
-                title="删除"
+                className="copy-mini tip-right"
+                data-tip="删除 / Delete"
                 onClick={() => {
                   void api
                     ?.deleteKey(k.id)
@@ -291,7 +291,7 @@ export function ApiKeys({ desktop }: { desktop: boolean }) {
             <code className="mono" style={{ fontSize: 12, wordBreak: 'break-all', flex: 1 }}>
               {fresh.secret}
             </code>
-            <CopyBtn value={fresh.secret} label="" />
+            <CopyBtn value={fresh.secret} label="" tip="复制 / Copy" />
             <button className="copy-mini" onClick={() => setFresh(null)}>
               <T zh="知道了" en="Done" />
             </button>

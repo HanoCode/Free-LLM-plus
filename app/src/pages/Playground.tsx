@@ -523,7 +523,7 @@ export function Playground() {
                               {a.streaming && (
                                 <button
                                   className="pg-stop-mini"
-                                  title={tx(lang, '停止这一路', 'Stop this lane')}
+                                  data-tip={tx(lang, '停止这一路', 'Stop this lane')}
                                   onClick={() => stopAt(j)}
                                 >
                                   <Square />
@@ -575,13 +575,13 @@ export function Playground() {
               }}
             />
             {streaming ? (
-              <button className="pg-send stop" title={tx(lang, '停止生成', 'Stop')} onClick={stop}>
+              <button className="pg-send stop tip-below" data-tip={tx(lang, '停止生成', 'Stop')} onClick={stop}>
                 <Square />
               </button>
             ) : (
               <button
-                className="pg-send"
-                title={tx(lang, '发送', 'Send')}
+                className="pg-send tip-below"
+                data-tip={tx(lang, '发送', 'Send')}
                 disabled={!input.trim() || !running}
                 onClick={() => void send()}
               >

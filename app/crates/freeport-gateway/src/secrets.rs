@@ -178,6 +178,16 @@ pub fn get_key(provider_id: &str) -> Option<String> {
     decrypt(&v.master, provider_id, blob)
 }
 
+/// 本机主密钥的 hex 形态，**只**给自动备份当口令派生源（见 `backup.rs`）。
+///
+/// 边界与密钥库本体一致：快照加密后把这段内存里的字符串丢掉；
+/// 它不落盘、不过 IPC、不打日志。快照与 vault.key 同生死——
+/// 这正是「本机备份」的语义，跨机器迁移请走口令迁移码。
+pub fn master_hex() -> Option<String> {
+    let v = vault().lock().ok()?;
+    Some(v.master.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /* ── OAuth 凭据 ──────────────────────────────────────
  * 和 API key 分开存：同一条凭据将来可能既有 key 又有 token，
  * 「退出登录」也只该清 token，不该把 key 一起删掉。
@@ -247,6 +257,43 @@ pub fn delete_cookie(account_id: &str) {
     if v.items.remove(&cookie_slot(account_id)).is_some() {
         persist(&v.items);
     }
+}
+
+/* ── 许可证体系的本机秘密 ────────────────────────────
+ * 设备密钥（激活时登记公钥、续签时自证身份）与时间高水位（防时钟回拨）。
+ * 都挂在 `license#` 前缀下，AAD 绑定槽位名，与 provider key / oauth /
+ * cookie 三类凭据互不通用。设备密钥丢了 = 续签过不了设备校验，
+ * 重新激活即可（激活会登记新公钥）。 */
+
+const LICENSE_DEVICE_SLOT: &str = "license#device";
+const LICENSE_HWM_SLOT: &str = "license#hwm";
+
+pub fn set_device_key(payload: &str) -> Result<(), String> {
+    let mut v = vault().lock().map_err(|_| "密钥库被占用".to_string())?;
+    let blob = encrypt(&v.master, LICENSE_DEVICE_SLOT, payload)?;
+    v.items.insert(LICENSE_DEVICE_SLOT.to_string(), blob);
+    persist(&v.items);
+    Ok(())
+}
+
+pub fn get_device_key() -> Option<String> {
+    let v = vault().lock().ok()?;
+    let blob = v.items.get(LICENSE_DEVICE_SLOT)?;
+    decrypt(&v.master, LICENSE_DEVICE_SLOT, blob)
+}
+
+pub fn set_license_hwm(ts: i64) -> Result<(), String> {
+    let mut v = vault().lock().map_err(|_| "密钥库被占用".to_string())?;
+    let blob = encrypt(&v.master, LICENSE_HWM_SLOT, &ts.to_string())?;
+    v.items.insert(LICENSE_HWM_SLOT.to_string(), blob);
+    persist(&v.items);
+    Ok(())
+}
+
+pub fn get_license_hwm() -> Option<i64> {
+    let v = vault().lock().ok()?;
+    let blob = v.items.get(LICENSE_HWM_SLOT)?;
+    decrypt(&v.master, LICENSE_HWM_SLOT, blob)?.parse().ok()
 }
 
 /// 这条凭据能用来发请求吗——API key、OAuth token、web 会话，有一个就算。

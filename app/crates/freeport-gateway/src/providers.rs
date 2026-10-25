@@ -1,5 +1,5 @@
-//! 上游调用。M1.5 只做 OpenAI 兼容协议；
-//! Anthropic / Gemini 的 wire 转换在 M6 接 Canonical IR。
+//! 上游调用。OpenAI 兼容之外的原生协议（Anthropic / Responses / Gemini）
+//! 由 [`crate::upwire`] 在这一层做双向翻译。
 //!
 //! 所有出门的请求体都过一遍 [`crate::sanitize`]：剥内部字段 + 抹掉本凭据的
 //! 密钥字面量。上游回显 key 的错误体也在这里就地脱敏——这里是最靠外的
@@ -114,9 +114,16 @@ fn headers(p: &Provider, cred: &Credential, url: &str) -> Vec<(String, String)> 
         ("accept".into(), "application/json".into()),
     ];
 
+    let wire = crate::upwire::wire_of(p);
     match cred {
         Credential::Bearer { token, .. } => {
-            h.push(("authorization".into(), format!("Bearer {token}")));
+            // Gemini 原生端点只认 `x-goog-api-key`：发 Bearer 它会当成
+            // OAuth token 去验，API key 直接 401。
+            if wire == crate::upwire::Wire::Gemini {
+                h.push(("x-goog-api-key".into(), token.clone()));
+            } else {
+                h.push(("authorization".into(), format!("Bearer {token}")));
+            }
             // 附加认证头来自 token 本身（如 Codex 的工作区 id）。
             // 它们不按厂商写死，因为同一家不同号可能属于不同工作区。
             for (k, v) in cred.extras() {
@@ -162,6 +169,40 @@ fn headers(p: &Provider, cred: &Credential, url: &str) -> Vec<(String, String)> 
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Option<Vec<RawModel>>,
+}
+
+/// Gemini `/models` 的响应形状。只收声明支持 generateContent 的模型，
+/// 其余（embedding / aqa 等）chat 网关本来也调不动。
+#[derive(Deserialize)]
+struct GeminiModels {
+    #[serde(default)]
+    models: Vec<GeminiModel>,
+}
+
+#[derive(Deserialize)]
+struct GeminiModel {
+    name: String,
+    #[serde(default)]
+    input_token_limit: Option<u64>,
+    #[serde(default)]
+    supported_generation_methods: Vec<String>,
+}
+
+fn parse_gemini_models(text: &str) -> Vec<RawModel> {
+    let Ok(parsed) = serde_json::from_str::<GeminiModels>(text) else {
+        return Vec::new();
+    };
+    parsed
+        .models
+        .into_iter()
+        .filter(|m| m.supported_generation_methods.iter().any(|s| s == "generateContent"))
+        .map(|m| RawModel::Obj {
+            id: m.name.strip_prefix("models/").unwrap_or(&m.name).to_string(),
+            owned_by: None,
+            context_length: m.input_token_limit,
+            created: None,
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -218,7 +259,10 @@ pub async fn list_models(
         });
     }
 
-    let raw: Vec<RawModel> = if let Ok(parsed) = serde_json::from_str::<ModelsResponse>(&text) {
+    let raw: Vec<RawModel> = if crate::upwire::wire_of(p) == crate::upwire::Wire::Gemini {
+        // Gemini 原生端点的 /models 是自己的形状：{"models": [{"name": "models/x", …}]}
+        parse_gemini_models(&text)
+    } else if let Ok(parsed) = serde_json::from_str::<ModelsResponse>(&text) {
         parsed.data.unwrap_or_default()
     } else {
         serde_json::from_str::<Vec<RawModel>>(&text).unwrap_or_default()
@@ -272,8 +316,10 @@ pub async fn create_chat(
 ) -> Result<reqwest::Response, UpstreamError> {
     // 上游讲什么协议就发什么形状。绝大多数厂商是 OpenAI 兼容（原样发），
     // 订阅号只有原生端点，必须在**这一层**翻译——再往上一切都是 OpenAI 形态的。
-    let wire = crate::upwire::wire_of_provider(&p.id);
-    let url = join(&p.base_url, wire.path());
+    let wire = crate::upwire::wire_of(p);
+    let model = payload.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+    let stream = payload.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let url = crate::upwire::url(wire, &p.base_url, model, stream);
     let red = Redactor::for_credential(cred);
     let mut body = crate::upwire::request(wire, payload);
     strip_internal(&mut body);

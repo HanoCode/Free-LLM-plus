@@ -63,6 +63,14 @@ const BLURB: Record<string, { zh: string; en: string }> = {
     zh: 'Google 的 Gemini 命令行工具，用 GOOGLE_GEMINI_BASE_URL 接入。',
     en: 'Google’s Gemini CLI, wired via GOOGLE_GEMINI_BASE_URL.',
   },
+  'qwen-code': {
+    zh: '阿里的终端智能体（gemini-cli 分支），走 OpenAI 协议接网关。',
+    en: 'Alibaba’s terminal agent (a gemini-cli fork) via the OpenAI protocol.',
+  },
+  iflow: {
+    zh: '心流的终端智能体，settings.json 里换三行即接入。',
+    en: 'iFlow’s terminal agent; swap three keys in settings.json.',
+  },
   roo: {
     zh: 'Roo Code 的配置存放在私有存档里，采用托管变量方式。',
     en: 'Roo Code keeps config in a private store; uses hosted variables.',
@@ -104,6 +112,18 @@ const INSTALL: Record<string, { cmd?: string; url?: string }> = {
   'gemini-cli': {
     cmd: 'npm install -g @google/gemini-cli',
     url: 'https://github.com/google-gemini/gemini-cli',
+  },
+  goose: {
+    cmd: 'brew install block/goose/goose',
+    url: 'https://block.github.io/goose/',
+  },
+  'qwen-code': {
+    cmd: 'npm install -g @qwen-code/qwen-code',
+    url: 'https://github.com/QwenLM/qwen-code',
+  },
+  iflow: {
+    cmd: 'npm install -g @iflow-ai/iflow-cli',
+    url: 'https://github.com/iflow-ai/iflow-cli',
   },
   roo: {
     url: 'https://marketplace.visualstudio.com/items?itemName=RooVeterinaryInc.roo-cline',
@@ -171,7 +191,16 @@ async function copyText(text: string, label?: string) {
 }
 
 /** 命令 / 键值盒子：FreeLLMAPI 风格，右侧一个复制按钮。 */
-function CmdBox({ lines, label }: { lines: string[]; label?: string }) {
+function CmdBox({
+  lines,
+  label,
+  onCopy,
+}: {
+  lines: string[];
+  label?: string;
+  /** 传入时接管复制行为：框里显示的是占位文本，真要复制的另有所指（如完整 key） */
+  onCopy?: () => void;
+}) {
   return (
     <div className="cmdbox">
       <div className="cmdbox-text">
@@ -181,8 +210,8 @@ function CmdBox({ lines, label }: { lines: string[]; label?: string }) {
       </div>
       <button
         className="cmdbox-copy"
-        title="复制 / Copy"
-        onClick={() => void copyText(lines.join('\n'), label)}
+        data-tip="复制 / Copy"
+        onClick={() => (onCopy ? onCopy() : void copyText(lines.join('\n'), label))}
       >
         <Copy size={12} />
       </button>
@@ -201,6 +230,9 @@ export function Agents() {
   const [err, setErr] = useState<string | null>(null);
   const [port, setPort] = useState<number | null>(null);
   const [prefix, setPrefix] = useState<string>('fp-preview');
+  /** 快速开始选中的 key：default 的明文 = 老 authToken（迁移后原值仍在用），可直接取 */
+  const [keyId, setKeyId] = useState<string | null>(null);
+  const [keyName, setKeyName] = useState<string>('default');
 
   const selected = list.find((a) => a.id === openId) ?? null;
 
@@ -227,8 +259,17 @@ export function Agents() {
         const st = await api.status();
         setPort(st.port ?? null);
         const keys = await api.keys();
-        const k = keys.find((x) => x.name.startsWith('agent:'));
-        if (k) setPrefix(k.prefix);
+        // 快速开始是「手动接入的统一密钥」：优先 default（老用户无需新建），
+        // 其次注入签发的 agent key；虚拟 key 明文不回显，复制逻辑见 copyFullKey
+        const k =
+          keys.find((x) => x.name === 'default' && x.enabled) ??
+          keys.find((x) => x.name.startsWith('agent:') && x.enabled) ??
+          keys.find((x) => x.enabled);
+        if (k) {
+          setPrefix(k.prefix);
+          setKeyId(k.id);
+          setKeyName(k.name);
+        }
       } catch {
         /* 网关未启动时留空，步骤里给占位值 */
       }
@@ -295,6 +336,38 @@ export function Agents() {
   const base = port ? `http://127.0.0.1:${port}` : 'http://127.0.0.1:8787';
   const keyPrefix = `${prefix}…`;
 
+  /** 快速开始的 API KEY：框里是前缀占位，复制时取完整明文。
+   *  default key 的明文就是网关 authToken（迁移后原值仍参与鉴权）；
+   *  其余虚拟 key 只存 sha256 无法回显，提示去设置页新建。 */
+  async function copyFullKey() {
+    if (!api) return;
+    if (keyName === 'default') {
+      try {
+        const st = await api.status();
+        if (st.authToken) {
+          await navigator.clipboard.writeText(st.authToken);
+          toast('已复制完整 API Key（default）');
+          return;
+        }
+      } catch {
+        /* 掉到下面的通用提示 */
+      }
+    }
+    if (!keyId) {
+      toast('还没有可用密钥：请在设置页新建虚拟 key');
+      return;
+    }
+    try {
+      const secret = await api.revealKey(keyId);
+      if (!secret) throw new Error('empty');
+      await navigator.clipboard.writeText(secret);
+      toast('已复制完整 API Key');
+    } catch {
+      // 虚拟 key 落盘只存 sha256（keys.rs 的刻意取舍），明文拿不回来
+      toast('该虚拟 key 无法回显明文：请改用 default 密钥，或在设置页新建一把（明文只显示一次）');
+    }
+  }
+
   return (
     <>
       <div className="page-head">
@@ -318,17 +391,6 @@ export function Agents() {
             <T zh="重新扫描" en="Rescan" />
           </button>
         </div>
-      </div>
-
-      {/* 渠道来源风险提示：上游会校验请求渠道，滥用接入有封号风险 */}
-      <div className="risk-note" style={{ marginBottom: 12 }}>
-        <AlertTriangle />
-        <p>
-          <T
-            zh="近期 WorkBuddy 请求会校验渠道来源，请合理使用接入功能，可能会引起封号风险！"
-            en="WorkBuddy now verifies the channel origin of requests. Use the injection feature responsibly — account bans are a real risk!"
-          />
-        </p>
       </div>
 
       {err && (
@@ -370,18 +432,22 @@ export function Agents() {
             </div>
             <div className="quickstart-row">
               <div className="qs-field">
-                <span className="qs-label">BASE URL</span>
+                <span className="qs-label">
+                  <T zh="接口地址" en="BASE URL" />
+                </span>
                 <CmdBox lines={[base]} label="Base URL" />
               </div>
               <div className="qs-field">
-                <span className="qs-label">API KEY</span>
-                <CmdBox lines={[keyPrefix]} label="Key 前缀" />
+                <span className="qs-label">
+                  <T zh="API 密钥" en="API KEY" />
+                </span>
+                <CmdBox lines={[keyPrefix]} onCopy={() => void copyFullKey()} />
               </div>
             </div>
             <div className="sub" style={{ fontSize: 11.5 }}>
               <T
-                zh={`当前统一密钥：${prefix}…（完整密钥在设置页新建虚拟 key 后获取）`}
-                en={`Unified key: ${prefix}… (create a full virtual key in Settings)`}
+                zh={`当前统一密钥：${prefix}…（点 API 密钥框右侧按钮复制完整密钥）`}
+                en={`Unified key: ${prefix}… (use the copy button to copy the full key)`}
               />
             </div>
           </div>
@@ -520,7 +586,7 @@ export function Agents() {
                     {a.state === 'missing' && (
                       <>
                         <button
-                          className="btn primary sm"
+                          className="btn success sm"
                           onClick={() => setOpenId(a.id)}
                           disabled={!install}
                         >
@@ -620,7 +686,7 @@ function AgentModal({
           </div>
           <span className="agent-modal-status">
             <StateTag state={agent.state} />
-            <button className="cmdbox-copy" onClick={onClose} title="关闭 / Close">
+            <button className="cmdbox-copy" onClick={onClose} data-tip="关闭 / Close">
               <X size={14} />
             </button>
           </span>

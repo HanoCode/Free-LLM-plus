@@ -44,6 +44,11 @@ export interface GwStatus {
   /** 非流式响应的精确匹配缓存 */
   cache: boolean;
   cacheTtlSecs: number;
+  /** OTLP 导出（traces）。默认关，开了把请求元数据推给用户自己的 collector */
+  otlpEnabled: boolean;
+  otlpEndpoint: string;
+  /** 一行一个 `Key: Value` */
+  otlpHeaders: string[];
   cooldowns: GwCooldown[];
   error?: string | null;
 }
@@ -56,6 +61,16 @@ export interface UpdateCheck {
   url?: string | null;
   notes?: string | null;
   publishedAt?: string | null;
+}
+
+/** 自动更新通道（tauri-plugin-updater）。走签名校验 + latest.json。 */
+export interface UpdaterStatus {
+  current: string;
+  available: boolean;
+  /** 有新版本时的版本号（不含 v 前缀） */
+  version?: string | null;
+  /** 发布说明 */
+  notes?: string | null;
 }
 
 /**
@@ -73,30 +88,6 @@ export interface DesktopPrefs {
 export interface PrefsPatch {
   startMinimized?: boolean;
   cleanupOnQuit?: boolean;
-}
-
-export type LicenseStatus = 'missing' | 'valid' | 'grace' | 'expired' | 'invalid' | 'wrong_machine';
-/**
- * 许可证状态。
- *
- * `tier` 是生效档位（过期就是 free），`licensedTier` 是买过的档位——
- * 两个都拿才能说清「你买的是 Pro，已于 10-01 到期，现在是免费版」。
- */
-export interface GwLicense {
-  status: LicenseStatus;
-  tier: 'free' | 'pro';
-  licensedTier: 'free' | 'pro';
-  pro: boolean;
-  subject?: string;
-  features: string[];
-  /** unix 秒 */
-  expiresAt?: number;
-  graceUntil?: number;
-  daysLeft?: number;
-  seats?: number;
-  /** 本机安装码。绑机器的 license 用它核对。 */
-  machineId: string;
-  message?: string;
 }
 
 export type HealthStatus =
@@ -272,7 +263,7 @@ export interface GwLog {
   sticky?: boolean;
   /** 进了哪个账号池：chat / coding / vision / probe */
   purpose?: string;
-  /** 用途判定的依据：header / image / agent-key / default */
+  /** 用途判定的依据：header / image / agent-key / heuristic / default */
   purposeSource?: string;
   error?: string;
 }
@@ -320,6 +311,12 @@ export interface ConfigPatch {
   /** 非流式响应的精确匹配缓存 */
   cache?: boolean;
   cacheTtlSecs?: number;
+  /** OTLP 导出开关 */
+  otlpEnabled?: boolean;
+  /** collector 地址（基址或完整 /v1/traces） */
+  otlpEndpoint?: string;
+  /** 自定义请求头，一行一个 `Key: Value` */
+  otlpHeaders?: string[];
 }
 
 /** 路由顺序策略。与 Rust 侧 `route::Strategy` 一一对应。 */
@@ -337,7 +334,116 @@ export interface GwRouting {
   purposeChain?: Record<string, string>;
   /** 三维评分权重。始终下发，未启用时 enabled=false + 70/15/15 默认值。 */
   weights?: GwWeights;
+  /** 策略档（Pro）：按 key 前缀 / 用途绑定的策略与权重。 */
+  profiles?: StrategyProfile[];
   cooldowns: GwCooldown[];
+}
+
+/** 策略档（Pro）。keyPrefix 与 purpose 至少绑一个，第一条命中的生效。 */
+export interface StrategyProfile {
+  id: string;
+  name: string;
+  /** 匹配的虚拟 key id 前缀，如 `agent:claude-code` */
+  keyPrefix?: string | null;
+  /** 匹配的用途：chat / coding / vision / probe */
+  purpose?: string | null;
+  strategy: string;
+  weights?: GwWeights | null;
+}
+
+/* ── Pro 本机功能（v1.12）：情报 / 报表 / 备份，全部本地计算 ── */
+
+/** 本机额度情报：按 provider×model 聚合最近请求 + 账本 + 健康度。 */
+export interface GwIntel {
+  /** false 时 models 恒为空——直接进 paywall，不渲染假数据 */
+  pro: boolean;
+  models: GwModelIntel[];
+  /** 参与聚合的日志条数（内存环上限 300） */
+  scanned: number;
+}
+
+export interface GwModelIntel {
+  provider: string;
+  model: string;
+  requests: number;
+  errors: number;
+  okRate: number;
+  p50Ms: number | null;
+  p95Ms: number | null;
+  /** 该厂商账本最紧窗口的剩余比例；null = 没记过账 */
+  remaining: number | null;
+  health: string | null;
+  lastError: string | null;
+  lastUsedAt: string | null;
+}
+
+/** 用量报表：基于本地持久化日志（Pro = 90 天）。 */
+export interface GwReports {
+  pro: boolean;
+  /** 持久化覆盖的天数（0 = 没有留存文件） */
+  days: number;
+  daily: GwDayStat[];
+  topModels: GwModelStat[];
+  byPurpose: GwBucket[];
+  byKey: GwBucket[];
+  requests: number;
+  errors: number;
+  tokensIn: number;
+  tokensOut: number;
+}
+
+export interface GwDayStat {
+  date: string;
+  requests: number;
+  errors: number;
+  tokensIn: number;
+  tokensOut: number;
+}
+
+export interface GwModelStat {
+  provider: string;
+  model: string;
+  requests: number;
+  errors: number;
+  tokensIn: number;
+  tokensOut: number;
+  avgOkMs: number;
+}
+
+/** Pro 功能开关与本机数据。 */
+export interface GwPro {
+  pro: boolean;
+  prewarm: boolean;
+  unstickRatio?: number | null;
+  /** 粘性窗口（分钟）。null = 默认 30 分钟；免费版恒为 null */
+  stickTtlMin?: number | null;
+  backup: GwBackupCfg;
+}
+
+export interface GwBackupCfg {
+  enabled: boolean;
+  dir?: string | null;
+  intervalHours: number;
+  keep: number;
+  lastAt?: number | null;
+}
+
+export interface GwBackupFile {
+  name: string;
+  bytes: number;
+  modified?: string | null;
+}
+
+export interface ProPatch {
+  prewarm?: boolean;
+  /** null = 回到默认 0.10 */
+  unstickRatio?: number | null;
+  /** 粘性窗口（分钟，5–1440）；null = 回默认 30 */
+  stickTtlMin?: number | null;
+  backupEnabled?: boolean;
+  backupDir?: string;
+  backupIntervalHours?: number;
+  backupKeep?: number;
 }
 
 /**
@@ -828,6 +934,8 @@ export interface FreeportBridge {
     info: () => Promise<Record<string, unknown>>;
     /** 读 GitHub Releases 的 latest，与本地版本比。没发过 release 时 `updateAvailable: false` */
     checkUpdate: () => Promise<UpdateCheck>;
+    updaterCheck: () => Promise<UpdaterStatus>;
+    updaterInstall: () => Promise<boolean>;
     /** 脱敏诊断快照：不含明文密钥、不含掩码、不含 authToken */
     diagnostics: () => Promise<Record<string, unknown>>;
     /** 存成 json 文件；null = 用户取消 */
@@ -930,16 +1038,31 @@ export interface FreeportBridge {
       mode?: 'merge' | 'replace',
     ) => Promise<ImportSummary | null>;
 
-    /** 许可证状态。离线验签，不联网。 */
-    license: () => Promise<GwLicense>;
-    /** 激活：签名不对 / 绑了别的机器 / 已过宽限期都会被拒，且不落盘 */
-    activateLicense: (token: string) => Promise<GwLicense>;
-    /** 解除激活，回到免费版（转发不受影响） */
-    clearLicense: () => Promise<GwLicense>;
+    /** 本机额度情报（Pro）。非 Pro 返回 pro=false + 空 models。 */
+    intel: () => Promise<GwIntel>;
+    /** 用量报表（Pro）。days 夹在 1..=90。 */
+    reports: (days: number) => Promise<GwReports>;
+    /** 导出留存日志（原生保存对话框）。null = 用户取消 */
+    reportsExport: () => Promise<string | null>;
+    /** Pro 功能开关与本机数据。 */
+    pro: () => Promise<GwPro>;
+    setPro: (patch: ProPatch) => Promise<GwPro>;
+    /** 手动打一份快照。失败（未开启 / 没配目录）会给能行动的报错 */
+    backupNow: () => Promise<string>;
+    backupList: () => Promise<GwBackupFile[]>;
+    backupRestore: (name: string) => Promise<ImportSummary>;
+    /** 策略档写入（Pro）。整批校验。 */
+    setProfiles: (profiles: StrategyProfile[]) => Promise<GwRouting>;
+    /** 远程接入（Pro）：切换回环 / 0.0.0.0 监听。重启网关后生效。 */
+    setRemote: (on: boolean) => Promise<GwStatus>;
 
     setRouting: (patch: Partial<GwRouting>) => Promise<GwRouting>;
     clearCooldowns: () => Promise<boolean>;
     setConfig: (patch: ConfigPatch) => Promise<GwStatus>;
+    /** 自动更新的下载/安装进度。应用重启后监听自然失效 */
+    onUpdaterProgress: (
+      cb: (p: { phase: string; downloaded?: number; total?: number | null }) => void,
+    ) => () => void;
 
     catalog: () => Promise<GwCatalog>;
     catalogRefresh: () => Promise<GwCatalog>;

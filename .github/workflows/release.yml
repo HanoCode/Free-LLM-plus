@@ -106,33 +106,29 @@ jobs:
         working-directory: app
         run: npm ci
 
-      # 只有配了更新公钥才开启升级产物；否则会生成一个谁都验不过的 latest.json
+      # 更新公钥已提交在 tauri.conf.json（plugins.updater）。这里只差签名私钥：
+      # 配了 TAURI_SIGNING_PRIVATE_KEY 才产出升级包，否则生成的 latest.json
+      # 谁都验不过，宁可不生成。
       - name: 决定是否带更新通道
         id: updater
         shell: bash
         env:
-          PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          PRIVKEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           args="--target ${{ matrix.target }}"
-          if [ -n "${PUBKEY:-}" ]; then
+          if [ -n "${PRIVKEY:-}" ]; then
             cfg="$RUNNER_TEMP/updater.json"
             cat > "$cfg" <<EOF
           {
-            "bundle": { "createUpdaterArtifacts": true },
-            "plugins": {
-              "updater": {
-                "endpoints": ["https://github.com/HanoCode/Free-LLM-plus/releases/latest/download/latest.json"],
-                "pubkey": "${PUBKEY}"
-              }
-            }
+            "bundle": { "createUpdaterArtifacts": true }
           }
           EOF
             args="$args --config $cfg"
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::未配置 TAURI_UPDATER_PUBKEY，本次不产出自动更新包"
+            echo "::notice::未配置 TAURI_SIGNING_PRIVATE_KEY，本次不产出自动更新包"
           fi
           echo "args=$args" >> "$GITHUB_OUTPUT"
 
@@ -149,7 +145,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          # 自动更新包的签名私钥（minisign），与 TAURI_UPDATER_PUBKEY 配对
+          # 自动更新包的签名私钥（minisign），公钥已提交在 tauri.conf.json
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:

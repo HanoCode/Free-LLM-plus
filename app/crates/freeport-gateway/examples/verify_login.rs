@@ -128,6 +128,7 @@ async fn main() -> Result<(), String> {
             quota: None,
             accounts: Vec::new(),
             proxy: None,
+            wire: None,
             health: Default::default(),
         },
         &cred,

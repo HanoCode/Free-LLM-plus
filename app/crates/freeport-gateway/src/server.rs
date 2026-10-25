@@ -4,7 +4,7 @@
 //! 由宿主通过进程内调用拿到 —— 避免本机任意进程改配置。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,11 +38,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
 use crate::anthropic;
+use crate::continuation;
 use crate::cred::{self, Credential};
 use crate::gemini;
 use crate::hold::{self, HoldCfg, HoldOutcome};
 use crate::keys;
-use crate::license;
+use crate::license::{self, PendingSubscribe};
 use crate::ollama;
 use crate::providers;
 use crate::responses;
@@ -54,7 +55,8 @@ use crate::tokens::{Broker, Endpoints, OAuthBlob};
 use crate::transfer;
 
 const MAX_BODY: usize = 8 * 1024 * 1024;
-const LOG_RING: usize = 300;
+// 内存日志环容量按档位走（`pro::log_ring_cap`：免费 300 / Pro 2000），
+// 这里不再写死——环大一分，情报与摘要的聚合样本就多一分。
 /// 巡检循环的节拍。真实探针按到期队列走，不需要跑得更勤。
 const PATROL_TICK: Duration = Duration::from_secs(300);
 /// 启动后先让用户用一会儿，别和第一个请求抢额度
@@ -78,17 +80,25 @@ const TIGHT_HEADROOM: f64 = 0.15;
 pub type LogSink = Arc<dyn Fn(LogEntry) + Send + Sync>;
 
 pub(crate) struct State_ {
-    pub(crate) data: RwLock<AppData>,    catalog: RwLock<Catalog>,
+    pub(crate) data: RwLock<AppData>,
+    pub(crate) catalog: RwLock<Catalog>,
     cooldowns: Cooldowns,
     /// SWRR 的累计权重。必须跨请求保留，否则「平滑」无从谈起。
     swrr: Mutex<Swrr>,
     /// 会话粘性：一段对话尽量回到上次答它的那家，保住 prompt cache。
-    affinity: Mutex<Affinity>,
+    /// pub(crate)：sessions 模块（Pro 落盘/回放）要读它，本体逻辑不动。
+    pub(crate) affinity: Mutex<Affinity>,
     logs: RwLock<Vec<LogEntry>>,
-    client: reqwest::Client,
+    /// 出网客户端。pub(crate)：OTLP 导出复用同一个连接池，不另起一套。
+    pub(crate) client: reqwest::Client,
+    /// OTLP 导出队列（`otlp` 模块消费）。满了丢最旧的并计数——观测
+    /// 绝不反压业务请求。
+    pub(crate) otlp_queue: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    pub(crate) otlp_dropped: AtomicU64,
     started_at: RwLock<Option<Instant>>,
     bound_port: AtomicU16,
-    running: AtomicBool,
+    /// 网关是否在跑。pub(crate)：许可证续签循环用它决定要不要继续醒
+    pub(crate) running: AtomicBool,
     /// 暂停：只挡业务请求，不挡 /health 与 /v1/models。
     /// 内存态，不落盘——重启就是恢复，避免「上次暂停了这次忘了开」。
     paused: AtomicBool,
@@ -97,12 +107,16 @@ pub(crate) struct State_ {
     /// 上次落盘时间（毫秒）：模型健康每次请求都会变，不能每个请求都写盘
     last_save_ms: AtomicI64,
     on_log: RwLock<Option<LogSink>>,
-    shutdown: Notify,
+    pub(crate) shutdown: Notify,
     /// OAuth 凭据的续期与并发去重
     broker: Broker,
     /// 进行中的设备码登录。用户点「登录」到浏览器里点完，中间隔了几十秒，
     /// 状态只能放这里。
     logins: Mutex<HashMap<String, PendingLogin>>,
+    /// 进行中的订阅会话（立即订阅 → 浏览器支付 → 回跳激活）。
+    /// 与 logins 分开：一个是厂商授权，一个是自己的收款链路，生命周期
+    /// 与字段完全不同。
+    pub(crate) subscribes: Mutex<HashMap<String, PendingSubscribe>>,
     /// `Idempotency-Key` 响应缓存。内存态：重启后重放一次上游，好过把响应体落盘。
     idem: idem::IdemStore,
     /// 这次加载用的数据目录。MCP 是独立进程，得靠它找到 `control.key`。
@@ -123,6 +137,9 @@ pub(crate) struct State_ {
     /// 每个凭据当前在途请求数，配合 `gateway.maxInflightPerAccount` 用。
     /// 0 表示不限，默认不限——单机场景限并发只会让用户以为软件卡了。
     acct_inflight: Mutex<HashMap<String, usize>>,
+    /// 会话预热（Pro）的去重账本：`provider:model` → 上次预热时刻（ms）。
+    /// 只在内存，重启归零——预热是效率增强，不值得为它落盘。
+    prewarmed: Mutex<std::collections::BTreeMap<String, i64>>,
 }
 
 /// 进行中的登录。两条路子的状态完全不通，只能分开存——
@@ -214,7 +231,7 @@ fn pkce_start_dto(login_id: String, flow: &sub::LoginStart) -> GwLoginStart {
 /// 发请求要用的凭据：OAuth 账号取 token（过期先续期），其余取 API key。
 ///
 /// 放在锁外面调用——续期要发网络请求，拿着 `data` 读锁等网络会把整个网关卡住。
-async fn credential(st: &Arc<State_>, account_id: &str) -> Option<Credential> {
+pub(crate) async fn credential(st: &Arc<State_>, account_id: &str) -> Option<Credential> {
     if secrets::has_oauth(account_id) {
         match st.broker.token(account_id).await {
             Ok(live) => {
@@ -256,6 +273,14 @@ fn with_auth_meta(mut p: GwProvider) -> GwProvider {
     p
 }
 
+impl State_ {
+    /// 本实例的数据目录。落盘路径的唯一入口——所有写盘模块（reports /
+    /// backup）从这里拿目录，不许直接摸 `dir` 字段。
+    pub(crate) fn instance_dir(&self) -> std::path::PathBuf {
+        self.dir.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 pub struct Gateway {
     pub(crate) st: Arc<State_>,
 }
@@ -276,6 +301,8 @@ impl Gateway {
                 swrr: Mutex::new(Swrr::new()),
                 affinity: Mutex::new(Affinity::default()),
                 logs: RwLock::new(Vec::new()),
+                otlp_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                otlp_dropped: AtomicU64::new(0),
                 broker: Broker::new(client.clone(), endpoints),
                 client,
                 started_at: RwLock::new(None),
@@ -287,6 +314,7 @@ impl Gateway {
                 on_log: RwLock::new(None),
                 shutdown: Notify::new(),
                 logins: Mutex::new(HashMap::new()),
+                subscribes: Mutex::new(HashMap::new()),
                 idem: idem::IdemStore::new(),
                 dir: std::sync::RwLock::new(store::data_dir()),
                 control_token: RwLock::new(String::new()),
@@ -294,6 +322,7 @@ impl Gateway {
                 resp_cache: Mutex::new(cache::ResponseCache::new()),
                 empty_streak: Mutex::new(HashMap::new()),
                 acct_inflight: Mutex::new(HashMap::new()),
+                prewarmed: Mutex::new(std::collections::BTreeMap::new()),
             }),
         }
     }
@@ -727,6 +756,8 @@ impl Gateway {
     pub async fn load_from(&self, dir: &std::path::Path) {
         *self.st.dir.write().unwrap_or_else(|e| e.into_inner()) = dir.to_path_buf();
         let mut data = store::load_from(dir);
+        // 启动即记下「本机最近一次真实在场时刻」（时间高水位，见 hwm.rs）
+        crate::hwm::note_now();
         let cat = catalog::load();
 
         // 目录摘要回写到配置，UI 才能显示「上次同步」
@@ -776,8 +807,62 @@ impl Gateway {
         (d.gateway.host.clone(), d.gateway.port)
     }
 
+    /// 远程接入（Pro）：把监听从 127.0.0.1 换成 0.0.0.0（或收回）。
+    ///
+    /// 只做一个开关而不给自由输入：绑哪个具体地址是运维决策，绑错了
+    /// （比如绑到公网网卡）的后果远超「一个设置项」该承担的。想精确
+    /// 控制地址走 CLI 的 `set_bind`——那个入口的调用方自己负责。
+    ///
+    /// 生效时机：改的是配置，**重启网关后生效**（返回值里带提示，
+    /// UI 负责说清楚）。非回环监听时 `require_auth` 被强制开启，
+    /// start() 里还有一道执法。
+    pub async fn set_remote(&self, on: bool) -> Result<GwStatus, String> {
+        {
+            let mut d = self.st.data.write().await;
+            if on {
+                if !crate::pro::allow(&d, crate::pro::Feature::RemoteAccess) {
+                    return Err("远程接入是 Pro 功能".into());
+                }
+                d.gateway.host = "0.0.0.0".to_string();
+                // 防呆：远程一定带鉴权，不等 start() 执法
+                d.gateway.require_auth = true;
+            } else {
+                d.gateway.host = "127.0.0.1".to_string();
+            }
+            save_here(&self.st, &d);
+        }
+        Ok(self.status().await)
+    }
+
     pub async fn start(&self) -> Result<u16, String> {
+        crate::hwm::note_now();
         let (port, host) = {
+            let mut d = self.st.data.write().await;
+            // 远程接入（Pro）：非回环监听只在 Pro 下放行，免费版一律收回本机。
+            // 这里的执法比 set_remote 更硬——配置文件是用户可编辑的，手工把
+            // host 改成 0.0.0.0 也绕不过去。
+            let h = d.gateway.host.trim();
+            if !h.is_empty() && !is_loopback_host(h) {
+                if crate::pro::allow(&d, crate::pro::Feature::RemoteAccess) {
+                    // 包能出机器，鉴权就没有「关」的选项
+                    if !d.gateway.require_auth {
+                        d.gateway.require_auth = true;
+                        tracing::warn!("非回环监听：已强制开启鉴权（require_auth）");
+                    }
+                } else {
+                    tracing::warn!("远程接入是 Pro 功能，监听地址已收回 127.0.0.1");
+                    d.gateway.host = "127.0.0.1".to_string();
+                }
+                save_here(&self.st, &d);
+            }
+            // 粘性窗口按档位应用（免费 30 分钟；Pro 可自定义 5 分钟–24 小时）
+            let ttl = crate::pro::stick_ttl_ms(&d);
+            drop(d);
+            self.st
+                .affinity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_ttl_ms(ttl);
             let d = self.st.data.read().await;
             (d.gateway.port, d.gateway.host.clone())
         };
@@ -842,6 +927,17 @@ impl Gateway {
         self.spawn_catalog_refresh();
         self.spawn_patrol();
         self.spawn_feed();
+        // 许可证续签：到期前 36h 内才会真发请求，平时零开销
+        self.spawn_license_refresh();
+        // 会话预热（Pro）：每分钟看一眼粘性表，余量见底才动，平时零开销
+        self.spawn_prewarm();
+        // 粘性会话落盘与重启恢复（Pro）：60 秒节流快照，启动时回放
+        crate::sessions::spawn(self);
+        crate::sessions::restore(self);
+        // 自动备份（Pro）：10 分钟醒一次，到期才写，平时零开销
+        crate::backup::spawn(self);
+        // OTLP 导出（opt-in）：批量推 span 给 collector，关着时每轮零成本
+        crate::otlp::spawn(self);
         // 扩展目录 materialize + sidecar 空闲清扫。没用到扩展就零开销。
         freeport_ext::install::materialize_builtin(&freeport_ext::install::extensions_dir());
         freeport_ext::start_reaper(freeport_ext::shared());
@@ -949,6 +1045,9 @@ impl Gateway {
             identifier_limit: d.gateway.identifier_limit,
             cache: d.gateway.cache.enabled,
             cache_ttl_secs: d.gateway.cache.ttl_secs,
+            otlp_enabled: d.gateway.otlp.enabled,
+            otlp_endpoint: d.gateway.otlp.endpoint.clone(),
+            otlp_headers: d.gateway.otlp.headers.clone(),
             cooldowns: self.st.cooldowns.snapshot(),
             error: None,
         }
@@ -1122,6 +1221,7 @@ impl Gateway {
             chains: d.routing.chains.clone(),
             purpose_chain: d.routing.purpose_chain.clone(),
             weights: d.routing.weights,
+            profiles: d.routing.profiles.clone(),
             cooldowns: self.st.cooldowns.snapshot(),
         }
     }
@@ -1150,6 +1250,7 @@ impl Gateway {
                 tier: p.tier.clone(),
                 homepage: p.docs.clone(),
                 note: p.free_note.clone(),
+                wire: None,
             });
         }
         out
@@ -1281,6 +1382,7 @@ impl Gateway {
             quota: None,
             accounts: if login_only { Vec::new() } else { vec![account.clone()] },
             proxy: None,
+            wire: preset.as_ref().and_then(|p| p.wire.clone()),
             health: Health {
                 status: HealthStatus::Probing,
                 checked_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -1963,7 +2065,7 @@ impl Gateway {
         secrets::get_key(id).unwrap_or_default()
     }
 
-    pub async fn set_routing(&self, patch: RoutingPatch) -> GwRouting {
+    pub async fn set_routing(&self, patch: RoutingPatch) -> Result<GwRouting, String> {
         {
             let mut d = self.st.data.write().await;
             if let Some(s) = patch.strategy {
@@ -1999,16 +2101,121 @@ impl Gateway {
                 }
                 d.routing.weights = w;
             }
+            if let Some(list) = patch.profiles {
+                // 策略档：宽松校验（跳过非法项并留痕）。设置页的正式写入
+                // 走 `set_profiles`，整批校验、任何一条非法就整体拒绝。
+                let pro = crate::pro::allow(&d, crate::pro::Feature::Profiles);
+                let mut out = Vec::new();
+                if pro {
+                    for p in list {
+                        if let Err(e) = p.validate() {
+                            tracing::warn!(id = %p.id, error = %e, "策略档被跳过：不合法");
+                            continue;
+                        }
+                        if out.len() >= 8 {
+                            break;
+                        }
+                        out.push(p);
+                    }
+                }
+                d.routing.profiles = out;
+            }
             save_here(&self.st, &d);
         }
-        self.routing().await
+        Ok(self.routing().await)
+    }
+
+    /// 策略档写入（Pro）。整批校验：任何一条非法就整体拒绝——
+    /// 「存了一半」会让用户以为没保存的那条只是丢了名字。
+    pub async fn set_profiles(&self, profiles: Vec<freeport_core::model::StrategyProfile>) -> Result<GwRouting, String> {
+        {
+            let mut d = self.st.data.write().await;
+            if !crate::pro::allow(&d, crate::pro::Feature::Profiles) {
+                return Err("策略档是 Pro 功能".into());
+            }
+            if profiles.len() > 8 {
+                return Err("策略档最多 8 条".into());
+            }
+            for p in &profiles {
+                p.validate()?;
+            }
+            d.routing.profiles = profiles;
+            save_here(&self.st, &d);
+        }
+        Ok(self.routing().await)
+    }
+
+    /* ── Pro 本机功能（v1.12）：开关的读写与状态下发 ── */
+
+    pub async fn pro_config(&self) -> GwPro {
+        let d = self.st.data.read().await;
+        GwPro {
+            pro: crate::license::state(&d).pro,
+            prewarm: d.pro.prewarm,
+            unstick_ratio: d.pro.unstick_ratio,
+            stick_ttl_min: d.pro.stick_ttl_min,
+            backup: d.pro.backup.clone(),
+        }
+    }
+
+    pub async fn set_pro(&self, patch: ProPatch) -> GwPro {
+        {
+            let mut d = self.st.data.write().await;
+            if let Some(v) = patch.prewarm {
+                d.pro.prewarm = v;
+            }
+            if let Some(r) = patch.unstick_ratio {
+                // None = 回默认；Some 夹到 0.02..=0.5（pro::unstick_ratio 读时再验一遍）
+                d.pro.unstick_ratio = r.map(|v| v.clamp(0.02, 0.5));
+            }
+            if let Some(v) = patch.stick_ttl_min {
+                // None = 回默认 30 分钟；Some 夹到 5..=1440（pro::stick_ttl_ms 读时再验一遍）
+                d.pro.stick_ttl_min = v.map(|m| m.clamp(5, 1_440));
+            }
+            if let Some(v) = patch.backup_enabled {
+                d.pro.backup.enabled = v;
+            }
+            if let Some(dir) = patch.backup_dir {
+                let t = dir.trim().to_string();
+                d.pro.backup.dir = if t.is_empty() { None } else { Some(t) };
+            }
+            if let Some(h) = patch.backup_interval_hours {
+                if (1..=168).contains(&h) {
+                    d.pro.backup.interval_hours = h;
+                }
+            }
+            if let Some(k) = patch.backup_keep {
+                if (1..=30).contains(&k) {
+                    d.pro.backup.keep = k;
+                }
+            }
+            save_here(&self.st, &d);
+            // TTL 即时生效：粘性窗口是亲和表的参数，改完下次判定就用新值。
+            // 锁不跨 await——先落盘再调锁。
+            let ttl = crate::pro::stick_ttl_ms(&d);
+            drop(d);
+            self.st
+                .affinity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_ttl_ms(ttl);
+        }
+        self.pro_config().await
     }
 
     pub async fn set_config(&self, patch: ConfigPatch) -> GwStatus {
         {
             let mut d = self.st.data.write().await;
             if let Some(v) = patch.require_auth {
-                d.gateway.require_auth = v;
+                // 非回环监听时鉴权关不掉：start() 会再强制一次，这里提前拦，
+                // 免得 UI 上显示「已关闭」而实际在强制——说谎的开关最贵。
+                let remote = !d.gateway.host.trim().is_empty()
+                    && !is_loopback_host(d.gateway.host.trim());
+                if !v && remote {
+                    tracing::warn!("非回环监听下拒绝关闭鉴权");
+                } else {
+                    d.gateway.require_auth = v;
+                }
             }
             if let Some(p) = patch.port {
                 d.gateway.port = p;
@@ -2043,6 +2250,23 @@ impl Gateway {
             if let Some(secs) = patch.cache_ttl_secs {
                 // 上限一天：再长就不是「复用答案」而是「喂陈旧信息」了
                 d.gateway.cache.ttl_secs = secs.clamp(10, 86_400);
+            }
+            if let Some(v) = patch.otlp_enabled {
+                d.gateway.otlp.enabled = v;
+            }
+            if let Some(v) = patch.otlp_endpoint {
+                // 不做 URL 校验：填错只会让上报失败并 warn，导流到业务请求之外
+                d.gateway.otlp.endpoint = v.trim().trim_end_matches('/').to_string();
+            }
+            if let Some(v) = patch.otlp_headers {
+                // 容错两种输入：数组直接存，textarea 的多行按行拆。空行丢弃。
+                d.gateway.otlp.headers = v
+                    .iter()
+                    .flat_map(|h| h.lines())
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
             }
             save_here(&self.st, &d);
         }
@@ -2738,7 +2962,7 @@ impl Gateway {
     }
 
     fn spawn_patrol(&self) {
-        // 后台任务只需要 State_，构造一个同源的轻量句柄即可
+        // 后台任务只需要 State_，构造一个同源轻量句柄即可
         let gw = Gateway { st: self.st.clone() };
         tokio::spawn(async move {
             tokio::time::sleep(PATROL_WARMUP).await;
@@ -2750,6 +2974,95 @@ impl Gateway {
                 tokio::time::sleep(PATROL_TICK).await;
             }
         });
+    }
+
+    /// 会话预热（Pro）。粘住的会话余量 < 30% 时，对「换家后最可能接手」
+    /// 的候选做一次轻量探针，把它的健康/延迟状态测新鲜——等真要解粘时，
+    /// Gate 看到的是刚出炉的档案，而不是六小时前巡检留下的旧数据。
+    fn spawn_prewarm(&self) {
+        let gw = Gateway { st: self.st.clone() };
+        tokio::spawn(async move {
+            tokio::time::sleep(PATROL_WARMUP).await;
+            loop {
+                if !gw.st.running.load(Ordering::SeqCst) {
+                    break;
+                }
+                gw.prewarm_once().await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    const PREWARM_RATIO: f64 = 0.30;
+    /// 同一目标 30 分钟内只预热一次：探针也要花额度
+    const PREWARM_DEDUPE_MS: i64 = 30 * 60_000;
+
+    async fn prewarm_once(&self) {
+        let pro = {
+            let d = self.st.data.read().await;
+            crate::pro::allow(&d, crate::pro::Feature::Prewarm)
+        };
+        if !pro {
+            return;
+        }
+        let now = freeport_core::cooldown::now_ms();
+        let sticks: Vec<freeport_core::affinity::Stick> = {
+            let af = self.st.affinity.lock().unwrap_or_else(|e| e.into_inner());
+            af.active(now).into_iter().map(|(_, s)| s).collect()
+        };
+        let mut tried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for s in sticks {
+            let pick = {
+                let d = self.st.data.read().await;
+                if d.ledger.remaining_ratio(&s.account, now) >= Self::PREWARM_RATIO {
+                    continue;
+                }
+                plan_with(
+                    &d,
+                    &s.model,
+                    &self.st.cooldowns,
+                    &|a: &freeport_core::model::Account| secrets::has_credential(&a.id),
+                    &d.ledger,
+                    Needs::default(),
+                    Purpose::Chat,
+                )
+                .candidates
+                .into_iter()
+                .find(|c| d.providers.get(c.provider).map(|p| p.id.as_str()) != Some(&s.provider))
+            };
+            let Some(c) = pick else { continue };
+            let pid = {
+                let d = self.st.data.read().await;
+                match d.providers.get(c.provider) {
+                    Some(p) => p.id.clone(),
+                    None => continue,
+                }
+            };
+            let key = format!("{}:{}", pid, c.model_id);
+            if !tried.insert(key.clone()) {
+                continue;
+            }
+            {
+                let mut warm = self.st.prewarmed.lock().unwrap_or_else(|e| e.into_inner());
+                if warm
+                    .get(&key)
+                    .map(|t| now - *t < Self::PREWARM_DEDUPE_MS)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                warm.insert(key, now);
+                if warm.len() > 256 {
+                    warm.retain(|_, t| now - *t < Self::PREWARM_DEDUPE_MS);
+                }
+            }
+            tracing::info!(
+                provider = %pid,
+                model = %c.model_id,
+                "会话预热：粘住的厂商余量见底，提前体检下一个候选"
+            );
+            self.probe_model(&pid, &c.model_id, false).await;
+        }
     }
 
     async fn patrol_tick(&self) {
@@ -2789,9 +3102,32 @@ impl Gateway {
     }
 }
 
+/// 这个监听地址是不是只有本机能到。`localhost` / 回环 IP 算是；
+/// `0.0.0.0`、LAN IP、机器名都算「包能出机器」。
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// 按已接入厂商的日配额算今日探针预算。
+///
+/// 免费版固定 5 次/天（`pro::PATROL_FREE`）：只够「今天有谁挂了」的最低
+/// 感知；Pro 走 `clamp(日配额×1%, 60, 2400)` 自动扩展。用户自设的
+/// `budget_cap` 两边都只往下压、不放开。判断收在这一处，
+/// 调用方（含每日 roll）不用改。
 fn budget_of(cat: &Catalog, data: &AppData) -> u32 {
-    let quotas: Vec<u32> = data
+    let capped = |auto: u32| match data.patrol.budget_cap {
+        Some(c) if c > 0 => auto.min(c),
+        _ => auto,
+    };
+    if !crate::pro::allow(data, crate::pro::Feature::PatrolPlus) {
+        return capped(crate::pro::PATROL_FREE);
+    }
+    let sum: u32 = data
         .providers
         .iter()
         .filter(|p| p.enabled)
@@ -2806,8 +3142,8 @@ fn budget_of(cat: &Catalog, data: &AppData) -> u32 {
                         .unwrap_or(0)
                 })
         })
-        .collect();
-    budget::total_budget(&quotas, data.patrol.budget_cap)
+        .sum();
+    capped((sum / 100).clamp(budget::MIN_BUDGET, crate::pro::PATROL_MAX_PRO))
 }
 
 impl Default for Gateway {
@@ -3235,7 +3571,7 @@ async fn get_model(
 ///
 /// 返回依据（`PurposeSource`）是为了写进日志：池过滤是静默的，
 /// 不记依据的话，「为什么没走那把更快的 key」只能靠猜。
-fn purpose_of(headers: &HeaderMap, needs: Needs, key_name: Option<&str>) -> (Purpose, PurposeSource) {
+fn purpose_of(headers: &HeaderMap, needs: Needs, key_name: Option<&str>, payload: &Value) -> (Purpose, PurposeSource) {
     let declared = headers
         .get("x-freeport-purpose")
         .and_then(|v| v.to_str().ok())
@@ -3252,7 +3588,9 @@ fn purpose_of(headers: &HeaderMap, needs: Needs, key_name: Option<&str>) -> (Pur
         }
     }
     let from_agent = key_name.map(|n| n.starts_with("agent:")).unwrap_or(false);
-    Purpose::infer_with_source(declared, needs.vision, from_agent)
+    // 带上请求体：三信号都没命中时，看请求特征像不像编码（零成本启发式，
+    // 不调小模型）。判不出回落 chat，与旧行为一致。
+    Purpose::infer_deep_with_source(declared, needs.vision, from_agent, Some(payload))
 }
 
 /// 会话标识：优先用调用方显式给的 header，没有就按对话内容推指纹。
@@ -3286,8 +3624,9 @@ fn build_plan(
     session: &str,
     needs: Needs,
     purpose: Purpose,
+    key_id: &str,
 ) -> (Plan, bool) {
-    build_plan_opts(st, d, requested, session, true, needs, purpose)
+    build_plan_opts(st, d, requested, session, true, needs, purpose, key_id)
 }
 
 /// `commit = false` 是「预演」：SWRR 用状态副本算顺序、不写回粘性表。
@@ -3302,6 +3641,7 @@ fn build_plan_opts(
     commit: bool,
     needs: Needs,
     purpose: Purpose,
+    key_id: &str,
 ) -> (Plan, bool) {
     // 对外露的是 `claude-freeport-*`，进来先脱壳，否则裸 id 找不到任何厂商
     let requested = freeport_core::route::resolve_alias(requested);
@@ -3321,8 +3661,9 @@ fn build_plan_opts(
             af.peek(session, now).cloned()
         };
         if let Some(s) = prev {
-            // 余量见底就主动解粘：粘在最后一滴额度上，比换家贵得多
-            if d.ledger.remaining_ratio(&s.account, now) < affinity::UNSTICK_RATIO {
+            // 余量见底就主动解粘：粘在最后一滴额度上，比换家贵得多。
+            // 阈值默认 0.10；Pro 可以自定义（pro::unstick_ratio 统一收口）。
+            if d.ledger.remaining_ratio(&s.account, now) < crate::pro::unstick_ratio(d) {
                 if commit {
                     st.affinity
                         .lock()
@@ -3342,16 +3683,26 @@ fn build_plan_opts(
 
     // ② Order：没粘住才轮转
     if !sticky && p.candidates.len() > 1 {
-        let strategy = Strategy::parse(&d.routing.strategy);
+        // 策略档（Pro）：按 key 前缀 / 用途命中的第一条覆盖全局策略与权重；
+        // 没开 Pro 或没命中 → 沿用全局。匹配只影响「这一单怎么排」，
+        // 不碰 Gate 的准入——分池与熔断与档位无关。
+        let (strat, weights_ov) = match crate::pro::resolve_profile(d, key_id, purpose) {
+            Some(prof) => (
+                prof.strategy.clone(),
+                prof.weights.filter(|w| w.enabled),
+            ),
+            None => (d.routing.strategy.clone(), None),
+        };
+        let strategy = Strategy::parse(&strat);
         let cands = std::mem::take(&mut p.candidates);
         p.candidates = {
             let mut swrr = st.swrr.lock().unwrap_or_else(|e| e.into_inner());
             if commit {
-                swrr.order_with(strategy, cands, d, &d.ledger, now)
+                swrr.order_with_weights(strategy, cands, d, &d.ledger, now, weights_ov)
             } else {
                 // 副本推进：既不写回，也不影响下一次真实请求
                 let mut ghost = swrr.clone();
-                ghost.order_with(strategy, cands, d, &d.ledger, now)
+                ghost.order_with_weights(strategy, cands, d, &d.ledger, now, weights_ov)
             }
         };
     }
@@ -3412,7 +3763,8 @@ async fn explain_route_json(
 ) -> serde_json::Value {
     let d = st.data.read().await;
     let now = freeport_core::cooldown::now_ms();
-    let (p, sticky) = build_plan_opts(st, &d, model, session, commit, needs, purpose);
+    // 预演不带 key 身份：策略档按「默认调用方」展示，命中不了档就展示全局策略
+    let (p, sticky) = build_plan_opts(st, &d, model, session, commit, needs, purpose, "");
     let weights = d.routing.weights.active();
 
     let hops = p
@@ -3792,8 +4144,8 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
             // 老 authToken 不在 key 列表里，但日志里也得看得出「这条是老客户端打的」
             .or_else(|| (key_label == "default").then(|| "legacy token".to_string()));
         // 用途要在 plan 之前定：它参与候选过滤，不是事后标注
-        let (purpose, source) = purpose_of(&headers, needs, name.as_deref());
-        let (mut p, sticky) = build_plan(&st, &d, &requested, &session, needs, purpose);
+        let (purpose, source) = purpose_of(&headers, needs, name.as_deref(), &payload);
+        let (mut p, sticky) = build_plan(&st, &d, &requested, &session, needs, purpose, &key_label);
         // key 的模型白名单在计划之后过滤：候选（provider + model）要到这一步才存在。
         // 过滤掉的不静默消失，写进 rejected，用户才知道是 key 白名单挡的。
         if let Some(k) = d.api_keys.iter().find(|k| k.id == key_label) {
@@ -4052,7 +4404,7 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                                 total_ms: d.gateway.hold_total_ms.min(cap),
                             }
                         };
-                        match hold::wait_commit(upstream, &cfg, upwire::wire_of_provider(&provider_id)).await {
+                        match hold::wait_commit(upstream, &cfg, upwire::wire_of(&provider)).await {
                             HoldOutcome::Committed { head, rest } => Ok((head, rest)),
                             HoldOutcome::Rejected { kind, detail } => {
                                 // 这段 detail 会被写进日志并回给客户端，先抹掉 key
@@ -4067,8 +4419,8 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                         Ok((head, rest)) => {
                             mark_success(&st, &mut entry, &provider_id, &account_id, &model_id, t0.elapsed().as_millis() as u64, cand.half_open, &session).await;
                             let trail = trail_of(&entry);
-                            let wire = upwire::wire_of_provider(&provider_id);
-                            return stream_response(st.clone(), head, rest, entry, started, provider_id, account_id, model_id, trail, limits, est_total, wire, slot);
+                            let wire = upwire::wire_of(&provider);
+                            return stream_response(st.clone(), head, rest, entry, started, provider_id, account_id, model_id, trail, limits, est_total, payload, budget_ms, wire, slot);
                         }
                         Err((kind, detail)) => {
                             let cls = if kind == "upstream_body" {
@@ -4120,7 +4472,7 @@ async fn chat(State(st): State<Arc<State_>>, headers: HeaderMap, body: Bytes) ->
                     serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
                 // 上游讲原生协议时，从这里开始一切必须回到 OpenAI 形态：
                 // 记账、幂等、缓存、回给客户端的都是这个形状
-                let wire = upwire::wire_of_provider(&provider_id);
+                let wire = upwire::wire_of(&provider);
                 if !wire.is_openai() {
                     json = upwire::response(wire, &json, &model_id);
                 }
@@ -4725,7 +5077,7 @@ async fn embeddings_entry(State(st): State<Arc<State_>>, headers: HeaderMap, bod
     let (budget_ms, plan, has_any_key) = {
         let d = st.data.read().await;
         let (mut p, _sticky) =
-            build_plan(&st, &d, &requested, "", Needs::default(), Purpose::Chat);
+            build_plan(&st, &d, &requested, "", Needs::default(), Purpose::Chat, &key_label);
         // 虚拟 key 的白名单同样要过：embeddings 不该成为绕过白名单的侧门
         if let Some(k) = d.api_keys.iter().find(|k| k.id == key_label) {
             if !k.allowed_models.is_empty() {
@@ -4774,8 +5126,8 @@ async fn embeddings_entry(State(st): State<Arc<State_>>, headers: HeaderMap, bod
             let quota = p.account(&cand.account).and_then(|a| a.quota);
             (p, quota)
         };
-        // 订阅号的原生端点没有 embeddings：不是失败，是这单从一开始就不该来
-        if !upwire::wire_of_provider(&provider.id).is_openai() {
+        // 订阅号与原生端点（含 Gemini 原生）没有 embeddings：不是失败，是这单从一开始就不该来
+        if !upwire::wire_of(&provider).is_openai() {
             entry.attempts.push(Attempt {
                 provider: provider.id.clone(),
                 account: Some(cand.account.clone()),
@@ -5457,6 +5809,8 @@ fn stream_response(
     trail: String,
     limits: [f64; 4],
     reserved: f64,
+    payload: Value,
+    budget_ms: u64,
     wire: upwire::Wire,
     slot: AcctSlot,
 ) -> Response {
@@ -5465,13 +5819,51 @@ fn stream_response(
     // 转换要用模型名，header 也要用——spawn 会把 model_id 移走，各留一份
     let model_for_wire = model_id.clone();
     let model_for_header = model_id.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    let (mut tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
 
     tokio::spawn(async move {
         // 名额跟着流走：流结束（或客户端断开）才释放，否则「限并发」只是限住了握手
         let _slot = slot;
         let mut tail = String::new();
-        let mut broken = false;
+        let mut acc = continuation::ContentAcc::new();
+        let mut client_gone = false;
+
+        // 把一段上游流原样转给客户端，顺便喂正文累积器（供续写用）。
+        // 返回 None = 正常结束；Some(e) = 连接级报错（区别于「干净断流」）。
+        async fn pump(
+            stream: &mut futures_util::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>,
+            tx: &mut tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+            tail: &mut String,
+            acc: &mut continuation::ContentAcc,
+            client_gone: &mut bool,
+        ) -> Option<String> {
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        // 只保留尾部用于抓 usage，最多 8KB
+                        let piece = String::from_utf8_lossy(&bytes);
+                        tail.push_str(&piece);
+                        if tail.len() > 8192 {
+                            let cut = tail.len() - 8192;
+                            let cut =
+                                tail.char_indices().nth(cut).map(|(i, _)| i).unwrap_or(cut);
+                            *tail = tail[cut..].to_string();
+                        }
+                        acc.feed(&piece);
+                        if tx.send(Ok(bytes)).await.is_err() {
+                            *client_gone = true;
+                            break; // 客户端断开
+                        }
+                    }
+                    Err(e) => {
+                        // 不在这里发 error 帧：也许还有一次续写机会，收尾时统一处理
+                        return Some(e.to_string());
+                    }
+                }
+            }
+            None
+        }
+
         // head 是 Hold 阶段已经读掉的字节，必须先补发给客户端
         let mut stream = futures_util::stream::iter(
             head.into_iter().map(|b| Ok::<Bytes, reqwest::Error>(b)),
@@ -5482,43 +5874,65 @@ fn stream_response(
         // 以及再往上一层对客户端协议的转换，全都按 OpenAI 的形状写的。
         // head 和 rest 一起进转换，否则断在帧中间的那一片会丢。
         if !wire.is_openai() {
-            stream = upwire::rewrite(wire, model_for_wire, stream);
+            stream = upwire::rewrite(wire, model_for_wire.clone(), stream);
         }
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    // 只保留尾部用于抓 usage，最多 8KB
-                    let piece = String::from_utf8_lossy(&bytes);
-                    tail.push_str(&piece);
-                    if tail.len() > 8192 {
-                        let cut = tail.len() - 8192;
-                        let cut = tail.char_indices().nth(cut).map(|(i, _)| i).unwrap_or(cut);
-                        tail = tail[cut..].to_string();
-                    }
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        break; // 客户端断开
-                    }
+
+        let mut broken = pump(&mut stream, &mut tx, &mut tail, &mut acc, &mut client_gone).await;
+        let mut complete = broken.is_none() && stream_complete(&tail);
+
+        // CONTINUE（§中途接力）：正文已有、没碰工具调用、客户端还连着——
+        // 把已收到的正文接回上游续写一次。预写不够 / 续写失败都拿到 None，
+        // 那时再走下面的 STOP，行为与从前一致。
+        if !complete && !client_gone && !acc.tool_call && !acc.content.is_empty() {
+            let cont_t0 = Instant::now();
+            if let Some(resp) = continuation::resume(
+                &st,
+                &provider_id,
+                &account_id,
+                &model_for_wire,
+                &payload,
+                &acc.content,
+                started,
+                budget_ms,
+            )
+            .await
+            {
+                let mut s2 = resp.bytes_stream().boxed();
+                if !wire.is_openai() {
+                    s2 = upwire::rewrite(wire, model_for_wire.clone(), s2);
                 }
-                Err(e) => {
-                    let msg = format!(
-                        "data: {}\n\n",
-                        oai_error(
-                            &format!("上游流中断: {e}"),
-                            "freeport_stream_error",
-                            "stream_broken",
-                            json!({})
-                        )
-                    );
-                    let _ = tx.send(Ok(Bytes::from(msg))).await;
-                    broken = true;
-                    break;
-                }
+                broken = pump(&mut s2, &mut tx, &mut tail, &mut acc, &mut client_gone).await;
+                complete = broken.is_none() && stream_complete(&tail);
+                entry.attempts.push(Attempt {
+                    provider: provider_id.clone(),
+                    account: Some(account_id.clone()),
+                    model: model_id.clone(),
+                    ms: cont_t0.elapsed().as_millis() as u64,
+                    status: if broken.is_some() { 0 } else { 200 },
+                    kind: "stream_continued".into(),
+                    scope: None,
+                    cooled_ms: None,
+                    detail: None,
+                    skip_provider: None,
+                });
             }
         }
+
         // STOP：已经交出去的内容收不回来，但「没答完」必须说出来。
         // 静默闭合最坏——客户端当成正常结束，用户看到一段被截断的回答，
         // 还会在此基础上继续追问。
-        if !broken && !stream_complete(&tail) {
+        if let Some(e) = broken {
+            let msg = format!(
+                "data: {}\n\n",
+                oai_error(
+                    &format!("上游流中断: {e}"),
+                    "freeport_stream_error",
+                    "stream_broken",
+                    json!({})
+                )
+            );
+            let _ = tx.send(Ok(Bytes::from(msg))).await;
+        } else if !complete {
             entry.error = Some("上游流在结束标记前断开".into());
             let msg = format!(
                 "data: {}\n\n",
@@ -5776,12 +6190,20 @@ async fn record(st: &Arc<State_>, entry: LogEntry) {
         }
     }
     {
+        let cap = {
+            let d = st.data.read().await;
+            crate::pro::log_ring_cap(&d)
+        };
         let mut logs = st.logs.write().await;
         logs.insert(0, entry.clone());
-        if logs.len() > LOG_RING {
-            logs.truncate(LOG_RING);
+        if logs.len() > cap {
+            logs.truncate(cap);
         }
     }
+    // 90 天留存（Pro）：进环后顺手落盘。失败只 warn，不影响请求。
+    crate::reports::on_record(st, &entry).await;
+    // OTLP 导出（opt-in）：挂进队列由后台任务批量上报，失败不影响请求。
+    crate::otlp::on_record(st, &entry).await;
     let sink = st.on_log.read().await.clone();
     if let Some(f) = sink {
         f(entry);
@@ -5790,7 +6212,33 @@ async fn record(st: &Arc<State_>, entry: LogEntry) {
 
 #[cfg(test)]
 mod tests {
-    use super::stream_complete;
+    use super::{budget_of, stream_complete};
+    use crate::pro::PATROL_FREE;
+    use freeport_catalog::Catalog;
+    use freeport_core::model::AppData;
+
+    // 免费开放时代（pro::FREE_FOR_ALL）巡检预算走 Pro 路径，本用例保留
+    // 待恢复收费时移除 ignore。
+    #[test]
+    #[ignore = "FREE_FOR_ALL：预算走 Pro 路径，恢复收费时移除 ignore"]
+    fn free_patrol_budget_is_fixed_five() {
+        let d = AppData::default();
+        let cat = Catalog::default();
+        assert!(!crate::license::state(&d).pro, "测试环境默认无有效 license");
+        assert_eq!(budget_of(&cat, &d), PATROL_FREE);
+    }
+
+    #[test]
+    #[ignore = "FREE_FOR_ALL：预算走 Pro 路径，恢复收费时移除 ignore"]
+    fn budget_cap_only_lowers_free_budget() {
+        let mut d = AppData::default();
+        let cat = Catalog::default();
+        d.patrol.budget_cap = Some(3);
+        assert_eq!(budget_of(&cat, &d), 3);
+        // 自设 cap 再大也压不过免费档的 5——否则它就成了免费解锁口
+        d.patrol.budget_cap = Some(600);
+        assert_eq!(budget_of(&cat, &d), PATROL_FREE);
+    }
 
     #[test]
     fn done_marker_counts_as_finished() {

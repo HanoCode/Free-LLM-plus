@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Check, Copy, X } from 'lucide-react';
-import { tierLabel, useLang } from '../lib/i18n';
+import { Check, Copy, TriangleAlert, X } from 'lucide-react';
+import { T, tierLabel, useLang } from '../lib/i18n';
 
 /* ── Badge ──────────────────────────────── */
 export type Tone = 'gray' | 'accent' | 'ok' | 'warn' | 'bad' | 'info';
@@ -89,11 +89,13 @@ export function Switch({
 }
 
 /* ── Copy ───────────────────────────────── */
-export function CopyBtn({ value, label }: { value: string; label?: string }) {
+export function CopyBtn({ value, label, tip }: { value: string; label?: string; tip?: string }) {
   const [done, setDone] = useState(false);
   return (
     <button
       className="copy-mini"
+      // 只在图标态（不显示文字）时需要气泡提示；有文字的样式保持原样
+      {...(!label && tip ? { 'data-tip': tip } : null)}
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(value);
@@ -147,7 +149,7 @@ export function Modal({
             <h3>{title}</h3>
             {subtitle && <div className="sub">{subtitle}</div>}
           </div>
-          <button className="icon-btn" onClick={onClose} aria-label="close">
+          <button className="icon-btn" onClick={onClose} data-tip="关闭 / Close" aria-label="close">
             <X size={13} />
           </button>
         </div>
@@ -184,6 +186,91 @@ export function ToastHost() {
   }, []);
 
   return <div className={`toast ${show ? 'show' : ''}`}>{msg}</div>;
+}
+
+/* ── 高危操作确认 ───────────────────────────────
+   危险面大的操作（删凭据、清冷却、覆盖导入）统一走这里：
+   红色确认按钮 + 可选的输入确认词（打字要过脑子，勾选框太容易顺手勾上）。
+   用法：if (!(await confirmDanger({ zh, en, confirmWord: '删除' }))) return; */
+
+interface ConfirmReq {
+  zh: string;
+  en: string;
+  confirmWord?: string;
+  resolve: (ok: boolean) => void;
+}
+
+let confirmEmit: ((r: ConfirmReq) => void) | null = null;
+
+export function confirmDanger(opts: { zh: string; en: string; confirmWord?: string }): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!confirmEmit) {
+      // ConfirmHost 没挂载时兜底走原生 confirm，别让操作悄悄放行
+      resolve(window.confirm(opts.zh));
+      return;
+    }
+    confirmEmit({ ...opts, resolve });
+  });
+}
+
+export function ConfirmHost() {
+  const lang = useLang();
+  const [req, setReq] = useState<ConfirmReq | null>(null);
+  const [typed, setTyped] = useState('');
+
+  useEffect(() => {
+    confirmEmit = (r) => {
+      setReq(r);
+      setTyped('');
+    };
+    return () => {
+      confirmEmit = null;
+    };
+  }, []);
+
+  if (!req) return null;
+  const wordOk = !req.confirmWord || typed.trim() === req.confirmWord;
+  const close = (ok: boolean) => {
+    setReq(null);
+    req.resolve(ok);
+  };
+
+  return (
+    <div className="palette-mask" onMouseDown={() => close(false)}>
+      <div className="confirm-box" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="confirm-title">
+          <TriangleAlert size={14} />
+          <span>{lang === 'zh' ? '确认执行该操作' : 'Confirm this action'}</span>
+        </div>
+        <p className="confirm-body">{lang === 'zh' ? req.zh : req.en}</p>
+        {req.confirmWord && (
+          <input
+            className="confirm-input"
+            autoFocus
+            placeholder={lang === 'zh' ? `输入「${req.confirmWord}」以确认` : `type "${req.confirmWord}" to confirm`}
+            value={typed}
+            onChange={(e) => setTyped(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && wordOk) close(true);
+              if (e.key === 'Escape') close(false);
+            }}
+          />
+        )}
+        <div className="confirm-actions">
+          <button className="btn ghost sm" onClick={() => close(false)}>
+            <T zh="取消" en="Cancel" />
+          </button>
+          <button
+            className="btn danger sm"
+            disabled={!wordOk}
+            onClick={() => close(true)}
+          >
+            <T zh="确认执行" en="Confirm" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ── 小工具 ─────────────────────────────── */

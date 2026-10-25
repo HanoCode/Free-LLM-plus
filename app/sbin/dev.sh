@@ -18,6 +18,7 @@ command -v cargo >/dev/null 2>&1 || die "缺少 cargo（https://rustup.rs）"
 
 cd "$APP_DIR"
 
+
 # devUrl 固定 5273（见 src-tauri/tauri.conf.json），被占会导致窗口空白
 if lsof -nP -iTCP:5273 -sTCP:LISTEN >/dev/null 2>&1; then
   die "端口 5273 已被占用，可能已有 dev 实例在运行。查看: lsof -nP -iTCP:5273 -sTCP:LISTEN"

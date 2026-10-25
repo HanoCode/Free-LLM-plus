@@ -45,6 +45,13 @@ pub struct GwStatus {
     pub cache: bool,
     #[serde(rename = "cacheTtlSecs")]
     pub cache_ttl_secs: u64,
+    /// OTLP 导出（设置页据此显示当前值）
+    #[serde(rename = "otlpEnabled")]
+    pub otlp_enabled: bool,
+    #[serde(rename = "otlpEndpoint")]
+    pub otlp_endpoint: String,
+    #[serde(rename = "otlpHeaders")]
+    pub otlp_headers: Vec<String>,
     pub cooldowns: Vec<CooldownSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -328,6 +335,9 @@ pub struct GwRouting {
     /// 三维评分权重。始终下发（含 `enabled = false` 的默认值），
     /// 界面才有东西可渲染——不给的话开关会显示成「未知」。
     pub weights: crate::model::RouteWeights,
+    /// 策略档（Pro）。空的 profile 不会存进来。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<crate::model::StrategyProfile>,
     pub cooldowns: Vec<CooldownSnapshot>,
 }
 
@@ -365,6 +375,9 @@ pub struct RoutingPatch {
     /// 三维权重整体替换。`None` = 不动；`enabled = false` 即退回旧公式。
     #[serde(default)]
     pub weights: Option<crate::model::RouteWeights>,
+    /// 策略档整体替换（Pro）。`None` = 不动；空数组即清空。
+    #[serde(default)]
+    pub profiles: Option<Vec<crate::model::StrategyProfile>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -392,6 +405,15 @@ pub struct ConfigPatch {
     /// 响应缓存生存期（秒）
     #[serde(default, rename = "cacheTtlSecs")]
     pub cache_ttl_secs: Option<u64>,
+    /// OTLP 导出开关（traces，OTLP/HTTP + JSON）
+    #[serde(default)]
+    pub otlp_enabled: Option<bool>,
+    /// OTLP collector 地址（基址或完整 `/v1/traces`）
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// OTLP 自定义请求头，一行一个 `Key: Value`
+    #[serde(default)]
+    pub otlp_headers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -951,6 +973,79 @@ impl GwLoginState {
     }
 }
 
+/* ── 订阅（立即订阅 → 浏览器支付 → 自动回跳激活） ───────────── */
+
+/// 发起订阅的返回。`url` 指向 license 服务器的 /subscribe 页，已带
+/// state（与回环回调配对）；port 是本机回调端口，None = 只能轮询 +
+/// 手动贴码。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwSubscribeStart {
+    pub subscribe_id: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// 订阅会话有效期（秒），与订单窗口一致
+    pub expires_in: u64,
+}
+
+/// 一次订阅等待的结果。UI 循环调 wait，拿到 done/expired/error 才停。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwSubscribeState {
+    /// `pending` / `done` / `expired` / `error`
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// done 时带上激活好的许可证，UI 直接换状态不用再拉一次
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<GwLicense>,
+}
+
+impl GwSubscribeState {
+    pub fn pending() -> Self {
+        Self { status: "pending".into(), message: None, license: None }
+    }
+
+    pub fn done(license: GwLicense) -> Self {
+        Self { status: "done".into(), message: None, license: Some(license) }
+    }
+
+    pub fn expired() -> Self {
+        Self {
+            status: "expired".into(),
+            message: Some("订阅会话已过期，请重新发起".into()),
+            license: None,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self { status: "error".into(), message: Some(message.into()), license: None }
+    }
+}
+
+/// 授权管理：一台已激活设备。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GwDevice {
+    pub machine_id: String,
+    pub activated_at: i64,
+    pub last_refresh: i64,
+    /// 本机标记（客户端按自己的 machineId 对上的）
+    #[serde(default)]
+    pub current: bool,
+}
+
+/// 授权管理：席位占用总览。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwLicenseDevices {
+    pub items: Vec<GwDevice>,
+    pub seats: i64,
+    /// `lifetime` / `annual`
+    pub plan: String,
+}
+
 /// 近期观测：把内存日志环折成「快不快、花了多少、谁在烧」。
 ///
 /// 与 `/v1/freeport/inspect` 的 `window` 段同源——两边都调
@@ -997,6 +1092,126 @@ pub struct GwBucket {
     pub avg_ok_ms: u64,
 }
 
+/* ── Pro 本机功能（v1.12）：云端只做授权，以下全部本地计算 ── */
+
+/// 本机额度情报：按 `provider×model` 聚合最近请求 + 账本 + 健康度。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwIntel {
+    /// false 时 models 恒为空——UI 直接进 paywall，不渲染假数据
+    pub pro: bool,
+    pub models: Vec<GwModelIntel>,
+    /// 参与聚合的日志条数（内存环上限 300，如实告知样本量）
+    pub scanned: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwModelIntel {
+    pub provider: String,
+    pub model: String,
+    pub requests: usize,
+    pub errors: usize,
+    #[serde(rename = "okRate")]
+    pub ok_rate: f64,
+    #[serde(rename = "p50Ms")]
+    pub p50_ms: Option<u64>,
+    #[serde(rename = "p95Ms")]
+    pub p95_ms: Option<u64>,
+    /// 该厂商账本上最紧的窗口剩余比例（None = 没记过账）
+    pub remaining: Option<f64>,
+    /// 健康状态机当前档（unknown/healthy/...）
+    pub health: Option<String>,
+    /// 最近一次错误（截断到 120 字符）
+    pub last_error: Option<String>,
+    /// 最近一次使用时间（RFC3339）
+    pub last_used_at: Option<String>,
+}
+
+/// 用量报表：基于本地持久化的请求日志（Pro = 90 天，免费 = 仅内存环）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwReports {
+    pub pro: bool,
+    /// 持久化覆盖的天数（0 = 没有留存文件）
+    pub days: usize,
+    /// 逐天统计，按日期升序
+    pub daily: Vec<GwDayStat>,
+    /// 区间内按模型排行（前 10）
+    pub top_models: Vec<GwModelStat>,
+    /// 区间按用途
+    pub by_purpose: Vec<GwBucket>,
+    /// 区间按虚拟 key
+    pub by_key: Vec<GwBucket>,
+    pub requests: usize,
+    pub errors: usize,
+    #[serde(rename = "tokensIn")]
+    pub tokens_in: u64,
+    #[serde(rename = "tokensOut")]
+    pub tokens_out: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwDayStat {
+    /// 本地日期 YYYY-MM-DD
+    pub date: String,
+    pub requests: usize,
+    pub errors: usize,
+    #[serde(rename = "tokensIn")]
+    pub tokens_in: u64,
+    #[serde(rename = "tokensOut")]
+    pub tokens_out: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwModelStat {
+    pub provider: String,
+    pub model: String,
+    pub requests: usize,
+    pub errors: usize,
+    #[serde(rename = "tokensIn")]
+    pub tokens_in: u64,
+    #[serde(rename = "tokensOut")]
+    pub tokens_out: u64,
+    #[serde(rename = "avgOkMs")]
+    pub avg_ok_ms: u64,
+}
+
+/// Pro 功能开关的下发与回写。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GwPro {
+    pub pro: bool,
+    pub prewarm: bool,
+    pub unstick_ratio: Option<f64>,
+    /// 粘性窗口（分钟）。None = 默认 30 分钟（免费版恒为 None 语义）
+    pub stick_ttl_min: Option<u32>,
+    pub backup: crate::model::BackupCfg,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProPatch {
+    #[serde(default)]
+    pub prewarm: Option<bool>,
+    /// 0.02..=0.5 之外的值会被夹住；传 null 回默认
+    #[serde(default)]
+    pub unstick_ratio: Option<Option<f64>>,
+    /// 粘性窗口（分钟）；传 null 回默认 30
+    #[serde(default)]
+    pub stick_ttl_min: Option<Option<u32>>,
+    #[serde(default)]
+    pub backup_enabled: Option<bool>,
+    #[serde(default)]
+    pub backup_dir: Option<String>,
+    #[serde(default)]
+    pub backup_interval_hours: Option<u32>,
+    #[serde(default)]
+    pub backup_keep: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1227,7 @@ mod tests {
             enabled: true,
             added_at: String::new(),
             proxy: None,
+            wire: None,
             models: ids
                 .iter()
                 .map(|id| ModelInfo {

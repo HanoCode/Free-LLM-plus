@@ -9,10 +9,11 @@
 use std::sync::Arc;
 
 use freeport_core::dto::{
-    AccountInput, AccountPatch, AddProviderResult, ConfigPatch, FeedPatch, GwCatalog, GwFeed, GwKey,
-    GwLicense, GwLoginStart, GwLoginState,
-    GwModel, GwModelProbe, GwPatrol, GwProvider, GwQuota, GwRouting, GwStatus, KeyCreated, KeyInput,
-    PatrolPatch, PatrolReport, ProbeResult, ProviderInput, RoutingPatch,
+    AccountInput, AccountPatch, AddProviderResult, ConfigPatch, FeedPatch, GwCatalog, GwFeed, GwIntel,
+    GwKey, GwLicense, GwLicenseDevices, GwLoginStart, GwLoginState,
+    GwModel, GwModelProbe, GwPatrol, GwPro, GwProvider, GwQuota, GwReports, GwRouting, GwStatus,
+    GwSubscribeStart, GwSubscribeState,
+    KeyCreated, KeyInput, PatrolPatch, PatrolReport, ProPatch, ProbeResult, ProviderInput, RoutingPatch,
 };
 use freeport_core::model::LogEntry;
 use freeport_core::presets::ProviderPreset;
@@ -95,8 +96,21 @@ fn win_prefs() -> prefs::DesktopPrefs {
 }
 
 #[tauri::command]
-fn win_set_prefs(patch: prefs::PrefsPatch) -> Result<prefs::DesktopPrefs, String> {
-    prefs::apply(patch)
+fn win_set_prefs(app: tauri::AppHandle, patch: prefs::PrefsPatch) -> Result<prefs::DesktopPrefs, String> {
+    let lang_changed = patch.ui_lang.is_some();
+    let saved = prefs::apply(patch)?;
+    // 语言是托盘唯一要跟着变的东西：菜单在 Rust 侧，换完立刻重建
+    if lang_changed {
+        if let Some(tray) = app.tray_by_id("freeport-tray") {
+            match tray_menu(&app) {
+                Ok(menu) => {
+                    let _ = tray.set_menu(Some(menu));
+                }
+                Err(e) => tracing::warn!(error = %e, "重建托盘菜单失败"),
+            }
+        }
+    }
+    Ok(saved)
 }
 
 /// 退出清理：把当前处于 `injected` 的 Agent 全部回滚。
@@ -422,6 +436,81 @@ fn version_gt(a: &str, b: &str) -> bool {
         }
     }
     false
+}
+
+/* ── 自动更新（tauri-plugin-updater） ───────────── */
+
+/// 查询更新通道。走插件（带签名校验 + latest.json），渠道没配置或
+/// collector 不可达时返回 Err——前端据此回落到「打开 Releases 页」的老路。
+/// 成功但已是最新时 available=false。
+#[tauri::command]
+async fn updater_check(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let update = use_updater(&app)?
+        .check()
+        .await
+        .map_err(|e| format!("更新通道不可用：{e}"))?;
+    match update {
+        Some(u) => Ok(serde_json::json!({
+            "current": env!("CARGO_PKG_VERSION"),
+            "available": true,
+            "version": u.version,
+            "notes": u.body,
+        })),
+        None => Ok(serde_json::json!({
+            "current": env!("CARGO_PKG_VERSION"),
+            "available": false,
+        })),
+    }
+}
+
+/// 下载并安装更新，成功后自动重启。
+///
+/// 下载进度经 `updater://progress` 事件发给前端（downloaded / total / phase）。
+/// 必须由用户在设置页显式点「安装」才进来——不弹窗、不静默升级。
+#[tauri::command]
+async fn updater_install(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_updater::UpdaterExt as _;
+
+    let mut update = use_updater(&app)?
+        .check()
+        .await
+        .map_err(|e| format!("更新通道不可用：{e}"))?
+        .ok_or("已经是最新版本")?;
+
+    // 两个回调各拿一份 handle：进度回调是 FnMut（可能多次触发），
+    // 收尾回调是 FnOnce，共享同一份会撞所有权。
+    let h_progress = app.clone();
+    let h_done = app.clone();
+    let mut downloaded: u64 = 0;
+    update
+        .download_and_install(
+            move |chunk, total| {
+                downloaded += chunk as u64;
+                let _ = h_progress.emit(
+                    "updater://progress",
+                    serde_json::json!({ "phase": "download", "downloaded": downloaded, "total": total }),
+                );
+            },
+            move || {
+                let _ = h_done.emit(
+                    "updater://progress",
+                    serde_json::json!({ "phase": "install" }),
+                );
+            },
+        )
+        .await
+        .map_err(|e| format!("更新安装失败：{e}"))?;
+
+    // 安装包已就位，重启是替换二进制的最后一步
+    app.restart()
+}
+
+/// updater 插件句柄。单独包一层是为了让错误信息带上「未配置」的提示，
+/// 而不是一个裸的 plugin error。
+fn use_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    use tauri_plugin_updater::UpdaterExt as _;
+    app.updater()
+        .map_err(|e| format!("更新通道未就绪（{e}）；请到 GitHub Releases 手动下载"))
 }
 
 /* ── 网关控制面 ─────────────────────────────────── */
@@ -763,12 +852,131 @@ async fn gw_clear_license(state: tauri::State<'_, AppState>) -> Result<GwLicense
     Ok(state.gw.clear_license().await)
 }
 
+/* ── 订阅（立即订阅）与授权管理 ───────────────────────────── */
+
+#[tauri::command]
+async fn gw_subscribe_start(state: tauri::State<'_, AppState>) -> Result<GwSubscribeStart, String> {
+    state.gw.subscribe_start().await
+}
+
+/// 等一轮订阅结果。前端循环调（每次最多阻塞 wait_secs 秒），
+/// 拿到 done / expired / error 才停。
+#[tauri::command]
+async fn gw_subscribe_wait(
+    state: tauri::State<'_, AppState>,
+    subscribe_id: String,
+    wait_secs: Option<u64>,
+) -> Result<GwSubscribeState, String> {
+    Ok(state
+        .gw
+        .subscribe_wait(&subscribe_id, wait_secs.unwrap_or(3).clamp(1, 10))
+        .await)
+}
+
+#[tauri::command]
+async fn gw_subscribe_cancel(state: tauri::State<'_, AppState>, subscribe_id: String) -> Result<(), String> {
+    state.gw.subscribe_cancel(&subscribe_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn gw_license_devices(state: tauri::State<'_, AppState>) -> Result<GwLicenseDevices, String> {
+    state.gw.license_devices().await
+}
+
+#[tauri::command]
+async fn gw_license_unbind(state: tauri::State<'_, AppState>, machine_id: String) -> Result<bool, String> {
+    state.gw.license_unbind(&machine_id).await
+}
+
+/* ── Pro 本机功能（v1.12）：情报 / 报表 / 备份 / 策略档 ── */
+
+#[tauri::command]
+async fn gw_intel(state: tauri::State<'_, AppState>) -> Result<GwIntel, String> {
+    Ok(state.gw.intel().await)
+}
+
+#[tauri::command]
+async fn gw_reports(state: tauri::State<'_, AppState>, days: Option<u32>) -> Result<GwReports, String> {
+    Ok(state.gw.reports(days.unwrap_or(30)).await)
+}
+
+/// 导出留存日志到用户挑的路径。`None` = 用户取消。
+#[tauri::command]
+async fn gw_reports_export_file(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let name = format!("freeport-logs-{}.jsonl", chrono::Local::now().format("%Y%m%d"));
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("导出请求日志（JSONL）")
+        .set_file_name(&name)
+        .add_filter("JSONL 日志", &["jsonl"])
+        .blocking_save_file();
+    let Some(fp) = picked else { return Ok(None) };
+    let path = fp
+        .into_path()
+        .map_err(|_| "选择的位置不是本地文件路径".to_string())?;
+    let body = state.gw.reports_export().await?;
+    std::fs::write(&path, body).map_err(|e| format!("写入失败：{e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+async fn gw_pro(state: tauri::State<'_, AppState>) -> Result<GwPro, String> {
+    Ok(state.gw.pro_config().await)
+}
+
+#[tauri::command]
+async fn gw_set_pro(state: tauri::State<'_, AppState>, patch: ProPatch) -> Result<GwPro, String> {
+    Ok(state.gw.set_pro(patch).await)
+}
+
+/// 远程接入（Pro）：切换回环 / 0.0.0.0 监听。重启网关后生效。
+#[tauri::command]
+async fn gw_set_remote(state: tauri::State<'_, AppState>, on: bool) -> Result<GwStatus, String> {
+    state.gw.set_remote(on).await
+}
+
+#[tauri::command]
+async fn gw_backup_now(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    state.gw.backup_now().await
+}
+
+#[tauri::command]
+async fn gw_backup_list(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<freeport_gateway::backup::BackupFile>, String> {
+    Ok(state.gw.backup_list().await)
+}
+
+#[tauri::command]
+async fn gw_backup_restore(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<freeport_gateway::transfer::Summary, String> {
+    state.gw.backup_restore(&name).await
+}
+
+/// 策略档写入（Pro）。整批校验，任何一条非法整体拒绝。
+#[tauri::command]
+async fn gw_set_profiles(
+    state: tauri::State<'_, AppState>,
+    profiles: Vec<freeport_core::model::StrategyProfile>,
+) -> Result<GwRouting, String> {
+    state.gw.set_profiles(profiles).await
+}
+
 #[tauri::command]
 async fn gw_set_routing(
     state: tauri::State<'_, AppState>,
     patch: RoutingPatch,
 ) -> Result<GwRouting, String> {
-    Ok(state.gw.set_routing(patch).await)
+    state.gw.set_routing(patch).await
 }
 
 #[tauri::command]
@@ -1235,7 +1443,7 @@ pub fn run() {
     fmt.init();
 
     if args.iter().any(|a| a == "--headless" || a == "serve") {
-        run_headless();
+        run_headless(args.iter().any(|a| a == "--subscribe"));
         return;
     }
     // sidecar 模式：扩展宿主拉起的独立进程，只服务自己的那一个能力。
@@ -1249,8 +1457,19 @@ pub fn run() {
     let gw = Arc::new(Gateway::new());
 
     tauri::Builder::default()
+        // 单实例锁必须第一个注册。没有它，双击两次图标 = 两个进程抢同一份
+        // 账本文件——额度账会分裂，表现为「莫名其妙 429」。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 第二个实例刚起来就被掐掉，职责只剩把已有窗口带到前台
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // LaunchAgent：macOS 上不注册守护进程，就是一份 ~/Library/LaunchAgents plist
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1309,6 +1528,8 @@ pub fn run() {
             gw_diagnostics,
             gw_save_diagnostics,
             check_update,
+            updater_check,
+            updater_install,
             gw_logs,
             gw_digest,
             gw_window,
@@ -1333,6 +1554,21 @@ pub fn run() {
             gw_license,
             gw_activate_license,
             gw_clear_license,
+            gw_subscribe_start,
+            gw_subscribe_wait,
+            gw_subscribe_cancel,
+            gw_license_devices,
+            gw_license_unbind,
+            gw_intel,
+            gw_reports,
+            gw_reports_export_file,
+            gw_pro,
+            gw_set_pro,
+            gw_set_remote,
+            gw_backup_now,
+            gw_backup_list,
+            gw_backup_restore,
+            gw_set_profiles,
             gw_login_start,
             gw_login_poll,
             gw_login_wait,
@@ -1390,15 +1626,27 @@ pub fn run() {
         });
 }
 
-fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+/// 托盘菜单。语言跟 DesktopPrefs.uiLang 走（前端切语言时同步写过来）；
+/// 菜单文本只有这一处，别处再抄一份迟早对不上。
+fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    let en = prefs::load().ui_lang.as_deref() == Some("en");
+    let show = MenuItem::with_id(
+        app,
+        "show",
+        if en { "Open Freeport" } else { "打开 Freeport" },
+        true,
+        None::<&str>,
+    )?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", if en { "Quit" } else { "退出" }, true, None::<&str>)?;
+    Menu::with_items(app, &[&show, &sep, &quit])
+}
+
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::tray::TrayIconBuilder;
 
-    let show = MenuItem::with_id(app, "show", "打开 Freeport", true, None::<&str>)?;
-    let sep = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &sep, &quit])?;
-
+    let menu = tray_menu(app)?;
     let mut builder = TrayIconBuilder::with_id("freeport-tray")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -1461,7 +1709,7 @@ fn run_mcp() {
     });
 }
 
-fn run_headless() {
+fn run_headless(subscribe: bool) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1475,6 +1723,39 @@ fn run_headless() {
             Err(e) => {
                 eprintln!("freeport: {e}");
                 std::process::exit(1);
+            }
+        }
+        // 订阅流程（--subscribe）：打印订阅页 URL，阻塞到支付完成/订单过期。
+        // headless 没有回环 UI 的顾虑，但浏览器可能在别的机器上——回调拿不到
+        // 就靠轮询兜底；全失败还能从 URL 页面复制激活码手动输入。
+        if subscribe {
+            match gw.subscribe_start().await {
+                Ok(s) => {
+                    eprintln!("FREEPORT_SUBSCRIBE url={}", s.url);
+                    eprintln!("freeport: 等待支付完成（浏览器打开上面的地址；关掉浏览器也会继续轮询）");
+                    loop {
+                        let st = gw.subscribe_wait(&s.subscribe_id, 5).await;
+                        match st.status.as_str() {
+                            "done" => {
+                                eprintln!("freeport: 订阅完成，Pro 已激活");
+                                break;
+                            }
+                            "expired" => {
+                                eprintln!("freeport: 订单已过期，请重新发起订阅");
+                                break;
+                            }
+                            "error" => {
+                                eprintln!(
+                                    "freeport: 订阅失败：{}",
+                                    st.message.unwrap_or_else(|| "未知错误".into())
+                                );
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => eprintln!("freeport: 发起订阅失败：{e}"),
             }
         }
         let _ = tokio::signal::ctrl_c().await;

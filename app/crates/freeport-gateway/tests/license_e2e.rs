@@ -27,17 +27,18 @@ async fn license_lifecycle() {
     let gw = Gateway::new();
     gw.load().await;
 
-    // 1) 从没激活过：是 missing，不是 invalid —— UI 不该弹红字
+    // 1) 从没激活过：免费开放时代（pro::FREE_FOR_ALL）恒报 free_era/pro，
+    //    UI 不弹红字、功能全开；恢复收费后这里回到 missing
     let l = gw.license().await;
-    assert_eq!(l.status, "missing");
-    assert!(!l.pro);
-    assert_eq!(l.tier, "free");
+    assert_eq!(l.status, "free_era");
+    assert!(l.pro);
+    assert_eq!(l.tier, "pro");
     assert!(l.machine_id.starts_with("m_"));
 
-    // 2) 垃圾 token：拒绝，且不落盘
+    // 2) 垃圾 token：拒绝（激活机制在免费时代仍然工作），且不落盘
     let err = gw.activate_license("not-a-token").await.unwrap_err();
     assert!(err.contains("格式"), "错误要说清原因，实际：{err}");
-    assert_eq!(gw.license().await.status, "missing");
+    assert_eq!(gw.license().await.status, "free_era");
 
     // 3) 真 token：激活成功，能力清单下发
     let token = iss.sign(&Claims::pro("user@example.com", 30, now));
@@ -72,10 +73,11 @@ async fn license_lifecycle() {
     mine.mid = Some(l2.machine_id.clone());
     assert!(gw2.activate_license(&iss.sign(&mine)).await.unwrap().pro);
 
-    // 8) 解除后回到 missing，转发配置一个字节没动
+    // 8) 解除后回到 free_era（免费时代没有「免费版」这个更低的档），
+    //    转发配置一个字节没动
     let l = gw2.clear_license().await;
-    assert_eq!(l.status, "missing");
-    assert!(!l.pro);
+    assert_eq!(l.status, "free_era");
+    assert!(l.pro);
 
     // 9) 宽限期：签名有效、刚过期几天，仍算 Pro，但带提醒。
     //    掉能力会误伤「刚过期还没来得及续费」的付费用户。

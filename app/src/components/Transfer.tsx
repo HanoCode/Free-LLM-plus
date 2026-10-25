@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { FileDown, FileUp, KeyRound, ShieldAlert } from 'lucide-react';
-import { T } from '../lib/i18n';
+import { T, tx, useLang } from '../lib/i18n';
 import { useGateway } from '../lib/gateway';
 import { CopyBtn, toast } from '../components/ui';
 import type { ImportSummary } from '../lib/bridge';
@@ -20,6 +20,7 @@ import type { ImportSummary } from '../lib/bridge';
 const MIN_PASS = 8;
 
 export function Transfer({ desktop }: { desktop: boolean }) {
+  const lang = useLang();
   const exportBundle = useGateway((s) => s.exportBundle);
   const exportBundleFile = useGateway((s) => s.exportBundleFile);
   const importBundle = useGateway((s) => s.importBundle);
@@ -36,34 +37,51 @@ export function Transfer({ desktop }: { desktop: boolean }) {
   const [inBlob, setInBlob] = useState('');
   const [inPass, setInPass] = useState('');
   const [mode, setMode] = useState<'merge' | 'replace'>('merge');
-  const [confirmed, setConfirmed] = useState(false);
+  /** 覆盖模式的确认词：勾选框太容易顺手勾上，打字要过脑子 */
+  const [confirmText, setConfirmText] = useState('');
   const [importing, setImporting] = useState(false);
   const [picking, setPicking] = useState(false);
 
   const [err, setErr] = useState('');
 
+  // 确认词按语言：英文用户不打中文，措辞里写什么就校验什么
+  const confirmWord = tx(lang, '覆盖', 'REPLACE');
+  const replaceConfirmed = mode === 'replace' && confirmText.trim() === confirmWord;
+
   /** 导入结果的统一说法（粘贴与选文件两条路共用） */
   const announce = (sum: ImportSummary) => {
     const kept =
       sum.providersKept + sum.accountsKept + sum.keysKept > 0
-        ? `，已存在 ${sum.providersKept} 个厂商 / ${sum.accountsKept} 条凭据 / ${sum.keysKept} 把虚拟 key`
+        ? tx(
+            lang,
+            `，已存在 ${sum.providersKept} 个厂商 / ${sum.accountsKept} 条凭据 / ${sum.keysKept} 把虚拟 key`,
+            `, kept ${sum.providersKept} providers / ${sum.accountsKept} credentials / ${sum.keysKept} virtual keys`,
+          )
         : '';
     // 墓碑跳过要说出来：不然用户会以为「我删掉的厂商怎么又回来了」
     const buried =
       (sum.providersSkipped ?? 0) + (sum.accountsSkipped ?? 0) > 0
-        ? `；${sum.providersSkipped} 个厂商 / ${sum.accountsSkipped} 条凭据是你在这台机器上删过的，没有导入`
+        ? tx(
+            lang,
+            `；${sum.providersSkipped} 个厂商 / ${sum.accountsSkipped} 条凭据是你在这台机器上删过的，没有导入`,
+            `; ${sum.providersSkipped} providers / ${sum.accountsSkipped} credentials were deleted on this machine and were not imported`,
+          )
         : '';
     toast(
-      `导入完成：+${sum.providersAdded} 厂商 · +${sum.accountsAdded} 凭据 · +${sum.keysAdded} 虚拟 key${kept}${buried}`,
+      tx(
+        lang,
+        `导入完成：+${sum.providersAdded} 厂商 · +${sum.accountsAdded} 凭据 · +${sum.keysAdded} 虚拟 key${kept}${buried}`,
+        `Imported: +${sum.providersAdded} providers · +${sum.accountsAdded} credentials · +${sum.keysAdded} virtual keys${kept}${buried}`,
+      ),
     );
   };
 
   const doExport = async () => {
     setErr('');
     if (pass.length < MIN_PASS) {
-      return setErr(`口令至少 ${MIN_PASS} 位——它保护的是你全部的 API key`);
+      return setErr(tx(lang, `口令至少 ${MIN_PASS} 位——它保护的是你全部的 API key`, `Passphrase must be at least ${MIN_PASS} characters — it protects all of your API keys`));
     }
-    if (pass !== again) return setErr('两次输入的口令不一致');
+    if (pass !== again) return setErr(tx(lang, '两次输入的口令不一致', 'The two passphrases do not match'));
     setExporting(true);
     try {
       const out = await exportBundle(pass);
@@ -83,9 +101,9 @@ export function Transfer({ desktop }: { desktop: boolean }) {
   const doExportFile = async () => {
     setErr('');
     if (pass.length < MIN_PASS) {
-      return setErr(`口令至少 ${MIN_PASS} 位——它保护的是你全部的 API key`);
+      return setErr(tx(lang, `口令至少 ${MIN_PASS} 位——它保护的是你全部的 API key`, `Passphrase must be at least ${MIN_PASS} characters — it protects all of your API keys`));
     }
-    if (pass !== again) return setErr('两次输入的口令不一致');
+    if (pass !== again) return setErr(tx(lang, '两次输入的口令不一致', 'The two passphrases do not match'));
     setSaving(true);
     try {
       const path = await exportBundleFile(pass);
@@ -105,8 +123,14 @@ export function Transfer({ desktop }: { desktop: boolean }) {
     setErr('');
     if (!inBlob.trim()) return setErr('先粘贴迁移码');
     if (!inPass) return setErr('请输入迁移码的口令');
-    if (mode === 'replace' && !confirmed) {
-      return setErr('覆盖会清掉本机现有凭据，请先勾选确认');
+    if (mode === 'replace' && !replaceConfirmed) {
+      return setErr(
+        tx(
+          lang,
+          '覆盖会清掉本机现有凭据：请在下方输入「覆盖」两字确认',
+          'Replace wipes existing credentials on this machine: type REPLACE below to confirm',
+        ),
+      );
     }
     setImporting(true);
     try {
@@ -114,7 +138,7 @@ export function Transfer({ desktop }: { desktop: boolean }) {
       announce(sum);
       setInBlob('');
       setInPass('');
-      setConfirmed(false);
+      setConfirmText('');
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -126,8 +150,14 @@ export function Transfer({ desktop }: { desktop: boolean }) {
   const doImportFile = async () => {
     setErr('');
     if (!inPass) return setErr('请先填写这个迁移包的口令');
-    if (mode === 'replace' && !confirmed) {
-      return setErr('覆盖会清掉本机现有凭据，请先勾选确认');
+    if (mode === 'replace' && !replaceConfirmed) {
+      return setErr(
+        tx(
+          lang,
+          '覆盖会清掉本机现有凭据：请在下方输入「覆盖」两字确认',
+          'Replace wipes existing credentials on this machine: type REPLACE below to confirm',
+        ),
+      );
     }
     setPicking(true);
     try {
@@ -136,7 +166,7 @@ export function Transfer({ desktop }: { desktop: boolean }) {
       announce(sum);
       setInPass('');
       setInBlob('');
-      setConfirmed(false);
+      setConfirmText('');
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -301,7 +331,7 @@ export function Transfer({ desktop }: { desktop: boolean }) {
               value={mode}
               onChange={(e) => {
                 setMode(e.target.value as 'merge' | 'replace');
-                setConfirmed(false);
+                setConfirmText('');
               }}
             >
               <option value="merge">
@@ -315,19 +345,31 @@ export function Transfer({ desktop }: { desktop: boolean }) {
         </div>
 
         {mode === 'replace' && (
-          <label className="transfer-warn">
-            <input
-              type="checkbox"
-              checked={confirmed}
-              onChange={(e) => setConfirmed(e.target.checked)}
-            />
+          <div className="transfer-warn" style={{ display: 'block' }}>
             <span>
               <T
-                zh="我确认：本机现有的厂商与凭据会被替换，多余的密文会被删除。"
-                en="I understand: local providers and credentials will be replaced, extra ciphertext deleted."
+                zh="覆盖 = 本机现有的厂商与凭据被整体替换，多余的密文会被删除。输入「覆盖」两字确认："
+                en="Replace = providers and credentials on this machine are replaced wholesale, extra ciphertext is deleted. Type REPLACE to confirm:"
               />
             </span>
-          </label>
+            <input
+              value={confirmText}
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={confirmWord}
+              onChange={(e) => setConfirmText(e.target.value)}
+              style={{
+                marginTop: 8,
+                width: 120,
+                height: 28,
+                padding: '0 8px',
+                border: '1px solid var(--bad-soft)',
+                borderRadius: 7,
+                background: 'var(--panel-2)',
+                color: 'var(--text)',
+              }}
+            />
+          </div>
         )}
 
         {err && <div className="modal-err">{err}</div>}

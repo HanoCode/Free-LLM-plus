@@ -3,6 +3,7 @@ import { create } from 'zustand';
 export type PageId =
   | 'overview'
   | 'models'
+  | 'connect'
   | 'providers'
   | 'accounts'
   | 'discover'
@@ -10,6 +11,7 @@ export type PageId =
   | 'agents'
   | 'extensions'
   | 'logs'
+  | 'reports'
   | 'settings'
   | 'playground';
 
@@ -20,12 +22,9 @@ interface AppState {
   page: PageId;
   lang: Lang;
   theme: Theme;
-  /** Pro 激活弹窗。放全局 store：侧边栏、设置页都能叫开它 */
-  licenseDialog: boolean;
   setPage: (p: PageId) => void;
   setLang: (l: Lang) => void;
   setTheme: (t: Theme) => void;
-  setLicenseDialog: (v: boolean) => void;
 }
 
 const savedLang = (localStorage.getItem('fp.lang') as Lang) || 'zh';
@@ -36,6 +35,7 @@ const savedTheme =
 const validPages: PageId[] = [
   'overview',
   'models',
+  'connect',
   'providers',
   'accounts',
   'discover',
@@ -43,6 +43,7 @@ const validPages: PageId[] = [
   'agents',
   'extensions',
   'logs',
+  'reports',
   'settings',
   'playground',
 ];
@@ -56,7 +57,6 @@ export const useApp = create<AppState>((set) => ({
   page: initialPage(),
   lang: savedLang,
   theme: savedTheme,
-  licenseDialog: false,
   setPage: (page) => {
     history.replaceState(null, '', `#/${page}`);
     set({ page });
@@ -64,12 +64,18 @@ export const useApp = create<AppState>((set) => ({
   setLang: (lang) => {
     localStorage.setItem('fp.lang', lang);
     set({ lang });
+    // 托盘菜单在 Rust 侧，读不到 localStorage：把语言同步进 DesktopPrefs。
+    // web 环境（无 Tauri）静默跳过；失败也不影响界面语言本身。
+    if ('__TAURI_INTERNALS__' in window) {
+      void import('@tauri-apps/api/core')
+        .then(({ invoke }) => invoke('win_set_prefs', { patch: { uiLang: lang } }))
+        .catch(() => {});
+    }
   },
   setTheme: (theme) => {
     localStorage.setItem('fp.theme', theme);
     set({ theme });
   },
-  setLicenseDialog: (licenseDialog) => set({ licenseDialog }),
 }));
 
 export const applyTheme = (theme: Theme) => {

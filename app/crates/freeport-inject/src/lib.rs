@@ -8,6 +8,7 @@
 
 pub mod desktop;
 pub mod diff;
+pub mod duo;
 pub mod envs;
 pub mod journal;
 pub mod json_edit;
@@ -129,6 +130,7 @@ fn strategy_str(s: &spec::AgentSpec) -> &'static str {
         Strategy::EnvList(_) => "env",
         Strategy::AcpEnv(_) => "acp",
         Strategy::Desktop(_) => "desktop",
+        Strategy::Duo(_) => "duo",
         Strategy::Guide => "guide",
     }
 }
@@ -259,6 +261,9 @@ pub fn preview_scoped(id: &str, scope: Scope<'_>, ctx: &Ctx) -> Result<Vec<DiffL
     if let Strategy::Desktop(d) = spec.strategy {
         return desktop::preview(d, ctx);
     }
+    if let Strategy::Duo(k) = spec.strategy {
+        return duo::preview(k, ctx);
+    }
     let (s, path, old) = prepare(id, scope)?;
     let (new, _) = render(s, &path, &old, ctx)?;
     let n = needles(ctx);
@@ -285,6 +290,13 @@ pub fn apply_scoped(
         }
         return desktop::apply(spec, d, ctx, key_id);
     }
+    // Duo 同 Desktop：两个文件互相成就，走不了「读一个文件、算一份新文本」的单文件管线
+    if let Strategy::Duo(k) = spec.strategy {
+        if matches!(scope, Scope::Project(_)) {
+            return Err("这个 Agent 只有用户级配置，没有项目级落点".into());
+        }
+        return duo::apply(spec, k, ctx, key_id);
+    }
     let (s, path, mut old) = prepare(id, scope)?;
     let (new, prev) = render(s, &path, &old, ctx)?;
     old.prev = prev;
@@ -296,6 +308,7 @@ pub fn apply_scoped(
         }
         Strategy::TomlBlock => toml_block::validate(&new)?,
         Strategy::Desktop(_) => return Err("Desktop 走多文件路径，不该到这里".into()),
+        Strategy::Duo(_) => return Err("Duo 走多文件路径，不该到这里".into()),
         Strategy::Guide => return Err("这个 Agent 只提供手工步骤".into()),
     }
 
@@ -389,6 +402,9 @@ pub fn revert_scoped(id: &str, scope: Scope<'_>) -> Result<AgentInfo, String> {
     if let Strategy::Desktop(_) = s.strategy {
         return desktop::revert(s);
     }
+    if let Strategy::Duo(_) = s.strategy {
+        return duo::revert(s);
+    }
     let key = log_key(id, scope);
     let mut log = journal::load();
     let Some(entry) = log.get(&key).cloned() else {
@@ -445,6 +461,7 @@ pub fn revert_scoped(id: &str, scope: Scope<'_>) -> Result<AgentInfo, String> {
             }
         }
         Strategy::Desktop(_) => return Err("Desktop 走多文件路径，不该到这里".into()),
+        Strategy::Duo(_) => return Err("Duo 走多文件路径，不该到这里".into()),
         Strategy::Guide => return Err("这个 Agent 没有被写入过".into()),
     }
 
@@ -531,6 +548,7 @@ fn render(
         Strategy::EnvList(keys) => envs::vscode_extension(&old.text, keys, ctx),
         Strategy::AcpEnv(keys) => envs::acp_servers(&old.text, keys, ctx, spec::ACP_MARK),
         Strategy::Desktop(_) => Err("Desktop 走多文件路径，不该到这里".into()),
+        Strategy::Duo(_) => Err("Duo 走多文件路径，不该到这里".into()),
         Strategy::Guide => Err("这个 Agent 只提供手工步骤".into()),
     }
 }

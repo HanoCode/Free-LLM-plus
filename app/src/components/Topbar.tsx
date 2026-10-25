@@ -1,19 +1,23 @@
+import { useState } from 'react';
 import { ChevronRight, Command, Moon, Pause, Play, Search, Sun } from 'lucide-react';
 import { useApp, applyTheme, type PageId } from '../lib/store';
 import { useGateway } from '../lib/gateway';
 import { T } from '../lib/i18n';
 import { toast } from './ui';
+import { CommandPalette, useCommandPalette } from './CommandPalette';
 
 const titles: Record<PageId, [string, string]> = {
   overview: ['概览', 'Overview'],
   models: ['模型', 'Models'],
-  providers: ['厂商', 'Providers'],
-  accounts: ['账号', 'Accounts'],
-  discover: ['发现', 'Discover'],
+  connect: ['连接', 'Connect'],
+  providers: ['连接', 'Connect'],
+  accounts: ['连接', 'Connect'],
+  discover: ['连接', 'Connect'],
   routing: ['路由', 'Routing'],
   agents: ['注入', 'Agents'],
   extensions: ['扩展', 'Extensions'],
   logs: ['日志', 'Logs'],
+  reports: ['报表', 'Reports'],
   settings: ['设置', 'Settings'],
   playground: ['试验场', 'Playground'],
 };
@@ -23,6 +27,8 @@ export function Topbar() {
   const online = useGateway((s) => s.available);
   const paused = useGateway((s) => s.status?.paused ?? false);
   const setPaused = useGateway((s) => s.setPaused);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  useCommandPalette(paletteOpen, setPaletteOpen);
 
   return (
     <div className="topbar" data-tauri-drag-region>
@@ -36,39 +42,39 @@ export function Topbar() {
 
       <div className="top-actions">
         <button
-          className="chip-btn"
-          onClick={() => toast(lang === 'zh' ? '搜索：⌘K 打开命令面板（M4 实现）' : 'Search: ⌘K palette (M4)')}
+          className="chip-btn tip-below"
+          onClick={() => setPaletteOpen(true)}
+          data-tip={lang === 'zh' ? '命令面板（⌘K）' : 'Command palette (⌘K)'}
         >
           <Search />
-          <span className="faint">⌘K</span>
-          <span className="kbd">/</span>
+          <span className="kbd">⌘K</span>
         </button>
 
         <button
-          className="chip-btn"
+          className="chip-btn tip-below"
           onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}
-          title="语言 / Language"
+          data-tip="语言 / Language"
         >
           <Command />
           {lang === 'zh' ? '中' : 'EN'}
         </button>
 
         <button
-          className="chip-btn"
+          className="chip-btn tip-below"
           onClick={() => {
             const next = theme === 'light' ? 'dark' : 'light';
             applyTheme(next);
             setTheme(next);
           }}
-          title="主题 / Theme"
+          data-tip="主题 / Theme"
         >
           {theme === 'light' ? <Moon /> : <Sun />}
         </button>
 
         <button
-          className="chip-btn"
+          className="chip-btn tip-below"
           disabled={!online}
-          title={
+          data-tip={
             online
               ? lang === 'zh'
                 ? '暂停后业务请求返回 503，/health 与 /v1/models 仍可用'
@@ -100,6 +106,8 @@ export function Topbar() {
 
         <div className="avatar">FP</div>
       </div>
+
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </div>
   );
 }

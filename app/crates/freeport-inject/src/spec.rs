@@ -87,7 +87,18 @@ pub enum Strategy {
     AcpEnv(&'static [KeySpec]),
     /// Claude Desktop 的 3p 网关：三个文件互相引用，见 [`DesktopSpec`]。
     Desktop(&'static DesktopSpec),
+    /// 双文件策略：两个文件各写一半，单独哪一个都生效不了，见 [`DuoKind`]。
+    Duo(DuoKind),
     Guide,
+}
+
+/// 双文件策略的两类客户端。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DuoKind {
+    /// Gemini CLI：`.env` 网关变量 + settings.json 的 API key 认证开关
+    GeminiCli,
+    /// Goose：custom_providers/freeport.json + config.yaml 的默认 provider
+    Goose,
 }
 
 /// Claude Desktop 的独立网关配置目录（`Claude-3p/`）。
@@ -281,6 +292,76 @@ pub(crate) fn desktop_meta() -> PathBuf {
 /// 只决定 `deploymentMode`，与 MCP 的配置同处一个文件。
 pub(crate) fn desktop_mode() -> PathBuf {
     desktop_root().join("claude_desktop_config.json")
+}
+
+/* ── Qwen Code ───────────────────────────────── */
+///
+/// Qwen Code 是 gemini-cli 的分支，但走 OpenAI 协议：`settings.json` 的 `env`
+/// 块里放 `OPENAI_*` 三项，再把认证切到 openai。不写 `modelProviders`——
+/// 那套多 provider 表结构随版本变，env 覆盖是官方文档给的无头配置方式。
+static QWEN_KEYS: &[KeySpec] = &[
+    KeySpec {
+        ptr: "/env/OPENAI_BASE_URL",
+        value: Src::BaseV1,
+    },
+    KeySpec {
+        ptr: "/env/OPENAI_API_KEY",
+        value: Src::Key,
+    },
+    KeySpec {
+        ptr: "/env/OPENAI_MODEL",
+        value: Src::Model,
+    },
+    KeySpec {
+        ptr: "/security/auth/selectedType",
+        value: Src::Literal("openai"),
+    },
+    KeySpec {
+        ptr: "/model/name",
+        value: Src::Model,
+    },
+];
+
+/// env 块只服务于 Qwen Code：别的工具留下的 `OPENAI_API_KEY` 会让请求打去别处，
+/// 与 Claude 的 `ANTHROPIC_` 清扫同一条理由。
+static QWEN_PRUNE: Prune = Prune {
+    at: "/env",
+    prefixes: &["OPENAI_"],
+    keys: &[],
+};
+
+/* ── iFlow CLI ───────────────────────────────── */
+///
+/// 只写顶层三键（`apiKey` / `baseUrl` / `modelName`），**不碰 `selectedAuthType`**：
+/// 官方 README 的示例就是 `selectedAuthType: "iflow"` 与三键共存的形状，
+/// 动它反而可能把用户的心流登录态弄丢。
+static IFLOW_KEYS: &[KeySpec] = &[
+    KeySpec {
+        ptr: "/baseUrl",
+        value: Src::BaseV1,
+    },
+    KeySpec {
+        ptr: "/apiKey",
+        value: Src::Key,
+    },
+    KeySpec {
+        ptr: "/modelName",
+        value: Src::Model,
+    },
+];
+
+/* ── Goose 的落点 ────────────────────────────── */
+///
+/// mac / Linux 在 `~/.config/goose`，Windows 在 `%APPDATA%\Block\goose\config`。
+pub(crate) fn goose_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("Block/goose/config")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        home().join(".config/goose")
+    }
 }
 
 /* ── Claude Code ─────────────────────────────── */
@@ -601,11 +682,11 @@ pub const AGENTS: &[AgentSpec] = &[
         name: "Gemini CLI",
         protocol: Protocol::Gemini,
         discovery: Discovery::SelfServe,
-        strategy: Strategy::Guide,
+        strategy: Strategy::Duo(DuoKind::GeminiCli),
         prune: None,
         detect: || vec![home().join(".gemini")],
-        file: || None,
-        note: "用 GOOGLE_GEMINI_BASE_URL + GEMINI_API_KEY 环境变量指向网关；写入 .env 会与 Gemini CLI 的登录态冲突，所以给步骤不代写",
+        file: || Some(home().join(".gemini/settings.json")),
+        note: "写 ~/.gemini/.env（网关地址 / key / 模型）并把 settings.json 切到 API key 认证——.env 的变量只在 API key 模式下被读，只写一半对 OAuth 用户无效；回滚会还原认证开关",
     },
     AgentSpec {
         id: "roo",
@@ -672,11 +753,11 @@ pub const AGENTS: &[AgentSpec] = &[
         name: "Goose",
         protocol: Protocol::OpenAi,
         discovery: Discovery::SelfServe,
-        strategy: Strategy::Guide,
+        strategy: Strategy::Duo(DuoKind::Goose),
         prune: None,
-        detect: || vec![home().join(".config/goose")],
-        file: || None,
-        note: "config.yaml 由 goose configure 托管，不代写；干净的路是 ~/.config/goose/custom_providers/freeport.json（engine=openai，api_key_env 引用环境变量），但 models 数组必须写死——写死就脏，给步骤",
+        detect: || vec![goose_dir()],
+        file: || Some(goose_dir().join("custom_providers/freeport.json")),
+        note: "写 custom_providers/freeport.json（engine=openai，密钥随 Authorization 头走，不动你的 shell 配置）并把 config.yaml 的 GOOSE_PROVIDER/GOOSE_MODEL 指到 freeport；两处都可一键回滚",
     },
     AgentSpec {
         id: "workbuddy",
@@ -688,6 +769,28 @@ pub const AGENTS: &[AgentSpec] = &[
         detect: || vec![home().join(".workbuddy")],
         file: || None,
         note: "模型接入走应用内的连接器/专家配置，没有可安全改写的模型配置文件；在设置里选自定义 OpenAI 兼容端点即可",
+    },
+    AgentSpec {
+        id: "qwen-code",
+        name: "Qwen Code",
+        protocol: Protocol::OpenAi,
+        discovery: Discovery::SelfServe,
+        strategy: Strategy::JsonKeys(QWEN_KEYS),
+        prune: Some(&QWEN_PRUNE),
+        detect: || vec![home().join(".qwen")],
+        file: || Some(home().join(".qwen/settings.json")),
+        note: "写 ~/.qwen/settings.json 的 OPENAI_ 三项并切到 openai 认证；env 块里的旧 OPENAI_ 键先清后写，原值进回滚日志",
+    },
+    AgentSpec {
+        id: "iflow",
+        name: "iFlow CLI",
+        protocol: Protocol::OpenAi,
+        discovery: Discovery::SelfServe,
+        strategy: Strategy::JsonKeys(IFLOW_KEYS),
+        prune: None,
+        detect: || vec![home().join(".iflow")],
+        file: || Some(home().join(".iflow/settings.json")),
+        note: "写 ~/.iflow/settings.json 的 apiKey / baseUrl / modelName 三项；认证方式不动，心流登录态不受影响",
     },
 ];
 

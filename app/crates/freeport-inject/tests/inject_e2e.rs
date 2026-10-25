@@ -558,6 +558,147 @@ fn injection_is_precise_idempotent_and_reversible() {
         "网关没有 Gemini 协议时必须如实标注"
     );
 
+    /* ── 10a. Qwen Code：env 清扫 + 认证开关 ── */
+    let qwen = home.join(".qwen/settings.json");
+    let qwen_original = r#"{"env":{"OPENAI_API_KEY":"sk-old"},"theme":"dark"}"#;
+    write(&qwen, qwen_original);
+
+    freeport_inject::apply("qwen-code", &ctx, None).unwrap();
+    let doc: Value = serde_json::from_str(&read(&qwen)).unwrap();
+    assert_eq!(doc["env"]["OPENAI_BASE_URL"], "http://127.0.0.1:8787/v1");
+    assert_eq!(doc["env"]["OPENAI_API_KEY"], "fp-0123456789abcdef");
+    assert_eq!(doc["env"]["OPENAI_MODEL"], "auto");
+    assert_eq!(doc["security"]["auth"]["selectedType"], "openai");
+    assert_eq!(doc["theme"], "dark", "无关设置不许动");
+
+    let once = read(&qwen);
+    freeport_inject::apply("qwen-code", &ctx, None).unwrap();
+    assert_eq!(read(&qwen), once, "重复注入必须幂等");
+
+    freeport_inject::revert("qwen-code").unwrap();
+    let doc: Value = serde_json::from_str(&read(&qwen)).unwrap();
+    assert_eq!(
+        doc["env"]["OPENAI_API_KEY"], "sk-old",
+        "被清扫的旧 key 必须进回滚日志并还原"
+    );
+    assert!(doc["env"].get("OPENAI_BASE_URL").is_none());
+    assert!(doc.get("security").is_none(), "我们加的认证开关要删干净");
+
+    /* ── 10b. iFlow CLI：顶层三键，认证方式不动 ── */
+    let iflow = home.join(".iflow/settings.json");
+    let iflow_original = r#"{"theme":"Default","selectedAuthType":"iflow"}"#;
+    write(&iflow, iflow_original);
+
+    freeport_inject::apply("iflow", &ctx, None).unwrap();
+    let doc: Value = serde_json::from_str(&read(&iflow)).unwrap();
+    assert_eq!(doc["baseUrl"], "http://127.0.0.1:8787/v1");
+    assert_eq!(doc["apiKey"], "fp-0123456789abcdef");
+    assert_eq!(doc["modelName"], "auto");
+    assert_eq!(
+        doc["selectedAuthType"], "iflow",
+        "心流登录态不许动"
+    );
+
+    let once = read(&iflow);
+    freeport_inject::apply("iflow", &ctx, None).unwrap();
+    assert_eq!(read(&iflow), once);
+
+    freeport_inject::revert("iflow").unwrap();
+    let doc: Value = serde_json::from_str(&read(&iflow)).unwrap();
+    assert!(doc.get("baseUrl").is_none(), "我们加的键要删干净");
+    assert!(doc.get("apiKey").is_none());
+    assert_eq!(doc["selectedAuthType"], "iflow");
+
+    /* ── 10c. Gemini CLI：.env 托管块 + settings.json 认证，两文件一起写一起撤 ── */
+    let gemini_dir = home.join(".gemini");
+    let genv = gemini_dir.join(".env");
+    let genv_original = "GOOGLE_GEMINI_BASE_URL=https://api.example.com\nCUSTOM=1\n";
+    write(&genv, genv_original);
+    let gsettings = gemini_dir.join("settings.json");
+    let gsettings_original =
+        r#"{"security":{"auth":{"selectedType":"oauth-personal"}},"theme":"auto"}"#;
+    write(&gsettings, gsettings_original);
+
+    let supported_all = ["openai", "anthropic", "gemini"];
+    let info = freeport_inject::list(&supported_all);
+    assert_eq!(
+        info.iter().find(|a| a.id == "gemini-cli").unwrap().state,
+        "detected"
+    );
+
+    let preview = freeport_inject::preview("gemini-cli", &ctx).unwrap();
+    let headers: Vec<_> = preview
+        .iter()
+        .filter(|l| l.kind == "ctx" && l.text.starts_with("── "))
+        .collect();
+    assert_eq!(headers.len(), 2, ".env 和 settings.json 都要在预览里露面");
+    assert!(preview
+        .iter()
+        .all(|l| !l.text.contains("fp-0123456789abcdef")));
+
+    freeport_inject::apply("gemini-cli", &ctx, None).unwrap();
+    let env_text = read(&genv);
+    assert!(env_text.contains("# >>> freeport managed begin"));
+    assert!(
+        env_text.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787\n"),
+        "网关根地址（不带 /v1）要写进托管块：{env_text}"
+    );
+    assert!(env_text.contains("GEMINI_API_KEY=fp-0123456789abcdef"));
+    assert!(env_text.contains("CUSTOM=1"), "无关变量不许动");
+    assert!(
+        env_text.contains("#freeport-off: GOOGLE_GEMINI_BASE_URL=https://api.example.com"),
+        "同名旧键必须注释掉，否则 dotenv 谁赢没有约定"
+    );
+    let gs: Value = serde_json::from_str(&read(&gsettings)).unwrap();
+    assert_eq!(gs["security"]["auth"]["selectedType"], "gemini-api-key");
+    assert_eq!(gs["theme"], "auto");
+
+    let once = (read(&genv), read(&gsettings));
+    freeport_inject::apply("gemini-cli", &ctx, None).unwrap();
+    assert_eq!(
+        (read(&genv), read(&gsettings)),
+        once,
+        "重复注入必须幂等"
+    );
+
+    freeport_inject::revert("gemini-cli").unwrap();
+    assert_eq!(read(&genv), genv_original, ".env 要字节级还原");
+    assert_eq!(read(&gsettings), gsettings_original, "认证开关要还原回 OAuth");
+
+    /* ── 10d. Goose：provider 文件 + config.yaml 默认值 ── */
+    let goose_dir = home.join(".config/goose");
+    let gprovider = goose_dir.join("custom_providers/freeport.json");
+    let gconfig = goose_dir.join("config.yaml");
+    let gconfig_original = "GOOSE_PROVIDER: openai\nGOOSE_MODEL: kimi\nother: 1\n";
+    write(&gconfig, gconfig_original);
+
+    freeport_inject::apply("goose", &push_ctx, None).unwrap();
+    let p: Value = serde_json::from_str(&read(&gprovider)).unwrap();
+    assert_eq!(p["name"], "freeport");
+    assert_eq!(p["engine"], "openai");
+    assert_eq!(
+        p["base_url"], "http://127.0.0.1:8787/v1/chat/completions",
+        "Goose 的 openai 引擎把 base_url 当完整端点用"
+    );
+    assert_eq!(p["headers"]["Authorization"], "Bearer fp-0123456789abcdef");
+    assert_eq!(p["models"][0]["name"], "gpt-4.1", "目录快照要进 models");
+    let cfg_text = read(&gconfig);
+    assert!(cfg_text.contains("GOOSE_PROVIDER: freeport"));
+    assert!(cfg_text.contains("GOOSE_MODEL: auto"));
+    assert!(
+        cfg_text.contains("#freeport-off: GOOSE_PROVIDER: openai"),
+        "同名旧键要注释掉"
+    );
+    assert!(cfg_text.contains("other: 1"), "无关配置不许动");
+
+    let once = (read(&gprovider), read(&gconfig));
+    freeport_inject::apply("goose", &push_ctx, None).unwrap();
+    assert_eq!((read(&gprovider), read(&gconfig)), once);
+
+    freeport_inject::revert("goose").unwrap();
+    assert_eq!(read(&gconfig), gconfig_original, "config.yaml 要字节级还原");
+    assert!(!gprovider.exists(), "我们建的 provider 文件要删掉");
+
     /* ── 11. 覆盖闸：会写文件的适配器必须每一个都真跑过 ── */
     let mut writable: Vec<&str> = info
         .iter()
@@ -575,6 +716,10 @@ fn injection_is_precise_idempotent_and_reversible() {
         "vscode-chat",
         "jetbrains",
         "claude-desktop",
+        "qwen-code",
+        "iflow",
+        "gemini-cli",
+        "goose",
     ];
     exercised.sort_unstable();
     assert_eq!(

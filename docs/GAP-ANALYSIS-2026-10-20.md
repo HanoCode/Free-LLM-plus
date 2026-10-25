@@ -5,6 +5,31 @@
 
 ---
 
+## 2026-10-25 补齐记录（发布前冲刺：P0 工程项 + 两个结构性缺口）
+
+| 项 | 改动 | 落点 | 测试 |
+|---|---|---|---|
+| **Gemini 原生上游** | `Wire::Gemini`：OpenAI ⇄ `generateContent` 双向转换（systemInstruction、functionCall/Response 按**函数名**回填、proto Schema 清洗——`type` 大写、剥 `additionalProperties`、`properties` 键原样保留）、流式 SSE 逐帧转写、hold 提交判定加 Gemini 分支。线格式从「按 id 推断」升级为 **`Provider.wire` 字段**（老 id 推断仅作存量兼容）。认证走 `x-goog-api-key`，绝不同时发 Bearer | `gateway/upwire.rs`、`providers.rs`、`hold.rs`、`core/model.rs`（wire 字段）、`core/presets.rs`（新增 `google-gemini` 预设，`WIRED` 表） | 单测 9 条（URL/system/tools/schema/图片/响应/拦截/流式/工具）+ `tests/gemini_upstream_e2e.rs`（桩上游讲 Gemini 协议，验双向转换、工具往返、usage 含思考 token） |
+| **OTLP 导出** | 一请求一 span（OTLP/HTTP + **JSON** 编码，零新依赖）：属性带 provider/model/purpose/attempts/token/折算成本，每跳失败是 event；批量推送、队列 2048 满丢最旧并计数、**绝不反压**；默认关，配置 `gateway.otlp = { enabled, endpoint, intervalSecs, batchSize, headers }`，端点两种写法都收。刻意只做 trace 不做 metrics：4 窗口账本就是 metrics，再推一份只会得到两个对不上的数 | `gateway/otlp.rs`（新模块）、`server.rs`（`record()` 挂钩 + start() 起导出循环 + `GwStatus` 带 otlp 三字段）、`core/model.rs`（OtlpConfig）、`core/dto.rs`（ConfigPatch 三字段） | 单测 4 条（span 结构/64 位时间戳必须字符串/错误事件/URL 两种写法）+ `tests/otlp_e2e.rs`（桩 collector，验证自定义 Bearer 头与路由元数据） |
+| **单实例锁** | `tauri-plugin-single-instance` 第一个注册：第二个实例当场退出，只把已有窗口拉到前台。没有它，双开 = 两个进程抢同一份账本文件 | `src-tauri/src/lib.rs`、`src-tauri/Cargo.toml` | 编译期 + 手工双开验证 |
+| **自动更新** | `tauri-plugin-updater` 全链路：签名密钥对已生成（私钥 `app/.secrets/` 已 gitignore，公钥提交在 `tauri.conf.json`）；`updater_check` / `updater_install` 命令（下载进度经 `updater://progress` 事件，装完自动重启）；设置页「检查更新」优先走签名通道，未配置/不可达回落 GitHub API + 浏览器；release.yml 改为只看 `TAURI_SIGNING_PRIVATE_KEY`（`TAURI_UPDATER_PUBKEY` secret 废弃，公钥单一来源是 tauri.conf.json） | `src-tauri/`、`src/lib/{ipc,bridge,store}.ts`、`pages/Settings.tsx`、`.github/workflows/release.yml`、`docs/RELEASE.md` | 本地构建 + 发版时 CI 端到端 |
+| **i18n 收口** | 约 30 处硬编码中文全部双语化：Accounts（凭据增删/登录/会话/额度提示）、Discover（目录同步/启用/时间格式 `ago()`）、Providers（接入/校验/移除）、Transfer（迁移结果/口令/**覆盖确认词按语言**：zh=覆盖、en=REPLACE，界面提示词与校验同源）、Settings（智能过滤/缓存/限速/冷却） | 上述页面 + `components/Transfer.tsx` | `tsc --noEmit` 通过 |
+| **托盘双语** | 托盘菜单文本跟 `DesktopPrefs.uiLang` 走；前端 `setLang` 时同步写 prefs，Rust 侧收到后立即 `tray.set_menu` 重建。语言权威源仍是前端 localStorage，托盘只是消费者 | `src-tauri/{lib,prefs}.rs`、`src/lib/store.ts` | 编译期 + 手工切换验证 |
+| **目录基线** | 离线冷启动从 15 厂商/10 模型补到 **15 厂商/88 模型**（全部 `free: true`、零重复、id 用各厂商真实 serving id 以便在线合并精确命中） | `freeport-catalog/src/baseline.json`（+baseline.rs 三个新断言测试） | `cargo test -p freeport-catalog` 37 通过 |
+
+至此 §2 差距总表里的 **#7 部署（更新通道）、#3 观测（OTLP + 已有 JSONL）、#1 上游协议（Anthropic/Responses/Gemini 三线齐）** 全部关闭。仍按决策不做的：fusion / decision 路由 / 60 语言 / 多租户 Web UI / Web 版 daemon 控制台。
+
+---
+
+## 2026-10-24 补齐记录（#1 流式接力 · #5 启发式意图路由）
+
+| 项 | 改动 | 落点 | 测试 |
+|---|---|---|---|
+| 流式 CONTINUE 续写 | 上游流断在半截（干净闭合无 `[DONE]`/`finish_reason`，或连接报错）且**已有正文、未碰工具调用**时，把已收到的正文作为 assistant prefill 接回同一家上游续写一次；一单只续一次，预算剩 <3s 不开；续写失败回落 STOP（行为同旧版）。工具调用已下发仍 STOP（半截工具参数续写=让客户端执行没写完的工具）——HANDOFF 不做 | `freeport-gateway/src/continuation.rs`（`ContentAcc` 攒正文 + `resume`）、`server.rs::stream_response` 改 pump 双段转发，日志记 `stream_continued` attempt | 单测 5 条（跨 chunk 攒帧/注释行/工具标记/prefill 构造）+ `tests/continuation_e2e.rs`（续写全量正文无 error 帧；工具调用断流报 `stream_truncated` 且不发续写请求） |
+| 零成本启发式意图路由 | 三信号（header/图/agent key）都没命中时，按请求特征打分判编码：tools 定义 +2、代码围栏 +2、`role:"tool"` +1、编码类 system（中英文各 +1），≥3 判 coding；判不出回落 chat。不调小模型、不烧额度、不加延迟 | `freeport-core/src/model.rs`（`Purpose::heuristic` + `infer_deep_with_source` + `PurposeSource::Heuristic`）、`server.rs::purpose_of` 带 payload、`Logs.tsx` 依据文案「请求特征识别」 | 单测 4 条（agent 请求识别/纯聊天不误判/heuristic 排序位/序列化） |
+
+---
+
 ## 2026-10-21 补齐记录（对照 freellmapi 核心逻辑）
 
 | 项 | 改动 | 落点 | 测试 |

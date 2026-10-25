@@ -21,7 +21,6 @@ import type {
   GwLoginStart,
   GwLoginState,
   GwLog,
-  GwLicense,
   GwModel,
   GwModelProbe,
   GwPatrol,
@@ -37,6 +36,12 @@ import type {
   PatrolReport,
   GwDigest,
   GwObserved,
+  GwIntel,
+  GwPro,
+  GwReports,
+  GwBackupFile,
+  ProPatch,
+  StrategyProfile,
   ProviderInput,
   ProviderPreset,
 } from './bridge';
@@ -59,9 +64,14 @@ interface GwState {
   quota: GwQuota[];
   agents: AgentInfo[];
   /** 许可证状态。启动时拉一次，激活/解除后更新——不需要进 8 秒轮询 */
-  license: GwLicense | null;
   /** 路由解释：只在「路由」页按需拉，不进 8 秒轮询（会消耗 SWRR 轮转预算） */
   route: GwRoute | null;
+  /** 本机情报（Pro）：报表页按需拉，不进轮询 */
+  intel: GwIntel | null;
+  /** 用量报表（Pro）：报表页按需拉 */
+  reports: GwReports | null;
+  /** Pro 功能开关（设置页按需拉） */
+  pro: GwPro | null;
   loading: boolean;
   error: string | null;
 
@@ -119,10 +129,8 @@ interface GwState {
     passphrase: string,
     mode?: 'merge' | 'replace',
   ) => Promise<ImportSummary | null>;
-  loadLicense: () => Promise<void>;
-  /** 激活会抛错（签名不对/机器不符/已过期），错误文本直接给用户看 */
-  activateLicense: (token: string) => Promise<GwLicense>;
-  clearLicense: () => Promise<void>;
+  /* 订阅与授权管理 */
+  /** 解绑失败原样上抛；成功返回是否真的解掉了一条绑定 */
   probeModel: (provider: string, model: string, deep?: boolean) => Promise<GwModelProbe>;
   probeFailed: () => Promise<PatrolReport>;
   runPatrol: (all?: boolean) => Promise<PatrolReport>;
@@ -134,6 +142,17 @@ interface GwState {
   /** 问厂商要这个账号的**官方**额度（账本是另一回事） */
   fetchUsage: (accountId: string) => Promise<GwUsage>;
   saveRouting: (patch: Partial<GwRouting>) => Promise<GwRouting>;
+  /** Pro 本机功能：情报 / 报表 / 开关（报表页与设置页按需拉） */
+  loadIntel: () => Promise<GwIntel | null>;
+  loadReports: (days: number) => Promise<GwReports | null>;
+  loadPro: () => Promise<GwPro | null>;
+  updatePro: (patch: ProPatch) => Promise<GwPro>;
+  backupNow: () => Promise<string>;
+  backupList: () => Promise<GwBackupFile[]>;
+  backupRestore: (name: string) => Promise<ImportSummary>;
+  setProfiles: (profiles: StrategyProfile[]) => Promise<GwRouting>;
+  /** 远程接入（Pro）：切换回环 / 0.0.0.0 监听。重启网关后生效 */
+  setRemote: (on: boolean) => Promise<GwStatus>;
   patchConfig: (patch: ConfigPatch) => Promise<GwStatus>;
   setRequireAuth: (v: boolean) => Promise<void>;
   /** 单次请求总预算；落库后下一次请求生效 */
@@ -160,8 +179,10 @@ export const useGateway = create<GwState>((set, get) => ({
   feed: null,
   quota: [],
   agents: [],
-  license: null,
   route: null,
+  intel: null,
+  reports: null,
+  pro: null,
   loading: false,
   error: null,
 
@@ -408,31 +429,6 @@ export const useGateway = create<GwState>((set, get) => ({
     return sum;
   },
 
-  async loadLicense() {
-    const gw = bridge();
-    if (!gw) return;
-    try {
-      set({ license: await gw.license() });
-    } catch {
-      // 许可证读不到不该影响任何别的页面——它只影响设置页那一行
-    }
-  },
-
-  /** 失败时保留旧状态：`license` 只在成功后替换，错误交给调用方 toast */
-  async activateLicense(token) {
-    const gw = bridge();
-    if (!gw) throw new Error('仅桌面端可用');
-    const l = await gw.activateLicense(token);
-    set({ license: l });
-    return l;
-  },
-
-  async clearLicense() {
-    const gw = bridge();
-    if (!gw) return;
-    set({ license: await gw.clearLicense() });
-  },
-
   async probeModel(provider, model, deep) {
     const gw = bridge();
     if (!gw) {
@@ -536,6 +532,94 @@ export const useGateway = create<GwState>((set, get) => ({
     return routing;
   },
 
+  /* ── Pro 本机功能（v1.12）───────────────────────── */
+
+  async loadIntel() {
+    const gw = bridge();
+    if (!gw) return null;
+    try {
+      const intel = await gw.intel();
+      set({ intel });
+      return intel;
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+      return null;
+    }
+  },
+
+  async loadReports(days) {
+    const gw = bridge();
+    if (!gw) return null;
+    try {
+      const reports = await gw.reports(days);
+      set({ reports });
+      return reports;
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+      return null;
+    }
+  },
+
+  async loadPro() {
+    const gw = bridge();
+    if (!gw) return null;
+    try {
+      const pro = await gw.pro();
+      set({ pro });
+      return pro;
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+      return null;
+    }
+  },
+
+  async updatePro(patch) {
+    const gw = bridge();
+    if (!gw) throw new Error('仅桌面端可用');
+    const pro = await gw.setPro(patch);
+    set({ pro });
+    return pro;
+  },
+
+  async backupNow() {
+    const gw = bridge();
+    if (!gw) throw new Error('仅桌面端可用');
+    const path = await gw.backupNow();
+    set({ pro: await gw.pro() });
+    return path;
+  },
+
+  async backupList() {
+    const gw = bridge();
+    if (!gw) throw new Error('仅桌面端可用');
+    return gw.backupList();
+  },
+
+  async backupRestore(name) {
+    const gw = bridge();
+    if (!gw) throw new Error('仅桌面端可用');
+    const summary = await gw.backupRestore(name);
+    await get().refresh();
+    return summary;
+  },
+
+  async setProfiles(profiles) {
+    const gw = bridge();
+    if (!gw) throw new Error('仅桌面端可用');
+    const routing = await gw.setProfiles(profiles);
+    set({ routing });
+    return routing;
+  },
+
+  /** 远程接入（Pro）：改的是监听配置，重启网关后生效 */
+  async setRemote(on) {
+    const gw = bridge();
+    if (!gw) throw new Error('仅桌面端可用');
+    const status = await gw.setRemote(on);
+    set({ status });
+    return status;
+  },
+
   /** 通用配置写入：新增开关不用每次都加一个动作 */
   async patchConfig(patch) {
     const gw = bridge();
@@ -562,7 +646,6 @@ export function initGateway(): () => void {
 
   void useGateway.getState().refresh();
   void useGateway.getState().loadCatalog();
-  void useGateway.getState().loadLicense();
 
   const off = gw.onLog((entry) => {
     useGateway.setState((s) => ({ logs: [entry, ...s.logs].slice(0, 300) }));

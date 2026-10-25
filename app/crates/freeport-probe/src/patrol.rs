@@ -207,6 +207,7 @@ mod tests {
                 purposes: Vec::new(),
             }],
             proxy: None,
+            wire: None,
             models: vec![ModelInfo {
                 id: "m1".into(),
                 owned_by: id.into(),

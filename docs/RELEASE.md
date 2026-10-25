@@ -20,22 +20,28 @@
   下载的 `.p8` 文件内容放 `APPLE_API_KEY`，Issuer ID 放 `APPLE_API_ISSUER`。
 - **Apple ID**：`APPLE_ID` + **App 专用密码**（不是登录密码）+ `APPLE_TEAM_ID`。
 
-### 0.2 自动更新密钥（可选）
+### 0.2 自动更新密钥（已生成，待配置 secrets）
 
-```bash
-cd app
-npx tauri signer generate -w ~/.tauri/freeport.key
-# 输出：私钥文件、公钥字符串、以及一个密码提示
-```
+密钥对**已经生成**，位置与用途如下：
 
-- 公钥字符串 → GitHub secret `TAURI_UPDATER_PUBKEY`
-- 私钥文件内容（整个文件，含注释行）→ `TAURI_SIGNING_PRIVATE_KEY`
-- 生成时设的密码 → `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+- 私钥：`app/.secrets/tauri-updater.key`（已在 `.gitignore` 里，**永远不会进仓库**；
+  把文件内容存进密码管理器后这份本地文件就只是备份）
+- 公钥：已写进 `app/src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`，
+  端点指向 `https://github.com/HanoCode/Free-LLM-plus/releases/latest/download/latest.json`
+- 私钥密码：空（生成时 `-p ""`）
+
+发版前把私钥配进 GitHub secrets：
+
+| secret | 值 |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | `app/.secrets/tauri-updater.key` 的**完整文件内容**（含注释行） |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 留空字符串即可（私钥无密码） |
+
+没配私钥时，workflow 会自动跳过升级包，release 里不会出现验不过的 `latest.json`；
+客户端的更新通道会报「不可达」，设置页自动回落到「打开 Releases 页」。
 
 **私钥丢了就只能换一把新的**：老客户端会因为验签失败而拒绝更新，只能手动重装。
-把私钥和密码存进密码管理器，不要放进仓库。
-
-没配这三项时，workflow 会自动跳过升级包，release 里不会出现验不过的 `latest.json`。
+换钥匙 = 改 `tauri.conf.json` 的 pubkey + 重发一版。
 
 ### 0.3 Windows 签名（当前关闭）
 
@@ -57,8 +63,10 @@ Azure Trusted Signing 需要 Azure 订阅 + 身份验证 + 证书配置文件。
 | `APPLE_SIGNING_IDENTITY` | 签名时必需 | 证书全名 |
 | `APPLE_API_KEY` / `APPLE_API_ISSUER` | 公证时二选一 | API Key 方式 |
 | `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 公证时二选一 | Apple ID 方式 |
-| `TAURI_UPDATER_PUBKEY` | 可选 | 开启自动更新产物 |
-| `TAURI_SIGNING_PRIVATE_KEY` / `..._PASSWORD` | 可选 | 给更新包签名 |
+| `TAURI_SIGNING_PRIVATE_KEY` / `..._PASSWORD` | 可选 | 给更新包签名（公钥已提交在 tauri.conf.json） |
+
+> `TAURI_UPDATER_PUBKEY` 这个 secret 已废弃：公钥现在提交在 `tauri.conf.json`，
+> workflow 只检查 `TAURI_SIGNING_PRIVATE_KEY` 是否存在。
 
 ## 1. 发一版
 
@@ -121,3 +129,24 @@ shasum -a 256 -c Freeport_0.1.0_aarch64.dmg.sha256
 - 设置页「保存诊断包」导出一份脱敏 JSON：版本、厂商与健康、账本、最近 20 条日志、
   崩溃文件列表。**不含**明文密钥、不含掩码、不含网关 authToken。
 - 用户报障时先要这份 JSON，比让他描述现象快得多。
+
+## 5. 商业化口径：免费开放期
+
+**当前状态（2026-10-25）**：`app/crates/freeport-gateway/src/pro.rs` 的
+`FREE_FOR_ALL = true`，全部增强功能（报表 / 自动备份 / 会话持久化 / 远程接入等）
+对所有用户免费。配套语义：
+
+- `license::state()` 返回 `status = "free_era"`、`tier = "pro"`，以 Pro 形态示人；
+- 前端不展示任何激活 / 订阅入口（`License.tsx` 已删），设置页的对应区块叫「增强功能」；
+- 激活与订阅的**服务器**（`server-api/`）已在 v0.1 清理时整体移除——首发即全免费，
+  它没有存在的必要。客户端侧机制（`freeport-license` + `gateway/license.rs`）保留但休眠；
+  设备挑战-应答的 e2e 用例随服务器一起移除（git 历史可查），离线加固用例保留。
+
+**翻回收费前必须核对**：
+
+1. 激活 / 订阅服务已按 `docs/SUBSCRIBE-DESIGN.md` 重建并上线（v0.1 前的完整服务器实现
+   在 git 历史，tag `v0.1.0` 之前的提交里可找回）；
+2. `FREE_FOR_ALL` 改回 `false`，跑 `cargo test -p freeport-gateway --test license_e2e`
+   与 `--test hardening_e2e`（防破解回归）；
+3. 设置页「增强功能」的文案与 Pro 门禁重新对齐（部分开关的禁用态会回来）；
+4. EULA 里的收费条款与实际定价一致。

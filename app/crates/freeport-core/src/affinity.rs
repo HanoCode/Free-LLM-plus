@@ -22,7 +22,7 @@ pub const UNSTICK_RATIO: f64 = 0.10;
 /// 最多记多少个会话，超出按最旧淘汰。够覆盖一台机器上的并行 agent。
 const MAX_SESSIONS: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Stick {
     pub provider: String,
     /// 上次答它的那条**凭据**。同一个厂商的两个 key 缓存互不相通，
@@ -55,6 +55,24 @@ impl Affinity {
 
     pub fn ttl_ms(&self) -> i64 {
         self.ttl_ms
+    }
+
+    /// 运行中调整粘性窗口。下限 1 秒——0 会让每个会话立即过期，
+    /// 等于把粘性整个关掉还假装开着。调用方（gateway）负责按档位给值。
+    pub fn set_ttl_ms(&mut self, ms: i64) {
+        self.ttl_ms = ms.max(1_000);
+    }
+
+    /// 把外部留存（落盘快照）灌回来。时间戳用原值，过期项交给
+    /// `peek/touch` 的既有逻辑自然淘汰——恢复路径不引入新的判定规则。
+    /// 只灌未过期的，避免把已经凉了的会话又拉回来占位。
+    pub fn restore(&mut self, entries: impl IntoIterator<Item = (String, Stick)>, now: i64) {
+        for (session, stick) in entries {
+            if session.is_empty() || now - stick.at > self.ttl_ms {
+                continue;
+            }
+            self.map.insert(session, stick);
+        }
     }
 
     /// 从请求体推一个会话指纹。
@@ -140,6 +158,16 @@ impl Affinity {
     pub fn prune(&mut self, now: i64) {
         let ttl = self.ttl_ms;
         self.map.retain(|_, s| now - s.at <= ttl);
+    }
+
+    /// 未过期的粘性快照（会话键 → Stick）。预热任务用它扫「哪些会话还活着」，
+    /// 只读克隆，不滑动过期时间——预热是旁观者，不该影响粘性窗口。
+    pub fn active(&self, now: i64) -> Vec<(String, Stick)> {
+        self.map
+            .iter()
+            .filter(|(_, s)| now - s.at <= self.ttl_ms)
+            .map(|(k, s)| (k.clone(), s.clone()))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -235,5 +263,33 @@ mod tests {
         let s = a.peek("s", 10).unwrap();
         assert_eq!((s.provider.as_str(), s.model.as_str()), ("cerebras", "qwen-3"));
         assert_eq!(a.len(), 1, "同一会话只留一条");
+    }
+
+    #[test]
+    fn restore_keeps_live_entries_only() {
+        let mut a = Affinity::default();
+        let fresh = Stick {
+            provider: "groq".into(),
+            account: "acct_a".into(),
+            model: "llama-3".into(),
+            at: 1_000,
+        };
+        let stale = Stick { at: 1_000 - DEFAULT_TTL_MS - 1, ..fresh.clone() };
+        a.restore(
+            vec![
+                ("live".to_string(), fresh.clone()),
+                ("dead".to_string(), stale),
+                (String::new(), Stick { at: 1_000, ..fresh.clone() }),
+            ],
+            1_000,
+        );
+        assert_eq!(a.len(), 1, "过期项与空键都不灌回");
+        assert!(a.peek("live", 1_000).is_some());
+
+        // TTL 可调：窗口调小后原来活的也会过期
+        a.set_ttl_ms(60_000);
+        assert!(a.peek("live", 1_000 + 61_000).is_none());
+        a.set_ttl_ms(0);
+        assert_eq!(a.ttl_ms(), 1_000, "TTL 下限 1 秒");
     }
 }

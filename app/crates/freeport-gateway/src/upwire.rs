@@ -9,11 +9,13 @@
 //! |---|---|---|
 //! | Anthropic（订阅号） | `/v1/messages` | Anthropic Messages |
 //! | Codex（订阅号） | `/backend-api/codex/responses` | OpenAI Responses |
+//! | Gemini 原生 | `/v1beta/models/{m}:generateContent` | Gemini generateContent |
 //!
-//! 订阅额度只能从这两个端点用掉，所以必须有一层「进去转一次、出来再转回来」。
-//! 这和 [`crate::anthropic`] / [`crate::responses`] 是两个方向：
+//! 订阅额度只能从这两个端点用掉，Gemini 原生端点则有兼容层覆盖不到的语义
+//! （工具调用的严格 schema、thinkingConfig），所以必须有一层「进去转一次、
+//! 出来再转回来」。这和 [`crate::anthropic`] / [`crate::responses`] 是两个方向：
 //! 那两处服务**客户端**（Claude Code 说 Messages，我们把它转成 OpenAI 去路由），
-//! 这里服务**上游**（上游说 Messages，我们把 OpenAI 转成它去发）。
+//! 这里服务**上游**（上游说原生协议，我们把 OpenAI 转成它去发）。
 //!
 //! ## 三条约定
 //!
@@ -40,6 +42,8 @@ pub enum Wire {
     Anthropic,
     /// OpenAI Responses（Codex 订阅）
     Responses,
+    /// Gemini generateContent（Google AI Studio 原生端点）
+    Gemini,
 }
 
 impl Wire {
@@ -48,6 +52,7 @@ impl Wire {
         match s.trim().to_ascii_lowercase().as_str() {
             "anthropic" | "messages" | "claude" => Wire::Anthropic,
             "responses" | "response" | "codex" => Wire::Responses,
+            "gemini" | "google" => Wire::Gemini,
             _ => Wire::Openai,
         }
     }
@@ -57,6 +62,7 @@ impl Wire {
             Wire::Openai => "openai",
             Wire::Anthropic => "anthropic",
             Wire::Responses => "responses",
+            Wire::Gemini => "gemini",
         }
     }
 
@@ -65,21 +71,48 @@ impl Wire {
     }
 
     /// 上游路径。拼在 `base_url` 后面。
+    ///
+    /// Gemini 没有固定路径（模型名和动作编在路径里），一律走 [`url`]。
     pub fn path(&self) -> &'static str {
         match self {
             Wire::Openai => "/chat/completions",
             Wire::Anthropic => "/messages",
             Wire::Responses => "/responses",
+            Wire::Gemini => "",
         }
     }
 }
 
-/// 按厂商 id 判上游线格式。
+/// 拼上游请求 URL。
 ///
-/// 用 id 而不是给 `Provider` 加字段，是因为**只有内置的两个订阅预设**需要
-/// 非 OpenAI 的线格式：它们的额度只能从原生端点用掉，没有 OpenAI 兼容层可选。
-/// 给它加一个 99% 的厂商都用不到的配置项，只会让接入表单多一个要解释的格子。
-/// 将来真出现第三家（比如只讲 Gemini 原生协议的免费端点），再把这个函数换成字段。
+/// 只有 Gemini 需要模型名和 stream 标志；其余协议是固定路径，两个参数被忽略。
+/// `?alt=sse` 不能省：不带它 Gemini 流式返回的是一整个 JSON 数组，没法按帧转。
+pub fn url(wire: Wire, base_url: &str, model: &str, stream: bool) -> String {
+    let base = base_url.trim_end_matches('/');
+    match wire {
+        Wire::Gemini if stream => format!("{base}/models/{model}:streamGenerateContent?alt=sse"),
+        Wire::Gemini => format!("{base}/models/{model}:generateContent"),
+        _ => format!("{base}{}", wire.path()),
+    }
+}
+
+/// 从厂商配置取线格式。
+///
+/// 显式 `wire` 字段优先（新配置的唯一来源）；空值回落到按 id 推断——
+/// 那是 `wire` 字段出现前的老行为，只为存量配置与订阅预设保留，
+/// 没有字段也要保证 `claude-sub` / `codex-sub` 继续走原生端点。
+pub fn wire_of(p: &freeport_core::model::Provider) -> Wire {
+    match p.wire.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(w) => Wire::parse(w),
+        None => wire_of_provider(&p.id),
+    }
+}
+
+/// 按厂商 id 判上游线格式（老路径，仅兜底）。
+///
+/// 用 id 而不是配置字段是 v1 的权宜：当时只有内置的两个订阅预设需要
+/// 非 OpenAI 线格式。现在有了 [`Wire::Gemini`]，显式配置走
+/// [`wire_of`]（读 `Provider.wire`），这个函数只服务「没写字段的存量配置」。
 pub fn wire_of_provider(id: &str) -> Wire {
     match id {
         "claude-sub" => Wire::Anthropic,
@@ -95,6 +128,7 @@ pub fn request(wire: Wire, oa: &Value) -> Value {
         Wire::Openai => oa.clone(),
         Wire::Anthropic => anthropic_request(oa),
         Wire::Responses => responses_request(oa),
+        Wire::Gemini => gemini_request(oa),
     }
 }
 
@@ -474,6 +508,272 @@ fn responses_request(oa: &Value) -> Value {
     Value::Object(out)
 }
 
+/// OpenAI chat → Gemini generateContent。
+///
+/// Gemini 是 proto-JSON：**不认识的键会整单拒收**（不是忽略），所以请求体
+/// 全部从零构造，OpenAI 的 `stream_options` 之类的键一个都不带。工具的
+/// JSON Schema 也要洗一遍——`type` 必须大写枚举、`additionalProperties`
+/// 这类 proto Schema 没有的键必须剥掉。
+fn gemini_request(oa: &Value) -> Value {
+    let mut out = Map::new();
+    let mut system: Vec<String> = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+    // call_id → 函数名。Gemini 的工具结果按**函数名**回填（functionResponse
+    // 不带 id），名字只能从配对的 assistant 消息里查——OpenAI 历史里
+    // tool 消息只引用 tool_call_id。
+    let mut call_names: std::collections::HashMap<String, String> = Default::default();
+
+    if let Some(list) = oa.get("messages").and_then(|m| m.as_array()) {
+        for m in list {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            match role {
+                "system" | "developer" => {
+                    let t = text_of(m.get("content"));
+                    if !t.is_empty() {
+                        system.push(t);
+                    }
+                }
+                "assistant" => {
+                    let mut parts: Vec<Value> = Vec::new();
+                    let t = text_of(m.get("content"));
+                    if !t.is_empty() {
+                        parts.push(json!({ "text": t }));
+                    }
+                    if let Some(calls) = m.get("tool_calls").and_then(|c| c.as_array()) {
+                        for (i, c) in calls.iter().enumerate() {
+                            let id = c
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("call_{i}"));
+                            let name = c
+                                .pointer("/function/name")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            call_names.insert(id, name.clone());
+                            let args = c
+                                .pointer("/function/arguments")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("{}");
+                            parts.push(json!({
+                                "functionCall": {
+                                    "name": name,
+                                    // 上游给的是字符串，Gemini 要对象
+                                    "args": serde_json::from_str::<Value>(args)
+                                        .unwrap_or_else(|_| json!({})),
+                                }
+                            }));
+                        }
+                    }
+                    if !parts.is_empty() {
+                        push_parts(&mut contents, "model", parts);
+                    }
+                }
+                "tool" => {
+                    let id = m.get("tool_call_id").and_then(|x| x.as_str()).unwrap_or_default();
+                    let name = call_names.get(id).cloned().unwrap_or_default();
+                    let content = text_of(m.get("content"));
+                    // functionResponse.response 必须是对象：裸字符串会被拒。
+                    // 包一层 {"result": …} 是各家 OpenAI→Gemini 代理的通用做法。
+                    let part = json!({
+                        "functionResponse": { "name": name, "response": { "result": content } }
+                    });
+                    push_parts(&mut contents, "user", vec![part]);
+                }
+                _ => {
+                    let parts = gemini_user_parts(m.get("content"));
+                    if !parts.is_empty() {
+                        push_parts(&mut contents, "user", parts);
+                    }
+                }
+            }
+        }
+    }
+
+    if !system.is_empty() {
+        out.insert(
+            "systemInstruction".into(),
+            json!({ "parts": [{ "text": system.join("\n\n") }] }),
+        );
+    }
+    out.insert("contents".into(), Value::Array(contents));
+
+    // 采样参数全进 generationConfig，这是 Gemini 和 OpenAI 最容易踩错的地方
+    let mut gc = Map::new();
+    if let Some(mt) = oa
+        .get("max_tokens")
+        .or_else(|| oa.get("max_completion_tokens"))
+        .filter(|x| !x.is_null())
+    {
+        gc.insert("maxOutputTokens".into(), mt.clone());
+    }
+    for (from, to) in [("temperature", "temperature"), ("top_p", "topP")] {
+        if let Some(x) = oa.get(from) {
+            gc.insert(to.into(), x.clone());
+        }
+    }
+    match oa.get("stop") {
+        Some(Value::String(s)) => {
+            gc.insert("stopSequences".into(), json!([s.clone()]));
+        }
+        Some(Value::Array(a)) if !a.is_empty() => {
+            gc.insert("stopSequences".into(), Value::Array(a.clone()));
+        }
+        _ => {}
+    }
+    // 思考档位：只搬客户端显式写的那个。effort 没有对应的官方字段，
+    // 映射到 thinkingBudget（都在 2.5 系模型的合法区间内）：
+    // low=1024 / medium=8192 / high=24576（flash 上限即 24576）。
+    if let Some(effort) = oa.get("reasoning_effort").and_then(|x| x.as_str()) {
+        let budget = match effort {
+            "low" => 1024,
+            "high" => 24_576,
+            _ => 8_192,
+        };
+        gc.insert("thinkingConfig".into(), json!({ "thinkingBudget": budget }));
+    }
+    if !gc.is_empty() {
+        out.insert("generationConfig".into(), Value::Object(gc));
+    }
+
+    if let Some(tools) = oa.get("tools").and_then(|t| t.as_array()) {
+        let decls: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function")?;
+                Some(json!({
+                    "name": f.get("name").and_then(|x| x.as_str())?,
+                    "description": f.get("description").cloned().unwrap_or(json!("")),
+                    "parameters": gemini_schema(
+                        f.get("parameters").unwrap_or(&json!({ "type": "object" })),
+                    ),
+                }))
+            })
+            .collect();
+        if !decls.is_empty() {
+            out.insert("tools".into(), json!([{ "functionDeclarations": decls }]));
+            if let Some(tc) = oa.get("tool_choice") {
+                let cfg = match tc {
+                    Value::String(s) if s == "required" => json!({ "mode": "ANY" }),
+                    Value::String(s) if s == "none" => json!({ "mode": "NONE" }),
+                    Value::Object(o) => {
+                        let name = o
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default();
+                        json!({ "mode": "ANY", "allowedFunctionNames": [name] })
+                    }
+                    _ => json!({ "mode": "AUTO" }),
+                };
+                out.insert("toolConfig".into(), json!({ "functionCallingConfig": cfg }));
+            }
+        }
+    }
+
+    Value::Object(out)
+}
+
+/// 把一条消息的内容块塞进去；和上一条同角色就合并——Gemini 对相邻同角色
+/// 的 contents 虽然不总是拒绝，但合并后的历史读起来才和 OpenAI 语义一致。
+fn push_parts(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
+    if let Some(last) = contents.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+            if let Some(arr) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                arr.extend(parts);
+                return;
+            }
+        }
+    }
+    contents.push(json!({ "role": role, "parts": parts }));
+}
+
+/// OpenAI 的 user content（字符串或分区数组）→ Gemini parts。
+///
+/// 远程 URL 图片被丢弃：Gemini 的 REST 端点只收 inlineData（base64）或
+/// 先经 Files API 上传的 fileUri，我们没有代上传——猜着发一个 URL 上游
+/// 会 400，还不如不发。
+fn gemini_user_parts(v: Option<&Value>) -> Vec<Value> {
+    match v {
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({ "text": s })]
+            }
+        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| {
+                let ty = p.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                match ty {
+                    "text" => p
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| json!({ "text": t })),
+                    "image_url" => {
+                        let url = p
+                            .pointer("/image_url/url")
+                            .or_else(|| p.get("image_url"))
+                            .and_then(|u| u.as_str())?;
+                        let data = url.strip_prefix("data:")?;
+                        let mut it = data.splitn(2, ',');
+                        let meta = it.next().unwrap_or("");
+                        let body = it.next()?;
+                        let media = meta.split(';').next().unwrap_or("image/png");
+                        Some(json!({ "inlineData": { "mimeType": media, "data": body } }))
+                    }
+                    _ => None,
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// OpenAPI JSON Schema → Gemini proto Schema。
+///
+/// proto 的枚举按名字精确匹配，`"object"` 会被拒，必须是 `"OBJECT"`；
+/// `additionalProperties` / `$schema` / `default` 这些 proto Schema 没有的键
+/// 见到就整单 400，必须剥掉。`properties` 里的键是**用户定义的字段名**，
+/// 不是 schema 关键字，必须原样保留、只递归洗值。
+fn gemini_schema(v: &Value) -> Value {
+    match v {
+        Value::Object(o) => {
+            let mut out = Map::new();
+            for (k, val) in o {
+                match k.as_str() {
+                    "type" => {
+                        if let Some(t) = val.as_str() {
+                            out.insert("type".into(), json!(t.to_ascii_uppercase()));
+                        } else {
+                            out.insert("type".into(), val.clone());
+                        }
+                    }
+                    "properties" => {
+                        let mut props = Map::new();
+                        if let Some(obj) = val.as_object() {
+                            for (pk, pv) in obj {
+                                props.insert(pk.clone(), gemini_schema(pv));
+                            }
+                        }
+                        out.insert("properties".into(), Value::Object(props));
+                    }
+                    "description" | "required" | "items" | "enum" | "format" => {
+                        out.insert(k.clone(), gemini_schema(val));
+                    }
+                    _ => {}
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(gemini_schema).collect()),
+        other => other.clone(),
+    }
+}
+
 /* ── 响应：上游 → OpenAI ─────────────────────────── */
 
 pub fn response(wire: Wire, native: &Value, model: &str) -> Value {
@@ -481,6 +781,7 @@ pub fn response(wire: Wire, native: &Value, model: &str) -> Value {
         Wire::Openai => native.clone(),
         Wire::Anthropic => anthropic_response(native, model),
         Wire::Responses => responses_response(native, model),
+        Wire::Gemini => gemini_response(native, model),
     }
 }
 
@@ -607,6 +908,87 @@ fn responses_response(v: &Value, model: &str) -> Value {
     let input = v.pointer("/usage/input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
     let output = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
     chat_completion(v.get("id").and_then(|x| x.as_str()), model, Value::Object(msg), finish, input, output)
+}
+
+/// Gemini generateContent → OpenAI chat.completion。
+fn gemini_response(v: &Value, model: &str) -> Value {
+    let mut text = String::new();
+    let mut thinking = String::new();
+    let mut calls: Vec<Value> = Vec::new();
+
+    if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(|p| p.as_array()) {
+        for p in parts {
+            if p.get("thought").and_then(|x| x.as_bool()).unwrap_or(false) {
+                thinking.push_str(p.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+            } else if let Some(fc) = p.get("functionCall") {
+                // Gemini 不给 tool_call id：按出现顺序生成，客户端下轮回传的
+                // tool_call_id 就是它——下一轮 gemini_request 靠它查回函数名
+                let idx = calls.len();
+                let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                calls.push(json!({
+                    "id": format!("call_{idx}"),
+                    "type": "function",
+                    "function": {
+                        "name": fc.get("name").and_then(|x| x.as_str()).unwrap_or(""),
+                        "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
+                    }
+                }));
+            } else {
+                text.push_str(p.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+            }
+        }
+    }
+
+    let mut finish = gemini_finish(
+        v.pointer("/candidates/0/finishReason")
+            .and_then(|x| x.as_str())
+            .unwrap_or(""),
+    );
+    // 整单被安全策略拦下时 promptFeedback 里有 blockReason、candidates 可能为空
+    if let Some(block) = v.pointer("/promptFeedback/blockReason").and_then(|x| x.as_str()) {
+        if finish == "stop" || text.is_empty() {
+            finish = "content_filter";
+            text.clear();
+            tracing::debug!(block = %block, "gemini 响应被安全策略拦截");
+        }
+    }
+    if !calls.is_empty() {
+        finish = "tool_calls";
+    }
+
+    let mut msg = Map::new();
+    msg.insert("role".into(), json!("assistant"));
+    msg.insert("content".into(), json!(text));
+    if !thinking.is_empty() {
+        msg.insert("reasoning_content".into(), json!(thinking));
+    }
+    if !calls.is_empty() {
+        msg.insert("tool_calls".into(), Value::Array(calls));
+    }
+
+    let input = v
+        .pointer("/usageMetadata/promptTokenCount")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    // 思考 token 也是真实输出，账本必须认账
+    let output = v
+        .pointer("/usageMetadata/candidatesTokenCount")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0)
+        + v.pointer("/usageMetadata/thoughtsTokenCount")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+    chat_completion(v.get("responseId").and_then(|x| x.as_str()), model, Value::Object(msg), finish, input, output)
+}
+
+/// Gemini finishReason → OpenAI finish_reason。
+fn gemini_finish(fr: &str) -> &'static str {
+    match fr {
+        "MAX_TOKENS" => "length",
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => "content_filter",
+        "MALFORMED_FUNCTION_CALL" => "stop",
+        _ => "stop",
+    }
 }
 
 fn chat_completion(
@@ -792,6 +1174,7 @@ impl Down {
             match self.wire {
                 Wire::Anthropic => self.on_anthropic(&v),
                 Wire::Responses => self.on_responses(&v),
+                Wire::Gemini => self.on_gemini(&v),
                 Wire::Openai => {}
             }
         }
@@ -947,6 +1330,60 @@ impl Down {
                 self.emit_error(&msg);
             }
             _ => {}
+        }
+    }
+
+    /// Gemini 的流式帧就是 `GenerateContentResponse`，没有独立的事件类型：
+    /// 文本增量在 `parts[].text`，工具调用整体出现在一个 part 里（没有参数
+    /// 分片），`usageMetadata` 逐帧累计，`finishReason` 只在最后一帧出现。
+    /// 帧结束没有 `[DONE]`——断流时由 `poll_next` 的兜底补收尾。
+    fn on_gemini(&mut self, v: &Value) {
+        if let Some(e) = v.get("error") {
+            let msg = e
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("上游返回错误")
+                .to_string();
+            self.emit_error(&msg);
+            return;
+        }
+        if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(|p| p.as_array()) {
+            for p in parts {
+                if p.get("thought").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    self.think(p.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                } else if let Some(fc) = p.get("functionCall") {
+                    let idx = self.tool_slots.len();
+                    let name = fc.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let id = format!("call_{idx}");
+                    // Gemini 的参数是完整对象，一次性发给客户端
+                    let args = serde_json::to_string(&fc.get("args").cloned().unwrap_or_else(|| json!({})))
+                        .unwrap_or_else(|_| "{}".into());
+                    self.tool_slots.push(name.clone());
+                    self.tool_delta(idx, Some(&id), Some(&name), &args);
+                } else {
+                    self.text(p.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                }
+            }
+        }
+        // 逐帧累计：中间帧的 candidatesTokenCount 是增量到当前的值，取 max 即总量
+        if let Some(u) = v.get("usageMetadata") {
+            self.input_tokens = self
+                .input_tokens
+                .max(u.get("promptTokenCount").and_then(|x| x.as_u64()).unwrap_or(0));
+            let out = u.get("candidatesTokenCount").and_then(|x| x.as_u64()).unwrap_or(0)
+                + u.get("thoughtsTokenCount").and_then(|x| x.as_u64()).unwrap_or(0);
+            self.output_tokens = self.output_tokens.max(out);
+        }
+        if let Some(fr) = v.pointer("/candidates/0/finishReason").and_then(|x| x.as_str()) {
+            let f = if !self.tool_slots.is_empty() && fr == "STOP" {
+                "tool_calls"
+            } else {
+                gemini_finish(fr)
+            };
+            self.finish(f);
+        } else if v.pointer("/promptFeedback/blockReason").is_some() {
+            // 没有内容也没有 finishReason、只有拦截标记：如实告诉客户端被拦了
+            self.finish("content_filter");
         }
     }
 
@@ -1163,14 +1600,14 @@ mod tests {
 
     /* ── 流式 ── */
 
-    fn drive(frames: &[&str]) -> Vec<Value> {
+    fn drive(wire: Wire, frames: &[&str]) -> Vec<Value> {
         use futures_util::StreamExt;
         let chunks: Vec<Result<Bytes, reqwest::Error>> = frames
             .iter()
             .map(|f| Ok(Bytes::from(f.to_string())))
             .collect();
         let input = futures_util::stream::iter(chunks).boxed();
-        let out = rewrite(Wire::Anthropic, "m".into(), input);
+        let out = rewrite(wire, "m".into(), input);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -1194,7 +1631,7 @@ mod tests {
 
     #[test]
     fn anthropic_sse_becomes_openai_chunks() {
-        let out = drive(&[
+        let out = drive(Wire::Anthropic, &[
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"好\"}}\n\n",
@@ -1225,7 +1662,7 @@ mod tests {
 
     #[test]
     fn a_frame_split_across_tcp_chunks_is_still_parsed() {
-        let out = drive(&[
+        let out = drive(Wire::Anthropic, &[
             "event: content_block_delta\ndata: {\"type\":\"content_bl",
             "ock_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
         ]);
@@ -1257,5 +1694,193 @@ mod tests {
         });
         assert!(text.contains("\"finish_reason\":\"stop\""));
         assert!(text.contains("[DONE]"));
+    }
+
+    /* ── Gemini 原生上游 ── */
+
+    #[test]
+    fn gemini_url_encodes_model_and_stream() {
+        let base = "https://generativelanguage.googleapis.com/v1beta";
+        assert_eq!(
+            url(Wire::Gemini, base, "gemini-2.5-flash", false),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(
+            url(Wire::Gemini, base, "gemini-2.5-flash", true),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+        // 其余协议仍是固定路径
+        assert_eq!(url(Wire::Anthropic, "https://x/v1/", "m", true), "https://x/v1/messages");
+    }
+
+    #[test]
+    fn gemini_request_lifts_system_and_tools() {
+        let out = gemini_request(&oa_req());
+        assert_eq!(
+            out["systemInstruction"]["parts"][0]["text"],
+            "you are terse",
+            "system 消息进 systemInstruction"
+        );
+        assert_eq!(out["generationConfig"]["maxOutputTokens"], 512);
+        assert!(out.get("stream").is_none(), "stream 编在 URL 里，不在 body");
+        assert!(out.get("model").is_none(), "模型名编在 URL 里，不在 body");
+
+        let decls = out["tools"][0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(decls[0]["name"], "ls");
+        assert_eq!(
+            decls[0]["parameters"]["type"], "OBJECT",
+            "proto 枚举必须大写，小写会被整单拒收"
+        );
+        assert_eq!(
+            out["toolConfig"]["functionCallingConfig"]["mode"], "ANY",
+            "required → ANY"
+        );
+        // role: tool 的两条结果按函数名回填，且合并进同一条 user contents
+        let contents = out["contents"].as_array().unwrap();
+        let kinds: Vec<String> = contents
+            .iter()
+            .map(|c| c["role"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(kinds, vec!["user", "model", "user"]);
+        let fr = contents[2]["parts"][0]["functionResponse"].clone();
+        assert_eq!(fr["name"], "ls", "函数名来自配对的 assistant tool_calls");
+        assert_eq!(fr["response"]["result"], "/bin");
+    }
+
+    #[test]
+    fn gemini_request_keeps_data_url_images_and_drops_remote() {
+        let out = gemini_request(&json!({
+            "model": "x",
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "看图" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } }
+            ]}]
+        }));
+        let parts = out["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "远程 URL 图片没有 fileUri，只能丢弃");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn gemini_schema_sanitizes_unknown_keys() {
+        let out = gemini_request(&json!({
+            "model": "x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "ls",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "properties": { "p": { "type": "string", "default": "/" } },
+                    "required": ["p"]
+                }
+            }}]
+        }));
+        let params = &out["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(params["type"], "OBJECT");
+        assert!(params.get("additionalProperties").is_none());
+        assert!(params.get("$schema").is_none());
+        assert_eq!(params["properties"]["p"]["type"], "STRING");
+        assert!(params["properties"]["p"].get("default").is_none());
+    }
+
+    #[test]
+    fn gemini_response_carries_text_thoughts_tools_and_usage() {
+        let v = json!({
+            "responseId": "resp_g",
+            "candidates": [{
+                "content": { "role": "model", "parts": [
+                    { "text": "想一想" , "thought": true },
+                    { "text": "答案" },
+                    { "functionCall": { "name": "ls", "args": { "p": "/" } } }
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 7,
+                "thoughtsTokenCount": 3
+            }
+        });
+        let out = gemini_response(&v, "gemini-2.5-flash");
+        let msg = &out["choices"][0]["message"];
+        assert_eq!(msg["content"], "答案");
+        assert_eq!(msg["reasoning_content"], "想一想");
+        assert_eq!(msg["tool_calls"][0]["id"], "call_0", "Gemini 不给 id，按序生成");
+        assert_eq!(msg["tool_calls"][0]["function"]["arguments"], "{\"p\":\"/\"}");
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
+        // 思考 token 也是真实输出，账本必须认账
+        assert_eq!(out["usage"]["prompt_tokens"], 11);
+        assert_eq!(out["usage"]["completion_tokens"], 10);
+    }
+
+    #[test]
+    fn gemini_truncation_and_blocks_are_reported_honestly() {
+        let truncated = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "半句" }] }, "finishReason": "MAX_TOKENS" }],
+            "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 2 }
+        });
+        let out = gemini_response(&truncated, "m");
+        assert_eq!(out["choices"][0]["finish_reason"], "length");
+
+        let blocked = json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 0 }
+        });
+        let out = gemini_response(&blocked, "m");
+        assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn gemini_sse_becomes_openai_chunks() {
+        let out = drive(Wire::Gemini, &[
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"你\"}]}}],\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":1}}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"好\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":2}}\n\n",
+        ]);
+
+        assert_eq!(out[0]["choices"][0]["delta"]["role"], "assistant");
+        let text: String = out
+            .iter()
+            .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|x| x.as_str()))
+            .collect();
+        assert_eq!(text, "你好");
+        let stop = out
+            .iter()
+            .find(|c| c.pointer("/choices/0/finish_reason").map(|f| !f.is_null()).unwrap_or(false))
+            .expect("必须有收尾块");
+        assert_eq!(stop["choices"][0]["finish_reason"], "stop");
+        let usage = out
+            .iter()
+            .find(|c| c.get("usage").is_some())
+            .expect("必须带 usage，账本靠它");
+        assert_eq!(usage["usage"]["prompt_tokens"], 9);
+        assert_eq!(usage["usage"]["completion_tokens"], 2);
+    }
+
+    #[test]
+    fn gemini_sse_tool_call_arrives_complete_in_one_part() {
+        let out = drive(Wire::Gemini, &[
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"ls\",\"args\":{\"p\":\"/\"}}}]},\"finishReason\":\"STOP\"}]}\n\n",
+        ]);
+        let delta = &out[1]["choices"][0]["delta"];
+        let call = &delta["tool_calls"][0];
+        assert_eq!(call["id"], "call_0");
+        assert_eq!(call["function"]["name"], "ls");
+        assert_eq!(call["function"]["arguments"], "{\"p\":\"/\"}");
+        let stop = out
+            .iter()
+            .find(|c| c.pointer("/choices/0/finish_reason").map(|f| !f.is_null()).unwrap_or(false))
+            .expect("必须有收尾块");
+        assert_eq!(stop["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn gemini_wire_parses_from_config() {
+        assert_eq!(Wire::parse("gemini"), Wire::Gemini);
+        assert_eq!(Wire::parse("google"), Wire::Gemini);
+        assert_eq!(Wire::Gemini.as_str(), "gemini");
     }
 }

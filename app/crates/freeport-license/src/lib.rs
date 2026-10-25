@@ -26,11 +26,33 @@ use serde::{Deserialize, Serialize};
 /// 到期后的宽限期。付费用户不该在到期那一刻被踢下车。
 pub const GRACE_SECS: i64 = 7 * 86400;
 
-/// 生产公钥（Ed25519，32 字节，base64）。
+/// 生产公钥（Ed25519，32 字节）。
+///
+/// **不落明文常量**：拆成 XOR 分片，运行时合成。公钥本身不是秘密，
+/// 但它是逆向的「金丝雀」——明文 32 字节块或 base64 串在二进制里
+/// 一眼可辨，替换成攻击者自己的公钥就能让自签 token 全部通过验签
+/// （比 patch 控制流还省事，自动化工具按字符串搜索就能完成）。
+/// 分片后这条路要靠理解验签代码本身才走得通。这是提高成本，不是加密。
 ///
 /// 私钥在签发端，不进仓库也不进二进制。轮换时改这里 + 让新 token 带 `kid`，
 /// 旧 token 仍能被旧公钥验到过期为止（见 [`verify_with`]）。
-pub const PROD_PUBKEY: &str = "UPVm5flhrILT9a80ExNh9SpzVu5cFx5Dxhj2gkwWpEI";
+const PK_SHARD_A: [u8; 32] = [
+    0x48, 0xe7, 0x13, 0xdd, 0xfc, 0x5a, 0x46, 0x2c, 0x4b, 0x9d, 0x59, 0x24, 0x00, 0x53, 0x14, 0x79,
+    0xb6, 0xfa, 0x90, 0x0c, 0x3f, 0x66, 0x20, 0xff, 0xf7, 0x06, 0x0f, 0xee, 0x70, 0xa3, 0x96, 0x45,
+];
+const PK_SHARD_B: [u8; 32] = [
+    0x18, 0x12, 0x75, 0x38, 0x05, 0x3b, 0xea, 0xae, 0x98, 0x68, 0xf6, 0x10, 0x13, 0x40, 0x75, 0x8c,
+    0x9c, 0x89, 0xc6, 0xe2, 0x63, 0x71, 0x3e, 0xbc, 0x31, 0x1e, 0xf9, 0x6c, 0x3c, 0xb5, 0x32, 0x07,
+];
+
+/// 合成生产公钥：`A ^ B`。
+fn prod_pubkey() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (o, (a, b)) in out.iter_mut().zip(PK_SHARD_A.iter().zip(PK_SHARD_B.iter())) {
+        *o = a ^ b;
+    }
+    out
+}
 
 pub const HEADER: &str = r#"{"alg":"EdDSA","typ":"JWT"}"#;
 
@@ -71,11 +93,21 @@ impl Claims {
         Self {
             sub: sub.into(),
             tier: "pro".into(),
+            // 完整能力清单。v1.14 起客户端按这个清单做功能门禁（pro.rs）：
+            // patch 掉 is_pro 拿不到 claims，清单为空，功能照样进不来——
+            // 单点 bool 不再是唯一闸门。前四个是 v1.13 及之前签发的
+            // 「旧清单」，客户端对它们按通配处理（见 License::grants）。
             feat: vec![
                 "feed.realtime".into(),
                 "quota.intel".into(),
                 "sync.cloud".into(),
                 "log.90d".into(),
+                "backup".into(),
+                "prewarm".into(),
+                "profiles".into(),
+                "patrol.plus".into(),
+                "remote.access".into(),
+                "intel.local".into(),
             ],
             iat: now,
             exp: now + days * 86400,
@@ -158,6 +190,29 @@ impl License {
         self.status.as_str()
     }
 
+    /// 测试与网关的时钟异常分支用：手工构造一个带原因的无效结果。
+    pub fn invalid(msg: impl Into<String>) -> Self {
+        Self::fail(Status::Invalid, msg)
+    }
+
+    /// v1.13 及之前的 token 只带四条「旧清单」，没有细粒度能力。对它们
+    /// 按通配处理——付费用户不能因为客户端升级而掉功能。伪造者拿不到
+    /// claims（签名不过时 `claims` 是 None），通配帮不了他们。
+    pub const LEGACY_FEATS: [&str; 4] = ["feed.realtime", "quota.intel", "sync.cloud", "log.90d"];
+
+    /// 能力判断（带旧清单通配）。这是功能门禁该调用的入口：`is_pro()`
+    /// 之外的这一层让「patch 掉一个 bool」拿不到任何功能——能力跟着
+    /// token 里的 claims 走，伪造 claims 需要私钥，替换公钥需要理解验签代码。
+    pub fn grants(&self, feature: &str) -> bool {
+        if !self.is_pro() {
+            return false;
+        }
+        self.claims
+            .as_ref()
+            .map(|c| feat_grants(&c.feat, feature))
+            .unwrap_or(false)
+    }
+
     /// 是不是 Pro。这是唯一该被业务代码调用的判断。
     pub fn is_pro(&self) -> bool {
         matches!(self.status, Status::Valid | Status::Grace)
@@ -196,6 +251,22 @@ impl License {
             .map(|c| c.feat.iter().any(|f| f.eq_ignore_ascii_case(feature)))
             .unwrap_or(false)
     }
+}
+
+/// 纯函数版能力判断：清单命中，或清单**整体**由旧能力组成（老签发器的
+/// 固定输出，不支持细粒度清单 → 按全量授权通配）。
+///
+/// 「命中任意一条旧能力就通配」是错的：quota.intel / log.90d 同时在
+/// 新旧两份清单里。网关的 DTO 层（`GwLicense.features`）用同一个函数，
+/// 两处口径永不分叉。
+pub fn feat_grants(feat: &[String], feature: &str) -> bool {
+    if feat.iter().any(|f| f.eq_ignore_ascii_case(feature)) {
+        return true;
+    }
+    !feat.is_empty()
+        && feat
+            .iter()
+            .all(|f| License::LEGACY_FEATS.iter().any(|l| f.eq_ignore_ascii_case(l)))
 }
 
 /// 用内置公钥校验。
@@ -383,8 +454,7 @@ pub fn pubkey() -> Option<[u8; 32]> {
             }
         }
     }
-    let raw = B64.decode(PROD_PUBKEY).ok()?;
-    <[u8; 32]>::try_from(raw.as_slice()).ok()
+    Some(prod_pubkey())
 }
 
 fn short_hash(bytes: &[u8]) -> String {
@@ -611,5 +681,41 @@ mod tests {
         assert_eq!(a, machine_id("inst-1"));
         assert_ne!(a, machine_id("inst-2"));
         assert!(a.starts_with("m_") && a.len() == 18);
+    }
+
+    #[test]
+    fn shard_xor_recovers_the_real_pubkey() {
+        // 分片常量手抄错一位就该在这里炸，而不是在用户机器上验签全挂
+        let expect: [u8; 32] = [
+            0x50, 0xf5, 0x66, 0xe5, 0xf9, 0x61, 0xac, 0x82, 0xd3, 0xf5, 0xaf, 0x34, 0x13, 0x13,
+            0x61, 0xf5, 0x2a, 0x73, 0x56, 0xee, 0x5c, 0x17, 0x1e, 0x43, 0xc6, 0x18, 0xf6, 0x82,
+            0x4c, 0x16, 0xa4, 0x42,
+        ];
+        assert_eq!(prod_pubkey(), expect);
+    }
+
+    #[test]
+    fn grants_follow_the_claims_not_the_bool() {
+        // 新式细粒度清单（含至少一条新条目 → 严格模式）：只有列出的放行
+        let mut c = Claims::pro("a@b.c", 30, NOW);
+        c.feat = vec!["quota.intel".into(), "backup".into(), "prewarm".into()];
+        let l = verify_with(&key(), &token(&c), NOW, "inst");
+        assert!(l.is_pro());
+        assert!(l.grants("quota.intel"));
+        assert!(l.grants("prewarm"));
+        assert!(!l.grants("profiles"), "清单里没有的能力不能通配");
+
+        // 旧清单：feat 全由四条旧能力组成 = 老签发器输出，按全量授权
+        let mut old = Claims::pro("a@b.c", 30, NOW);
+        old.feat = vec!["feed.realtime".into(), "log.90d".into()];
+        let l = verify_with(&key(), &token(&old), NOW, "inst");
+        assert!(l.grants("prewarm"), "旧 token 按通配处理");
+        assert!(l.grants("remote.access"));
+
+        // 无效 token 没有 claims：patch 掉 is_pro 也拿不到能力
+        let mut broken = verify_with(&key(), &token(&Claims::pro("a@b.c", 30, NOW)), NOW, "inst");
+        broken.status = Status::Expired;
+        broken.claims = None;
+        assert!(!broken.grants("quota.intel"));
     }
 }

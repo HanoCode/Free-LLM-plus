@@ -34,7 +34,7 @@ interface Row {
   stream: boolean;
   /** 进了哪个账号池；池过滤是静默的，不标出来就只剩猜 */
   purpose: string;
-  /** 这个池是怎么判出来的：header / image / agent-key / default */
+  /** 这个池是怎么判出来的：header / image / agent-key / heuristic / default */
   purposeSource: string;
 }
 
@@ -51,6 +51,7 @@ const SOURCE: Record<string, { zh: string; en: string }> = {
   header: { zh: '请求头指定', en: 'header' },
   image: { zh: '请求含图', en: 'has image' },
   'agent-key': { zh: 'Agent 注入 key', en: 'agent key' },
+  heuristic: { zh: '请求特征识别', en: 'request features' },
   default: { zh: '默认', en: 'default' },
 };
 
@@ -126,14 +127,15 @@ export function Logs() {
           <button
             className="btn ghost"
             disabled={!desktop || gwLogs.length === 0}
+            data-tip="复制脱敏日志 JSON（不含密钥与 token），可直接贴给 AI 或同事帮忙排障"
             onClick={() => {
               const blob = JSON.stringify(gwLogs, null, 2);
               void navigator.clipboard?.writeText(blob);
-              toast('已复制脱敏日志 JSON / Copied redacted JSON');
+              toast('已复制排障信息（脱敏 JSON，不含密钥）');
             }}
           >
             <Download />
-            <T zh="导出" en="Export" />
+            <T zh="复制排障信息" en="Copy for debugging" />
           </button>
         </div>
       </div>
@@ -222,16 +224,20 @@ export function Logs() {
                 <th style={{ width: 86 }}>
                   <T zh="时间" en="TIME" />
                 </th>
-                <th>MODEL</th>
-                <th style={{ width: 112 }}>PROVIDER</th>
+                <th>
+                  <T zh="模型" en="MODEL" />
+                </th>
+                <th style={{ width: 112 }}>
+                  <T zh="厂商" en="PROVIDER" />
+                </th>
                 <th style={{ width: 88 }}>
                   <T zh="状态" en="STATUS" />
                 </th>
                 <th style={{ width: 74 }} className="right">
-                  TOKENS
+                  <T zh="Token" en="TOKENS" />
                 </th>
                 <th style={{ width: 78 }} className="right">
-                  TTFB
+                  <T zh="首字延迟" en="TTFB" />
                 </th>
                 <th style={{ width: 70 }} className="right">
                   <T zh="跳数" en="HOPS" />

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Activity, Search, RefreshCw, Sparkles } from 'lucide-react';
-import { T, tx, useLang } from '../lib/i18n';
+import { T, healthLabel, tx, useLang } from '../lib/i18n';
 import { Status, Switch, fmt, toast } from '../components/ui';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
@@ -37,26 +37,11 @@ const toneOf = (s: HealthStatus): 'ok' | 'warn' | 'bad' | 'idle' => {
   return 'idle';
 };
 
-const labelOf = (s: HealthStatus) => {
-  switch (s) {
-    case 'healthy':
-      return { zh: '可用', en: 'ready' };
-    case 'degraded':
-      return { zh: '降级', en: 'degraded' };
-    case 'cooling':
-      return { zh: '冷却', en: 'cooling' };
-    case 'unavailable':
-      return { zh: '不可用', en: 'down' };
-    case 'retired':
-      return { zh: '已退役', en: 'retired' };
-    case 'probing':
-      return { zh: '探测中', en: 'probing' };
-    case 'error':
-      return { zh: '异常', en: 'error' };
-    default:
-      return { zh: '未测', en: 'untested' };
-  }
-};
+/* 状态说法统一收在 lib/i18n 的 healthLabel 里：路由候选链、报表、模型页共用一套词 */
+const labelOf = (s: HealthStatus) => ({
+  zh: healthLabel(s, 'zh'),
+  en: healthLabel(s, 'en'),
+});
 
 /** 能力徽章：hover 显示含义与实测结论 */
 function CapBadge({
@@ -292,8 +277,11 @@ export function Models() {
                   <div className="t-main">
                     {m.model}
                     {m.candidate && (
-                      <span className="badge warn canary-badge" title="feed 新模型：0.3 倍权重，跑满 20 次成功转正">
-                        canary {Math.min(m.canary, 20)}/20
+                      <span className="badge warn canary-badge" title="目录新发现的模型：先小流量试用，连续成功 20 次后转正">
+                        <T
+                          zh={`新模型试用 ${Math.min(m.canary, 20)}/20`}
+                          en={`trial ${Math.min(m.canary, 20)}/20`}
+                        />
                       </span>
                     )}
                     {m.alsoOn && m.alsoOn.length > 0 && (
@@ -366,8 +354,8 @@ export function Models() {
                 </td>
                 <td className="right">
                   <button
-                    className="icon-btn"
-                    title="探测这一条 / Probe this model"
+                    className="icon-btn tip-right"
+                    data-tip="探测这一条 / Probe this model"
                     disabled={busy !== null}
                     onClick={() => probeOne(m)}
                   >

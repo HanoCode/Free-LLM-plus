@@ -1,7 +1,7 @@
 {
-  "version": 2,
-  "builtAt": "2026-10-19",
-  "note": "随版本发布的内置基线。只放「厂商元数据 + 免费额度标注」，模型细节以 models.dev 为准；models.dev 未收录的厂商（匿名端点）才在这里写模型。",
+  "version": 3,
+  "builtAt": "2026-10-25",
+  "note": "随版本发布的内置基线。放「厂商元数据 + 免费额度标注 + 离线兜底用的免费模型列表」：断网/首次启动时用户至少能看到各家免费档里可以试的模型 id。在线同步后模型细节（上下文、能力位、价格）以 models.dev 为准，基线条目只补缺、不覆盖，并始终按免费计。",
   "providers": [
     {
       "id": "groq",
@@ -11,7 +11,17 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "免费档按模型限速（约 30 RPM / 1K–14.4K RPD）",
-      "quota": { "rpm": 30, "rpd": 14400 }
+      "quota": { "rpm": 30, "rpd": 14400 },
+      "models": [
+        { "id": "llama-3.3-70b-versatile", "name": "Llama 3.3 70B", "context": 131072, "free": true, "tools": true },
+        { "id": "llama-3.1-8b-instant", "name": "Llama 3.1 8B", "context": 131072, "free": true, "tools": true },
+        { "id": "meta-llama/llama-4-scout-17b-16e-instruct", "name": "Llama 4 Scout 17B", "context": 131072, "free": true, "tools": true, "vision": true },
+        { "id": "openai/gpt-oss-120b", "name": "GPT-OSS 120B", "context": 131072, "free": true, "tools": true, "reasoning": true },
+        { "id": "openai/gpt-oss-20b", "name": "GPT-OSS 20B", "context": 131072, "free": true, "tools": true, "reasoning": true },
+        { "id": "qwen/qwen3-32b", "name": "Qwen3 32B", "context": 131072, "free": true, "tools": true },
+        { "id": "deepseek-r1-distill-llama-70b", "name": "DeepSeek R1 Distill 70B", "context": 131072, "free": true, "reasoning": true },
+        { "id": "gemma2-9b-it", "name": "Gemma 2 9B", "context": 8192, "free": true }
+      ]
     },
     {
       "id": "cerebras",
@@ -21,7 +31,15 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "免费档每日 1M tokens，推理速度极快",
-      "quota": { "rpm": 30, "rpd": 1000 }
+      "quota": { "rpm": 30, "rpd": 1000 },
+      "models": [
+        { "id": "llama-3.3-70b", "name": "Llama 3.3 70B", "context": 128000, "free": true, "tools": true },
+        { "id": "llama3.1-8b", "name": "Llama 3.1 8B", "free": true, "tools": true },
+        { "id": "qwen-3-32b", "name": "Qwen3 32B", "context": 32768, "free": true, "tools": true },
+        { "id": "qwen-3-coder-480b", "name": "Qwen3 Coder 480B", "free": true, "tools": true },
+        { "id": "gpt-oss-120b", "name": "GPT-OSS 120B", "context": 65536, "free": true, "reasoning": true },
+        { "id": "zai-glm-4.6", "name": "GLM 4.6", "free": true, "tools": true }
+      ]
     },
     {
       "id": "openrouter",
@@ -31,7 +49,17 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "带 :free 后缀的模型价格为 0，另有每日免费请求上限",
-      "quota": { "rpm": 20, "rpd": 50 }
+      "quota": { "rpm": 20, "rpd": 50 },
+      "models": [
+        { "id": "deepseek/deepseek-r1:free", "name": "DeepSeek R1 (free)", "context": 163840, "free": true, "reasoning": true },
+        { "id": "deepseek/deepseek-chat-v3-0324:free", "name": "DeepSeek V3 (free)", "context": 163840, "free": true },
+        { "id": "meta-llama/llama-3.3-70b-instruct:free", "name": "Llama 3.3 70B (free)", "context": 131072, "free": true, "tools": true },
+        { "id": "google/gemini-2.0-flash-exp:free", "name": "Gemini 2.0 Flash (free)", "context": 1048576, "free": true, "vision": true },
+        { "id": "qwen/qwen3-coder:free", "name": "Qwen3 Coder (free)", "context": 262144, "free": true },
+        { "id": "mistralai/mistral-small-3.1-24b-instruct:free", "name": "Mistral Small 3.1 (free)", "context": 131072, "free": true },
+        { "id": "moonshotai/kimi-k2:free", "name": "Kimi K2 (free)", "free": true },
+        { "id": "z-ai/glm-4.5-air:free", "name": "GLM 4.5 Air (free)", "context": 131072, "free": true }
+      ]
     },
     {
       "id": "mistral",
@@ -41,7 +69,14 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "Free 套餐需绑定手机号，含 codestral 与每分钟限速",
-      "quota": { "rpm": 60, "rpd": 1000 }
+      "quota": { "rpm": 60, "rpd": 1000 },
+      "models": [
+        { "id": "mistral-small-latest", "name": "Mistral Small", "context": 131072, "free": true, "tools": true },
+        { "id": "open-mistral-nemo", "name": "Mistral Nemo", "context": 131072, "free": true },
+        { "id": "codestral-latest", "name": "Codestral", "context": 262144, "free": true, "tools": true },
+        { "id": "ministral-8b-latest", "name": "Ministral 8B", "context": 131072, "free": true },
+        { "id": "magistral-small-latest", "name": "Magistral Small", "free": true, "reasoning": true }
+      ]
     },
     {
       "id": "nvidia",
@@ -51,7 +86,16 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "开发者账号赠送 1000 credits，模型池极广",
-      "quota": { "rpm": 40, "rpd": 1000 }
+      "quota": { "rpm": 40, "rpd": 1000 },
+      "models": [
+        { "id": "meta/llama-3.3-70b-instruct", "name": "Llama 3.3 70B", "context": 131072, "free": true, "tools": true },
+        { "id": "meta/llama-3.1-8b-instruct", "name": "Llama 3.1 8B", "context": 131072, "free": true, "tools": true },
+        { "id": "deepseek-ai/deepseek-r1", "name": "DeepSeek R1", "context": 131072, "free": true, "reasoning": true },
+        { "id": "openai/gpt-oss-120b", "name": "GPT-OSS 120B", "context": 131072, "free": true, "tools": true, "reasoning": true },
+        { "id": "qwen/qwen2.5-coder-32b-instruct", "name": "Qwen2.5 Coder 32B", "free": true },
+        { "id": "microsoft/phi-4-multimodal-instruct", "name": "Phi-4 Multimodal", "free": true, "vision": true },
+        { "id": "google/gemma-3-27b-it", "name": "Gemma 3 27B", "context": 131072, "free": true, "vision": true }
+      ]
     },
     {
       "id": "google",
@@ -61,7 +105,16 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "Gemini 免费档按模型限速（RPM/RPD/T PM 各自独立）",
-      "quota": { "rpm": 15, "rpd": 1500 }
+      "quota": { "rpm": 15, "rpd": 1500 },
+      "models": [
+        { "id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "context": 1048576, "free": true, "tools": true, "vision": true, "reasoning": true },
+        { "id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "context": 1048576, "free": true, "tools": true, "vision": true },
+        { "id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "context": 1048576, "free": true, "tools": true, "vision": true, "reasoning": true },
+        { "id": "gemini-3-pro", "name": "Gemini 3 Pro", "context": 1048576, "free": true, "tools": true, "vision": true, "reasoning": true },
+        { "id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash", "context": 1048576, "free": true, "tools": true, "vision": true },
+        { "id": "gemini-2.0-flash-lite", "name": "Gemini 2.0 Flash Lite", "context": 1048576, "free": true, "vision": true },
+        { "id": "gemma-3-27b-it", "name": "Gemma 3 27B", "context": 131072, "free": true, "vision": true }
+      ]
     },
     {
       "id": "zhipuai",
@@ -71,7 +124,12 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "glm-4-flash 系列长期免费，其余按 token 计费",
-      "quota": { "rpm": 60, "rpd": 2000 }
+      "quota": { "rpm": 60, "rpd": 2000 },
+      "models": [
+        { "id": "glm-4-flash", "name": "GLM-4-Flash", "context": 128000, "free": true, "tools": true },
+        { "id": "glm-4.5-flash", "name": "GLM-4.5-Flash", "context": 128000, "free": true, "tools": true },
+        { "id": "glm-4v-flash", "name": "GLM-4V-Flash", "free": true, "vision": true }
+      ]
     },
     {
       "id": "siliconflow",
@@ -81,7 +139,13 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "部分小参数模型免费（如 Qwen2.5-7B），其余按 token 计费",
-      "quota": { "rpm": 60, "rpd": 2000 }
+      "quota": { "rpm": 60, "rpd": 2000 },
+      "models": [
+        { "id": "Qwen/Qwen2.5-7B-Instruct", "name": "Qwen2.5 7B", "context": 32768, "free": true },
+        { "id": "Qwen/Qwen3-8B", "name": "Qwen3 8B", "free": true },
+        { "id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "name": "DeepSeek R1 Distill Qwen 7B", "free": true, "reasoning": true },
+        { "id": "THUDM/glm-4-9b-chat", "name": "GLM-4 9B", "free": true }
+      ]
     },
     {
       "id": "alibaba",
@@ -91,7 +155,14 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "新用户每模型 100 万 tokens 免费额度，有效期 180 天",
-      "quota": { "rpm": 60, "rpd": 2000 }
+      "quota": { "rpm": 60, "rpd": 2000 },
+      "models": [
+        { "id": "qwen-turbo", "name": "Qwen Turbo", "context": 1000000, "free": true },
+        { "id": "qwen-plus", "name": "Qwen Plus", "context": 131072, "free": true },
+        { "id": "qwen3-32b", "name": "Qwen3 32B", "context": 32768, "free": true },
+        { "id": "deepseek-r1", "name": "DeepSeek R1", "context": 65536, "free": true, "reasoning": true },
+        { "id": "deepseek-v3", "name": "DeepSeek V3", "context": 65536, "free": true }
+      ]
     },
     {
       "id": "sambanova",
@@ -101,7 +172,15 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "免费档低速档位，适合离线批处理",
-      "quota": { "rpm": 10, "rpd": 500 }
+      "quota": { "rpm": 10, "rpd": 500 },
+      "models": [
+        { "id": "Meta-Llama-3.3-70B-Instruct", "name": "Llama 3.3 70B", "context": 131072, "free": true },
+        { "id": "Meta-Llama-3.1-8B-Instruct", "name": "Llama 3.1 8B", "free": true },
+        { "id": "DeepSeek-R1", "name": "DeepSeek R1", "free": true, "reasoning": true },
+        { "id": "DeepSeek-R1-Distill-Llama-70B", "name": "DeepSeek R1 Distill 70B", "context": 131072, "free": true, "reasoning": true },
+        { "id": "Qwen3-32B", "name": "Qwen3 32B", "free": true },
+        { "id": "Llama-4-Maverick-17B-128E-Instruct", "name": "Llama 4 Maverick 17B", "free": true }
+      ]
     },
     {
       "id": "cloudflare-workers-ai",
@@ -111,7 +190,16 @@
       "tier": "A",
       "freeTier": true,
       "freeNote": "每天 10K neurons 免费；baseUrl 里的 {account_id} 需替换为真实账号 ID",
-      "quota": { "rpm": 60, "rpd": 1000 }
+      "quota": { "rpm": 60, "rpd": 1000 },
+      "models": [
+        { "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "name": "Llama 3.3 70B", "free": true, "tools": true },
+        { "id": "@cf/meta/llama-3.1-8b-instruct", "name": "Llama 3.1 8B", "free": true, "tools": true },
+        { "id": "@cf/meta/llama-4-scout-17b-16e-instruct", "name": "Llama 4 Scout 17B", "free": true, "vision": true },
+        { "id": "@cf/microsoft/phi-4", "name": "Phi-4", "free": true },
+        { "id": "@cf/google/gemma-7b-it", "name": "Gemma 7B", "free": true },
+        { "id": "@cf/qwen/qwen2.5-coder-32b-instruct", "name": "Qwen2.5 Coder 32B", "free": true },
+        { "id": "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", "name": "DeepSeek R1 Distill 32B", "free": true, "reasoning": true }
+      ]
     },
     {
       "id": "opencode",
@@ -121,7 +209,13 @@
       "tier": "C",
       "freeTier": true,
       "freeNote": "订阅账号额度；支持 API Key 与内置窗口登录，不做多账号共享",
-      "quota": { "rpm": 30, "rpd": 1000 }
+      "quota": { "rpm": 30, "rpd": 1000 },
+      "models": [
+        { "id": "grok-code", "name": "Grok Code", "free": true },
+        { "id": "kimi-k2", "name": "Kimi K2", "free": true },
+        { "id": "code-supernova", "name": "Code Supernova", "free": true },
+        { "id": "qwen3-coder", "name": "Qwen3 Coder", "free": true }
+      ]
     },
     {
       "id": "github",
@@ -131,7 +225,15 @@
       "tier": "C",
       "freeTier": true,
       "freeNote": "用 GitHub PAT 调用，免费档按分钟/天限流，数据可能用于训练",
-      "quota": { "rpm": 10, "rpd": 150 }
+      "quota": { "rpm": 10, "rpd": 150 },
+      "models": [
+        { "id": "openai/gpt-4o-mini", "name": "GPT-4o mini", "context": 128000, "free": true, "tools": true },
+        { "id": "openai/gpt-4.1-mini", "name": "GPT-4.1 mini", "context": 1047576, "free": true, "tools": true },
+        { "id": "openai/gpt-4.1-nano", "name": "GPT-4.1 nano", "context": 1047576, "free": true, "tools": true },
+        { "id": "meta/Llama-3.3-70B-Instruct", "name": "Llama 3.3 70B", "context": 131072, "free": true },
+        { "id": "deepseek/DeepSeek-R1", "name": "DeepSeek R1", "context": 131072, "free": true, "reasoning": true },
+        { "id": "microsoft/Phi-4", "name": "Phi-4", "context": 16384, "free": true }
+      ]
     },
     {
       "id": "pollinations",
@@ -143,12 +245,13 @@
       "freeNote": "匿名公开端点，无需 Key；限速严格，仅作兜底",
       "quota": { "rpm": 5, "rpd": 200 },
       "models": [
-        { "id": "openai", "name": "OpenAI (proxy)", "context": 32768 },
-        { "id": "openai-fast", "name": "OpenAI Fast", "context": 32768 },
-        { "id": "mistral", "name": "Mistral (proxy)", "context": 32768 },
-        { "id": "llama", "name": "Llama (proxy)", "context": 32768 },
-        { "id": "qwen-coder", "name": "Qwen Coder (proxy)", "context": 32768 },
-        { "id": "deepseek", "name": "DeepSeek (proxy)", "context": 32768 }
+        { "id": "openai", "name": "OpenAI (proxy)", "context": 32768, "free": true },
+        { "id": "openai-fast", "name": "OpenAI Fast", "context": 32768, "free": true },
+        { "id": "openai-large", "name": "OpenAI Large (proxy)", "free": true },
+        { "id": "mistral", "name": "Mistral (proxy)", "context": 32768, "free": true },
+        { "id": "llama", "name": "Llama (proxy)", "context": 32768, "free": true },
+        { "id": "qwen-coder", "name": "Qwen Coder (proxy)", "context": 32768, "free": true },
+        { "id": "deepseek", "name": "DeepSeek (proxy)", "context": 32768, "free": true }
       ]
     },
     {
@@ -161,10 +264,11 @@
       "freeNote": "公共端点，匿名可用；带 token 可提高限额。工具调用不稳定",
       "quota": { "rpm": 10, "rpd": 300 },
       "models": [
-        { "id": "gpt-4o-mini-2024-07-18", "name": "GPT-4o mini (proxy)", "context": 128000 },
-        { "id": "gpt-4.1-nano", "name": "GPT-4.1 nano (proxy)", "context": 128000 },
-        { "id": "mistral-small-3.2", "name": "Mistral Small 3.2", "context": 128000 },
-        { "id": "deepseek-r1-0528", "name": "DeepSeek R1", "context": 65536 }
+        { "id": "gpt-4o-mini-2024-07-18", "name": "GPT-4o mini (proxy)", "context": 128000, "free": true },
+        { "id": "gpt-4.1-nano", "name": "GPT-4.1 nano (proxy)", "context": 128000, "free": true },
+        { "id": "mistral-small-3.2", "name": "Mistral Small 3.2", "context": 128000, "free": true },
+        { "id": "deepseek-r1-0528", "name": "DeepSeek R1", "context": 65536, "free": true },
+        { "id": "deepseek-v3", "name": "DeepSeek V3", "free": true }
       ]
     }
   ]

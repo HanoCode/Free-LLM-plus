@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Play, Plus, RotateCcw, ShieldAlert, Trash2, Waves } from 'lucide-react';
-import { T, useLang } from '../lib/i18n';
-import { Badge, Switch, TierBadge, toast } from '../components/ui';
+import { T, healthLabel, useLang } from '../lib/i18n';
+import { Badge, Switch, TierBadge, confirmDanger, toast } from '../components/ui';
 import { useGateway } from '../lib/gateway';
 import type {
   AccountPurpose,
@@ -10,6 +10,7 @@ import type {
   GwWeights,
   HealthStatus,
   RouteStrategy,
+  StrategyProfile,
 } from '../lib/bridge';
 
 /**
@@ -66,12 +67,22 @@ export function Routing() {
   const models = useGateway((s) => s.models);
   const explainRoute = useGateway((s) => s.explainRoute);
   const clearCooldowns = useGateway((s) => s.clearCooldowns);
+  const routing = useGateway((s) => s.routing);
+  const saveRouting = useGateway((s) => s.saveRouting);
 
   const [model, setModel] = useState('auto');
   const [session, setSession] = useState('');
   /** 按哪个账号池算。切了就立刻重算——「同一个号在别的池里能不能用」是最常问的。 */
   const [purpose, setPurpose] = useState<AccountPurpose>('chat');
   const [busy, setBusy] = useState(false);
+  /** 自动调度下点「自定义调度」才展开策略面板；不持久化，改了配置自然就不是 auto 了 */
+  const [peek, setPeek] = useState(false);
+  const [resetting, setResetting] = useState(false);
+
+  // 自动 = 均衡策略 + 三维权重关闭。两者任一被用户改过，就不算 auto。
+  const auto =
+    (routing?.strategy ?? 'balanced') === 'balanced' && !routing?.weights?.enabled;
+  const showStrategy = !auto || peek;
 
   const run = async (m = model, s = session, p = purpose) => {
     setBusy(true);
@@ -79,6 +90,26 @@ export function Routing() {
       await explainRoute(m, s, p);
     } finally {
       setBusy(false);
+    }
+  };
+
+  /** 恢复自动：均衡策略 + 权重关闭，一次回到已知良好的默认 */
+  const backToAuto = async () => {
+    setResetting(true);
+    try {
+      await saveRouting({
+        strategy: 'balanced',
+        weights: {
+          ...(routing?.weights ?? { reliability: 70, speed: 15, intelligence: 15 }),
+          enabled: false,
+        },
+      });
+      setPeek(false);
+      toast('已恢复自动调度');
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e));
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -114,8 +145,8 @@ export function Routing() {
           </h1>
           <p>
             <T
-              zh="这条链就是下一秒真的会发出去的顺序：Gate 硬过滤 → Order 平滑加权 → Pick 会话粘性。"
-              en="This is the exact order the next request would follow: Gate filters, Order weights, Pick sticks."
+              zh="自动调度会按档位、剩余额度和健康状态分配每个请求，坏了自动换下一家。这里可以看它是怎么想的。"
+              en="Auto routing balances tier, remaining quota and health per request, failing over automatically. Watch how it thinks here."
             />
           </p>
         </div>
@@ -125,6 +156,39 @@ export function Routing() {
             <T zh="重新解释" en="Re-explain" />
           </button>
         </div>
+      </div>
+
+      {/* 自动调度横幅：默认只露这一张卡，策略/命名链/权重全收起来 */}
+      <div className="card auto-card" style={{ marginBottom: 14 }}>
+        <span className={`auto-dot ${auto ? 'on' : ''}`} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <b>
+            {auto ? <T zh="自动调度已开启" en="Auto routing is on" /> : <T zh="自定义调度已启用" en="Custom routing is on" />}
+          </b>
+          <span className="sub" style={{ display: 'block' }}>
+            {auto ? (
+              <T
+                zh="按档位 × 剩余额度 × 健康自动分配，失败自动换下一家。绝大多数情况不需要调整。"
+                en="Balanced by tier × remaining quota × health, with automatic failover. Most setups never need to change this."
+              />
+            ) : (
+              <T
+                zh={`当前策略：${routing?.strategy ?? 'balanced'}${routing?.weights?.enabled ? ' · 三维权重已启用' : ''}。改动即刻生效于真实流量。`}
+                en={`Strategy: ${routing?.strategy ?? 'balanced'}${routing?.weights?.enabled ? ' · weighted scoring on' : ''}. Changes apply to live traffic immediately.`}
+              />
+            )}
+          </span>
+        </div>
+        {auto ? (
+          <button className="btn ghost sm" onClick={() => setPeek(!peek)}>
+            <T zh={peek ? '收起自定义' : '自定义调度'} en={peek ? 'Hide options' : 'Customize'} />
+          </button>
+        ) : (
+          <button className="btn sm" disabled={resetting} onClick={() => void backToAuto()}>
+            <RotateCcw size={12} />
+            <T zh="恢复自动" en="Back to auto" />
+          </button>
+        )}
       </div>
 
       <div className="routing-grid">
@@ -237,7 +301,7 @@ export function Routing() {
               <span className="sub">
                 {route?.sticky
                   ? <T zh="粘性优先，本轮不轮转" en="sticky, no rotation this round" />
-                  : <T zh="SWRR 加权轮转" en="SWRR rotation" />}
+                  : <T zh="按额度比例轮流" en="rotating by quota share" />}
               </span>
             </div>
             <div className="card-body" style={{ paddingTop: 6, paddingBottom: 10 }}>
@@ -290,10 +354,10 @@ export function Routing() {
                     />
                   )}
                   {byKind.health.length > 0 && (
-                    <RejectGroup zh="模型判死" en="model judged dead" tone="bad" items={byKind.health} />
+                    <RejectGroup zh="模型连续失败" en="model failing repeatedly" tone="bad" items={byKind.health} />
                   )}
                   {byKind.cooldown.length > 0 && (
-                    <RejectGroup zh="冷却 / 熔断" en="cooling / breaker" tone="gray" items={byKind.cooldown} />
+                    <RejectGroup zh="被限速或自动暂停" en="rate-limited / auto-paused" tone="gray" items={byKind.cooldown} />
                   )}
                   {byKind.nokey.length > 0 && (
                     <RejectGroup zh="没有 Key" en="no key" tone="bad" items={byKind.nokey} />
@@ -339,7 +403,20 @@ export function Routing() {
 
         {/* ── 右：机制 ───────────────────────────── */}
         <div className="stack">
-          <StrategyCard />
+          {showStrategy && <StrategyCard />}
+
+          {!showStrategy && (
+            <div className="card">
+              <div className="card-body" style={{ padding: '12px 16px' }}>
+                <span className="sub">
+                  <T
+                    zh="策略、命名链与三维权重已收起——自动调度不需要它们。要改请点上方「自定义调度」。"
+                    en="Strategies, named chains and weights are tucked away — auto routing doesn't need them. Use 'Customize' above to change."
+                  />
+                </span>
+              </div>
+            </div>
+          )}
 
           <div className="card">
             <div className="card-head">
@@ -409,6 +486,13 @@ export function Routing() {
                   className="btn ghost sm"
                   style={{ marginLeft: 'auto' }}
                   onClick={async () => {
+                    if (
+                      !(await confirmDanger({
+                        zh: '清空全部冷却？被限速的凭据会立刻重新参与路由，可能再次触发上游限流。',
+                        en: 'Clear all cooldowns? Rate-limited credentials will rejoin routing immediately and may hit upstream limits again.',
+                      }))
+                    )
+                      return;
                     await clearCooldowns();
                     await run();
                     toast('已清空冷却 / Cooldowns cleared');
@@ -575,13 +659,13 @@ function verdictText(pool: GwRoutePool): { zh: string; en: string } {
       };
     case 'tight':
       return {
-        zh: `会落在 ${who}，余量只剩 ${pct}%。这一单还能跑，下一单就不一定了。`,
-        en: `Lands on ${who} with ${pct}% headroom. This one fits; the next may not.`,
+        zh: `会落在 ${who}，剩余额度只有 ${pct}%。这一单还能跑，下一单就不一定了。`,
+        en: `Lands on ${who} with only ${pct}% quota left. This one fits; the next may not.`,
       };
     default:
       return {
-        zh: `会落在 ${who}，余量 ${pct}%。`,
-        en: `Lands on ${who}, ${pct}% headroom.`,
+        zh: `会落在 ${who}，剩余额度 ${pct}%。`,
+        en: `Lands on ${who}, ${pct}% quota left.`,
       };
   }
 }
@@ -593,7 +677,7 @@ function PoolCheck({ pool }: { pool: GwRoutePool }) {
     <div className={`pool-check ${tone}`} style={{ marginTop: 10 }}>
       <div className="pc-head">
         <Badge tone={tone}>
-          <T zh="池体检查" en="pool check" />
+          <T zh="额度检查" en="quota check" />
         </Badge>
         <span className="sub">
           <T
@@ -654,7 +738,9 @@ function HopRow({ hop, rank, max }: { hop: GwRouteHop; rank: number; max: number
             tier={hop.tier}
             tone={hop.tier === 'A' ? 'accent' : hop.tier === 'B' ? 'info' : 'gray'}
           />
-          <Badge tone={healthTone[hop.health] ?? 'gray'}>{hop.health}</Badge>
+          <Badge tone={healthTone[hop.health] ?? 'gray'}>
+            <T zh={healthLabel(hop.health, 'zh')} en={healthLabel(hop.health, 'en')} />
+          </Badge>
         </div>
         <div className="route-fac">
           <span title="档位">tier {f.tier.toFixed(2)}</span>
@@ -686,19 +772,53 @@ function HopRow({ hop, rank, max }: { hop: GwRouteHop; rank: number; max: number
           )}
           <span className="eq">= {hop.weight.toFixed(3)}</span>
         </div>
-        <div className="axes" style={{ marginTop: 6 }}>
+        {/* 底部量条行：左额度条与右权重条同基线（sc 列同样底部对齐），
+            并各带一枚微型标签——之前两条裸条悬在公式和数字下面，看起来像画歪的一根线 */}
+        <div className="bar-row">
+          <span className="bar-lb">
+            <T zh="剩余额度" en="Headroom" />
+          </span>
           <span className="axis r" title="剩余额度">
             <i style={{ width: `${Math.round(hop.remaining * 100)}%` }} />
           </span>
         </div>
       </div>
       <div className="sc">
-        <b>{(hop.weight / max).toFixed(2)}</b>
-        <div className="sc-bar" style={{ marginTop: 4 }}>
-          <i style={{ width: `${Math.round((hop.weight / max) * 100)}%` }} />
-        </div>
+        <RingProgress value={hop.weight / max} />
+        <span className="bar-lb">
+          <T zh="权重" en="Weight" />
+        </span>
       </div>
     </div>
+  );
+}
+
+/**
+ * 权重圆环：value = 本跳权重 / 榜首权重，环画比例、心里填百分数。
+ * 横条在链路行里太「细」不容易比对，圆环一眼能看出谁大谁小。
+ */
+function RingProgress({ value }: { value: number }) {
+  const v = Math.max(0, Math.min(1, value));
+  const r = 11;
+  const c = 2 * Math.PI * r;
+  return (
+    <svg className="ring" width="30" height="30" viewBox="0 0 30 30" role="img" aria-label={`${Math.round(v * 100)}%`}>
+      <circle cx="15" cy="15" r={r} fill="none" stroke="var(--panel-3)" strokeWidth="3.5" />
+      <circle
+        cx="15"
+        cy="15"
+        r={r}
+        fill="none"
+        stroke="var(--accent)"
+        strokeWidth="3.5"
+        strokeLinecap="round"
+        strokeDasharray={`${(v * c).toFixed(1)} ${c.toFixed(1)}`}
+        transform="rotate(-90 15 15)"
+      />
+      <text x="15" y="15.5" textAnchor="middle" dominantBaseline="central" className="ring-num">
+        {Math.round(v * 100)}
+      </text>
+    </svg>
   );
 }
 
@@ -1127,6 +1247,8 @@ function StrategyCard() {
           </button>
         </div>
 
+        <ProfilesEditor />
+
         {/* 用途 → 链：只在有链可选时才露出，空列表摆一排下拉没有意义 */}
         {Object.keys(chains).length > 0 && (
           <div className="purpose-map">
@@ -1158,6 +1280,165 @@ function StrategyCard() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/* ── 策略档（Pro）──────────────────────────────
+   按 key 前缀或用途绑定策略：第一条命中的生效，其余不看。
+   和分池一样是「收窄」不是「切分」——只覆盖策略选择，不改 Gate。 */
+
+const PROFILE_MAX = 8;
+
+function ProfilesEditor() {
+  const lang = useLang();
+  const zh = lang === 'zh';
+  const routing = useGateway((s) => s.routing);
+  const setProfiles = useGateway((s) => s.setProfiles);
+
+  const profiles = routing?.profiles ?? [];
+  const [busy, setBusy] = useState(false);
+
+  const commit = async (next: StrategyProfile[]) => {
+    setBusy(true);
+    try {
+      await setProfiles(next);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 输入框 blur 提交整批；后端整批校验，非法档会被整批拒绝并给出原因 */
+  const patchRow = (id: string, part: Partial<StrategyProfile>) => {
+    void commit(profiles.map((p) => (p.id === id ? { ...p, ...part } : p)));
+  };
+
+  const addRow = () => {
+    const id = `prof-${Date.now().toString(36)}`;
+    void commit([...profiles, { id, name: '', keyPrefix: '', purpose: null, strategy: 'balanced' }]);
+  };
+
+  const dropRow = (id: string) => {
+    void commit(profiles.filter((p) => p.id !== id));
+  };
+
+  const inputStyle: React.CSSProperties = {
+    flex: 1,
+    minWidth: 0,
+    height: 28,
+    padding: '0 8px',
+    border: '1px solid var(--line)',
+    borderRadius: 7,
+    background: 'var(--panel-2)',
+    color: 'var(--text)',
+    fontSize: 11.5,
+  };
+
+  return (
+    <div className="purpose-map" style={{ marginTop: 12 }}>
+      <div className="hint-line" style={{ marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span>
+          <T
+            zh="策略档：某把虚拟 Key 或某类用途，固定走某个策略。按列表顺序取第一条命中的。"
+            en="Profiles: pin a strategy to a virtual key or a purpose pool. First match in list order wins."
+          />
+        </span>
+      </div>
+
+      <>
+          {profiles.map((p) => (
+            <div className="chain-row" key={p.id} style={{ flexWrap: 'wrap', gap: 6 }}>
+              <input
+                defaultValue={p.name}
+                key={`n-${p.id}`}
+                placeholder={zh ? '名称（可空）' : 'name (optional)'}
+                spellCheck={false}
+                disabled={busy}
+                onBlur={(e) => {
+                  if (e.target.value !== p.name) patchRow(p.id, { name: e.target.value });
+                }}
+                style={{ ...inputStyle, flex: '0 1 110px' }}
+              />
+              <input
+                defaultValue={p.keyPrefix ?? ''}
+                key={`k-${p.id}`}
+                placeholder="agent:claude-code"
+                spellCheck={false}
+                disabled={busy}
+                onBlur={(e) => {
+                  if ((e.target.value || null) !== (p.keyPrefix ?? null))
+                    patchRow(p.id, { keyPrefix: e.target.value || null });
+                }}
+                style={inputStyle}
+              />
+              <select
+                className="select"
+                value={p.purpose ?? ''}
+                disabled={busy}
+                onChange={(e) => patchRow(p.id, { purpose: e.target.value || null })}
+                style={{ flex: 'none', width: 92 }}
+              >
+                <option value="">{zh ? '用途不限' : 'any purpose'}</option>
+                {ROUTE_PURPOSES.map((u) => (
+                  <option key={u} value={u}>
+                    {PURPOSE_LABEL[u].zh}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="select"
+                value={p.strategy}
+                disabled={busy}
+                onChange={(e) => patchRow(p.id, { strategy: e.target.value })}
+                style={{ flex: 'none', width: 110 }}
+              >
+                {STRATEGIES.map((s0) => (
+                  <option key={s0.id} value={s0.id}>
+                    {zh ? s0.zh : s0.id}
+                  </option>
+                ))}
+              </select>
+              <button className="btn ghost sm" disabled={busy} onClick={() => dropRow(p.id)}>
+                <Trash2 size={11} />
+              </button>
+            </div>
+          ))}
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button
+              className="btn ghost sm"
+              disabled={busy || profiles.length >= PROFILE_MAX}
+              title={
+                profiles.length >= PROFILE_MAX
+                  ? zh
+                    ? `最多 ${PROFILE_MAX} 条`
+                    : `max ${PROFILE_MAX}`
+                  : undefined
+              }
+              onClick={addRow}
+            >
+              <Plus size={11} />
+              <T zh="新建策略档" en="New profile" />
+            </button>
+            {profiles.length === 0 && (
+              <span className="faint" style={{ alignSelf: 'center', fontSize: 11 }}>
+                <T
+                  zh="例：keyPrefix 填 agent:codex、策略选「最快」——Codex 的请求从此永远先打最快的通道。"
+                  en="e.g. keyPrefix agent:codex + strategy 'fastest' — Codex traffic always tries the fastest channel first."
+                />
+              </span>
+            )}
+          </div>
+          {profiles.length > 0 && (
+            <div className="hint-line" style={{ marginTop: 6 }}>
+              <T
+                zh="keyPrefix 与用途至少要绑一个，后端才会收下这一条；都不绑的那行会在保存时被整批拒绝。"
+                en="Each profile must bind at least a keyPrefix or a purpose — rows binding neither are rejected as a whole on save."
+              />
+            </div>
+          )}
+        </>
     </div>
   );
 }

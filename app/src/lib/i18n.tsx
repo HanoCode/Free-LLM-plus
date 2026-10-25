@@ -27,3 +27,35 @@ export function tierLabel(tier: string, lang: 'zh' | 'en') {
   const map = lang === 'zh' ? TIER_ZH : TIER_EN;
   return map[tier] ?? `Tier ${tier}`;
 }
+
+/**
+ * 健康状态机的外部说法。界面上不出现裸的 `unknown` / `degraded`：
+ * 未测（unknown）≠ 不可用，措辞必须让用户看出这一层。
+ * 未识别的值回落原文，避免把没见过的状态吞掉。
+ */
+const HEALTH_ZH: Record<string, string> = {
+  healthy: '可用',
+  degraded: '不稳定',
+  cooling: '暂停中',
+  unavailable: '不可用',
+  retired: '已退役',
+  probing: '探测中',
+  error: '异常',
+  unknown: '未测',
+};
+
+const HEALTH_EN: Record<string, string> = {
+  healthy: 'ready',
+  degraded: 'flaky',
+  cooling: 'paused',
+  unavailable: 'down',
+  retired: 'retired',
+  probing: 'probing',
+  error: 'error',
+  unknown: 'untested',
+};
+
+export function healthLabel(status: string | null | undefined, lang: 'zh' | 'en') {
+  const map = lang === 'zh' ? HEALTH_ZH : HEALTH_EN;
+  return map[status ?? 'unknown'] ?? status ?? '—';
+}

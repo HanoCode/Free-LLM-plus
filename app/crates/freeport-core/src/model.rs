@@ -53,6 +53,79 @@ pub struct AppData {
     /// 槽位 `ext:<id>`，这里只留掩码。
     #[serde(default, rename = "extensions")]
     pub extensions: BTreeMap<String, ExtState>,
+    /// Pro 本机功能配置（v1.12）。云端只做授权，功能全在本地——
+    /// 这里只存「用户想不想用」，能不能用由 gateway 的 `pro::allow()` 统一判。
+    #[serde(default)]
+    pub pro: ProCfg,
+}
+
+/// Pro 功能开关。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProCfg {
+    /// 会话预热：粘住的会话余量见底前，提前体检下一个候选
+    #[serde(default = "default_true")]
+    pub prewarm: bool,
+    /// 自定义解粘阈值（余量比例）。`None` = 用内置默认 0.10。
+    /// 只在 Pro 下生效——免费版永远用默认值。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "unstickRatio")]
+    pub unstick_ratio: Option<f64>,
+    /// 粘性窗口（分钟）。`None` = 内置默认 30 分钟。只在 Pro 下生效，
+    /// 可用范围由 gateway 的 `pro::stick_ttl_ms` 夹取（5..=1440）。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "stickTtlMin")]
+    pub stick_ttl_min: Option<u32>,
+    /// 自动备份
+    #[serde(default)]
+    pub backup: BackupCfg,
+}
+
+impl Default for ProCfg {
+    fn default() -> Self {
+        Self {
+            prewarm: true,
+            unstick_ratio: None,
+            stick_ttl_min: None,
+            backup: BackupCfg::default(),
+        }
+    }
+}
+
+/// 自动备份配置。快照 = transfer 信封（含明文 key 的密文），口令由本机
+/// 主密钥派生——所以快照只在**本机**可解；跨机器迁移仍走手动迁移码。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 快照输出目录（绝对路径）。空 = 未配置，备份不会跑。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// 间隔（小时）
+    #[serde(default = "default_backup_interval_hours", rename = "intervalHours")]
+    pub interval_hours: u32,
+    /// 保留份数，超出删最旧
+    #[serde(default = "default_backup_keep")]
+    pub keep: u32,
+    /// 上次成功备份时间（epoch 秒）
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "lastAt")]
+    pub last_at: Option<i64>,
+}
+
+impl Default for BackupCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: None,
+            interval_hours: default_backup_interval_hours(),
+            keep: default_backup_keep(),
+            last_at: None,
+        }
+    }
+}
+
+fn default_backup_interval_hours() -> u32 {
+    24
+}
+fn default_backup_keep() -> u32 {
+    7
 }
 
 /// 单个扩展的用户配置。
@@ -218,6 +291,7 @@ impl Default for AppData {
             license: LicenseCfg::default(),
             tombstones: Tombstones::default(),
             extensions: BTreeMap::new(),
+            pro: ProCfg::default(),
         }
     }
 }
@@ -301,6 +375,48 @@ pub struct GatewayConfig {
     /// 让人「排一下队」比自己决定打几个更容易被理解成卡住。
     #[serde(default, rename = "maxInflightPerAccount")]
     pub max_inflight_per_account: u32,
+    /// OTLP 导出（traces，OTLP/HTTP + JSON）。默认关：会把请求元数据
+    /// （不含 prompt 内容）发往用户指定的 collector。
+    #[serde(default)]
+    pub otlp: OtlpConfig,
+}
+
+/// OTLP 导出配置。见 `freeport-gateway/src/otlp.rs`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtlpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// collector 基址（如 `http://127.0.0.1:4318`）；写到 `/v1/traces` 的按原样用。
+    #[serde(default)]
+    pub endpoint: String,
+    /// 批量上报的间隔（秒），1–300。
+    #[serde(default = "default_otlp_interval", rename = "intervalSecs")]
+    pub interval_secs: u64,
+    /// 单次最多上报多少个 span。
+    #[serde(default = "default_otlp_batch", rename = "batchSize")]
+    pub batch_size: usize,
+    /// 自定义请求头，一行一个 `Key: Value`（collector 需要 Bearer 时用）。
+    #[serde(default)]
+    pub headers: Vec<String>,
+}
+
+fn default_otlp_interval() -> u64 {
+    5
+}
+fn default_otlp_batch() -> usize {
+    64
+}
+
+impl Default for OtlpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            interval_secs: default_otlp_interval(),
+            batch_size: default_otlp_batch(),
+            headers: Vec::new(),
+        }
+    }
 }
 
 /// 响应缓存配置。见 `freeport-gateway/src/cache.rs` 的四条约束。
@@ -411,6 +527,7 @@ impl Default for GatewayConfig {
             identifier_limit: 0,
             cache: CacheConfig::default(),
             max_inflight_per_account: 0,
+            otlp: OtlpConfig::default(),
         }
     }
 }
@@ -447,6 +564,14 @@ pub struct Provider {
     /// 优先级：账号级（未实现）> 厂商级 > 环境变量；本机回环永远直连。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// 上游线格式：`openai` / `anthropic` / `responses` / `gemini`。
+    ///
+    /// 空 = 按 id 推断（`freeport-gateway::upwire::wire_of_provider`），
+    /// 这是存量配置与订阅预设的老行为，只为兼容保留：新配置一律显式写。
+    /// 需要它的场景很少——只有「额度只能从原生端点用掉」的厂商才值得配，
+    /// 讲 OpenAI 兼容线的厂商填了反而是给自己找 400。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<String>,
     #[serde(default)]
     pub health: Health,
 }
@@ -530,6 +655,21 @@ impl Purpose {
         has_image: bool,
         from_agent: bool,
     ) -> (Self, PurposeSource) {
+        Self::infer_deep_with_source(declared, has_image, from_agent, None)
+    }
+
+    /// 在 [`Purpose::infer_with_source`] 的三信号之上追加启发式正文判定。
+    ///
+    /// 带 `payload` 的调用方（网关真实请求）多拿一档：显式头、带图、agent key
+    /// 都没命中时，看一眼请求长得像不像编码——tools 定义、代码围栏、编码类
+    /// system。这些是**零成本**信号，不用小模型、不烧额度、不加延迟；
+    /// 判不出就回落 chat，与旧行为完全一致。
+    pub fn infer_deep_with_source(
+        declared: Option<Purpose>,
+        has_image: bool,
+        from_agent: bool,
+        payload: Option<&serde_json::Value>,
+    ) -> (Self, PurposeSource) {
         if let Some(p) = declared {
             return (p, PurposeSource::Header);
         }
@@ -539,7 +679,92 @@ impl Purpose {
         if from_agent {
             return (Self::Coding, PurposeSource::AgentKey);
         }
+        if let Some(body) = payload {
+            if matches!(Self::heuristic(body), Some(Self::Coding)) {
+                return (Self::Coding, PurposeSource::Heuristic);
+            }
+        }
         (Self::Chat, PurposeSource::Default)
+    }
+
+    /// 零成本意图判定：只回答「这单是不是编码」。
+    ///
+    /// vision / probe 有更硬的信号（图片是客观事实、探针是自己人），不在这里猜。
+    /// 只会返回 `Some(Coding)` 或 `None` —— 打分不足时保持沉默，让上层回落 chat。
+    ///
+    /// 打分口径（≥3 判编码）：
+    /// - 请求带 `tools` 定义：+2（agent/IDE 客户端才会带工具表，权重最高）；
+    /// - 正文出现代码围栏 ``` ：+2（贴代码问问题，哪怕不是 agent 也在写代码）；
+    /// - 消息里有 `role:"tool"`：+1（工具回传结果，多半在工具循环里）；
+    /// - system 里命中编码关键词：每类 +1，封顶 +2（中英文各算一类）。
+    ///
+    /// 刻意保守：漏判只是少享受一次分池，误判却会把聊天流量挡在 chat 池外——
+    /// 阈值取 3 而不是 2，就是为了把「贴了一段报错问怎么回事」这种边界情形
+    /// 留在 chat 里。
+    pub fn heuristic(payload: &serde_json::Value) -> Option<Self> {
+        let mut score = 0i32;
+
+        if payload
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
+            score += 2;
+        }
+
+        let mut fenced = false;
+        let mut tool_role = false;
+        let mut sys_kw_en = false;
+        let mut sys_kw_zh = false;
+        for msg in payload
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+        {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "tool" {
+                tool_role = true;
+            }
+            let texts: Vec<&str> = match msg.get("content") {
+                Some(serde_json::Value::String(s)) => vec![s.as_str()],
+                // 多模态内容里只看文本段
+                Some(serde_json::Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for text in texts {
+                if !fenced && text.contains("```") {
+                    fenced = true;
+                }
+                if role == "system" {
+                    let low = text.to_ascii_lowercase();
+                    sys_kw_en |= ["coding agent", "code assistant", "software engineer", "programmer", "you are claude code", "codex cli", "ide assistant"]
+                        .iter()
+                        .any(|k| low.contains(k));
+                    sys_kw_zh |= ["编程", "代码助手", "程序员", "开发者", "写代码"]
+                        .iter()
+                        .any(|k| text.contains(k));
+                }
+            }
+        }
+        if fenced {
+            score += 2;
+        }
+        if tool_role {
+            score += 1;
+        }
+        if sys_kw_en {
+            score += 1;
+        }
+        if sys_kw_zh {
+            score += 1;
+        }
+
+        (score >= 3).then_some(Self::Coding)
     }
 }
 
@@ -557,6 +782,8 @@ pub enum PurposeSource {
     Image,
     /// 用的是注入时发的 `agent:<id>` key
     AgentKey,
+    /// 三信号都没命中，但请求特征像编码（tools / 代码围栏 / 编码类 system）
+    Heuristic,
     /// 都没命中，按普通对话处理
     Default,
 }
@@ -567,6 +794,7 @@ impl PurposeSource {
             PurposeSource::Header => "header",
             PurposeSource::Image => "image",
             PurposeSource::AgentKey => "agent-key",
+            PurposeSource::Heuristic => "heuristic",
             PurposeSource::Default => "default",
         }
     }
@@ -1050,6 +1278,57 @@ pub struct RoutingConfig {
     /// 再叠一层权重会把「最快」变成「没那么快」。
     #[serde(default, skip_serializing_if = "RouteWeights::is_unset")]
     pub weights: RouteWeights,
+    /// 策略档（Pro）：把「策略 + 三维权重」绑给某类调用方。
+    /// 匹配顺序 = 数组顺序，第一条命中的生效。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<StrategyProfile>,
+}
+
+/// 策略档。两个字段都是 `None` 的档永远命中，不合法——写入口要拦。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyProfile {
+    pub id: String,
+    pub name: String,
+    /// 匹配的虚拟 key id 前缀（如 `agent:claude-code`）。`None` = 不按 key 匹配
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "keyPrefix")]
+    pub key_prefix: Option<String>,
+    /// 匹配的用途（chat/coding/vision/probe）。`None` = 不按用途匹配
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// 覆盖的策略名（八档之一；parse 失败的档在入口被拒）
+    pub strategy: String,
+    /// 覆盖的三维权重。`None` = 沿用全局
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<RouteWeights>,
+}
+
+impl StrategyProfile {
+    /// 是否合法：至少绑一个匹配维度、名字非空、策略认识。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("策略档名字不能为空".into());
+        }
+        if self.key_prefix.is_none() && self.purpose.is_none() {
+            return Err("策略档至少要绑定 key 前缀或用途之一".into());
+        }
+        if crate::route::Strategy::parse(&self.strategy).as_str() != self.strategy.trim() {
+            return Err(format!("不认识的路由策略：{}", self.strategy));
+        }
+        Ok(())
+    }
+
+    /// 这条请求（key id + 用途）是否命中本档。
+    pub fn matches(&self, key_id: &str, purpose: Purpose) -> bool {
+        let key_ok = match &self.key_prefix {
+            None => true,
+            Some(p) => key_id.starts_with(p.as_str()),
+        };
+        let purpose_ok = match &self.purpose {
+            None => true,
+            Some(p) => Purpose::parse(p) == Some(purpose),
+        };
+        key_ok && purpose_ok
+    }
 }
 
 /// 三维评分权重（百分比，不必凑够 100，按总和归一）。
@@ -1128,6 +1407,7 @@ impl Default for RoutingConfig {
             fallback_when_all_cooling: true,
             fallback_horizon_ms: default_fallback_horizon(),
             weights: RouteWeights::default(),
+            profiles: Vec::new(),
         }
     }
 }
@@ -1196,7 +1476,7 @@ pub struct LogEntry {
     /// 「为什么另一把更宽裕的 key 没被选中」。
     #[serde(default)]
     pub purpose: Purpose,
-    /// 用途是怎么判出来的（header / image / agent-key / default）
+    /// 用途是怎么判出来的（header / image / agent-key / heuristic / default）
     #[serde(
         rename = "purposeSource",
         default,
@@ -1520,6 +1800,7 @@ mod tests {
             quota: None,
             accounts,
             proxy: None,
+            wire: None,
             health: Health::default(),
         }
     }
@@ -1696,6 +1977,76 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&PurposeSource::AgentKey).unwrap(),
             "\"agent-key\""
+        );
+    }
+
+    #[test]
+    fn heuristic_flags_agent_like_requests() {
+        // tools 定义 + 代码围栏 = 典型编码请求
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "帮我看这段为什么崩：\n```rust\nfn main(){}\n```"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}]
+        });
+        assert_eq!(Purpose::heuristic(&body), Some(Purpose::Coding));
+
+        // 编码类 system 单独不够（+1），但代码围栏(+2) + tool 回传(+1) = 3 就够
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are Claude Code, an interactive CLI tool."},
+                {"role": "user", "content": "接着修：\n```rust\nfn main(){}\n```"},
+                {"role": "tool", "content": "ok"}
+            ]
+        });
+        assert_eq!(Purpose::heuristic(&body), Some(Purpose::Coding));
+    }
+
+    #[test]
+    fn heuristic_keeps_plain_chat_in_chat() {
+        // 贴了报错/代码片段问概念：只有围栏 +2，不到阈值
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "这段 ```SELECT 1``` SQL 是什么意思？"}
+            ]
+        });
+        assert_eq!(Purpose::heuristic(&body), None);
+
+        // 纯聊天
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "今天天气怎么样"}]
+        });
+        assert_eq!(Purpose::heuristic(&body), None);
+
+        // 空消息也不炸
+        let body = serde_json::json!({"messages": []});
+        assert_eq!(Purpose::heuristic(&body), None);
+    }
+
+    #[test]
+    fn deep_inference_slots_heuristic_before_default() {
+        // agent key 比启发式可靠，顺序不能颠倒
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "```py\nprint(1)\n```"}],
+            "tools": [{"type": "function"}]
+        });
+        let (p, src) =
+            Purpose::infer_deep_with_source(None, false, true, Some(&body));
+        assert_eq!((p, src), (Purpose::Coding, PurposeSource::AgentKey));
+
+        // 三信号都没命中才轮到启发式
+        let (p, src) =
+            Purpose::infer_deep_with_source(None, false, false, Some(&body));
+        assert_eq!((p, src), (Purpose::Coding, PurposeSource::Heuristic));
+
+        // 不带 payload 的老调用点行为不变
+        let (p, src) = Purpose::infer_deep_with_source(None, false, false, None);
+        assert_eq!((p, src), (Purpose::Chat, PurposeSource::Default));
+
+        // 依据写进日志能被前端直接读懂
+        assert_eq!(
+            serde_json::to_string(&PurposeSource::Heuristic).unwrap(),
+            "\"heuristic\""
         );
     }
 }

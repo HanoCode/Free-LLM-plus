@@ -1,16 +1,20 @@
 # Freeport 最终用户许可协议（EULA）
 
-最后更新：2026-10-20
+最后更新：2026-10-25
 
-Freeport（下称「本软件」）由 HanoCode 及贡献者发布。安装或使用本软件，即表示你接受本协议。如果你不同意，请不要安装或使用。
+Freeport（下称「本软件」）由 HanoCode 发布。安装或使用本软件，即表示你接受本协议。如果你不同意，请不要安装或使用。
 
 ---
 
 ## 1. 许可范围
 
-本软件以 **AGPL-3.0-or-later** 发布。你可以在该许可证条款下自由使用、修改、再分发，包括商业使用；若你向他人提供修改后的版本（含以网络服务形式提供），须按 AGPL-3.0 提供对应源码。
+本软件为**专有软件**（proprietary software），版权归 HanoCode 所有，保留全部权利。HanoCode 授予你**个人的、不可转让的、不可再许可的**使用许可，前提是你遵守本协议：
 
-本协议不限制、也不替代 AGPL-3.0 赋予你的权利；两者冲突时，以 AGPL-3.0 为准。本协议约束的是「使用本软件接入第三方模型服务」这一行为本身。
+1. 你可以出于正常使用目的安装和运行本软件；
+2. 你**不得**复制、分发、出租、转售或再许可本软件，也不得发布本软件的修改版或衍生版；
+3. 你**不得**对本软件进行反向工程、反编译或反汇编，法律明确允许的除外；
+4. 你**不得**绕过或规避本软件的任何技术保护措施或许可验证机制（包括但不限于许可证校验、功能门禁、设备绑定、激活与续签流程），也不得开发、传播或协助他人获取任何实施上述绕过的工具、补丁或修改版；
+5. **Pro 功能**仅在持有有效许可证（激活码 / 许可证 token）期间可用。许可证按席位限制设备数，到期或吊销后 Pro 功能自动降级为免费版，免费功能不受影响；席位可在「授权管理」页自助解绑。
 
 ## 2. 你带来的凭据
 
@@ -57,7 +61,9 @@ Freeport（下称「本软件」）由 HanoCode 及贡献者发布。安装或�
 
 # Freeport End User License Agreement (summary)
 
-Freeport is licensed under **AGPL-3.0-or-later**. This EULA does not restrict those rights; it governs the act of using Freeport to reach third-party model providers.
+Freeport is **proprietary software**, © HanoCode, all rights reserved. HanoCode grants you a personal, non-transferable license to install and run it as-is. You may not redistribute, resell, sublicense, or publish modified or derivative builds. You may not reverse engineer the software or circumvent its license verification and technical protection measures (activation, device binding, feature gating) beyond what the law explicitly allows.
+
+Pro features require a valid license. Licenses are seat-limited and degrade to the free tier on expiry or revocation; free features are unaffected.
 
 You must only use credentials you lawfully hold, and must not share accounts, resell free quota, or bypass paywalls. Credentials are encrypted at rest on your machine and never uploaded. Freeport does not create accounts, forge device fingerprints, read your browser's cookie store, or collect telemetry.
 

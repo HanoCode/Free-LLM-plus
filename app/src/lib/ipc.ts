@@ -13,21 +13,24 @@ import type {
   AgentInfo,
   DesktopPrefs,
   FreeportBridge,
+  GwBackupFile,
   GwCatalog,
   GwDigest,
   GwExt,
   GwFeed,
+  GwIntel,
   GwKey,
   GwLoginStart,
   GwLoginState,
   GwLog,
-  GwLicense,
   GwModel,
   GwModelProbe,
   GwObserved,
   GwPatrol,
+  GwPro,
   GwProvider,
   GwQuota,
+  GwReports,
   GwRoute,
   GwRouting,
   GwStatus,
@@ -38,6 +41,7 @@ import type {
   ProjectInjection,
   ProviderPreset,
   UpdateCheck,
+  UpdaterStatus,
 } from './bridge';
 
 export function isTauri(): boolean {
@@ -64,6 +68,8 @@ export function installTauriBridge(): boolean {
     app: {
       info: () => invoke<Record<string, unknown>>('app_info'),
       checkUpdate: () => invoke<UpdateCheck>('check_update'),
+      updaterCheck: () => invoke<UpdaterStatus>('updater_check'),
+      updaterInstall: () => invoke<boolean>('updater_install'),
       diagnostics: () => invoke<Record<string, unknown>>('gw_diagnostics'),
       saveDiagnostics: () => invoke<string | null>('gw_save_diagnostics'),
       prefs: () => invoke<DesktopPrefs>('win_prefs'),
@@ -135,9 +141,16 @@ export function installTauriBridge(): boolean {
       importBundle: (blob, passphrase, mode) =>
         invoke<ImportSummary>('gw_import_bundle', { blob, passphrase, mode }),
 
-      license: () => invoke<GwLicense>('gw_license'),
-      activateLicense: (token) => invoke<GwLicense>('gw_activate_license', { token }),
-      clearLicense: () => invoke<GwLicense>('gw_clear_license'),
+      intel: () => invoke<GwIntel>('gw_intel'),
+      reports: (days) => invoke<GwReports>('gw_reports', { days: days ?? 30 }),
+      reportsExport: () => invoke<string | null>('gw_reports_export_file'),
+      pro: () => invoke<GwPro>('gw_pro'),
+      setPro: (patch) => invoke<GwPro>('gw_set_pro', { patch }),
+      backupNow: () => invoke<string>('gw_backup_now'),
+      backupList: () => invoke<GwBackupFile[]>('gw_backup_list'),
+      backupRestore: (name) => invoke<ImportSummary>('gw_backup_restore', { name }),
+      setProfiles: (profiles) => invoke<GwRouting>('gw_set_profiles', { profiles }),
+      setRemote: (on) => invoke<GwStatus>('gw_set_remote', { on }),
 
       setRouting: (patch) => invoke<GwRouting>('gw_set_routing', { patch }),
       clearCooldowns: () => invoke<boolean>('gw_clear_cooldowns'),
@@ -181,6 +194,21 @@ export function installTauriBridge(): boolean {
       extSetKey: (id, key) => invoke<GwExt[]>('gw_ext_set_key', { id, key }),
       extStop: (id) => invoke<GwExt[]>('gw_ext_stop', { id }),
 
+      onUpdaterProgress: (cb) => {
+        let dispose: (() => void) | null = null;
+        let cancelled = false;
+        void listen<{ phase: string; downloaded?: number; total?: number | null }>(
+          'updater://progress',
+          (event) => cb(event.payload),
+        ).then((un) => {
+          if (cancelled) un();
+          else dispose = un;
+        });
+        return () => {
+          cancelled = true;
+          dispose?.();
+        };
+      },
       onLog: (cb) => {
         let dispose: (() => void) | null = null;
         let cancelled = false;

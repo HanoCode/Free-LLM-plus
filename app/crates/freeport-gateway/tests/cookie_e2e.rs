@@ -111,6 +111,7 @@ fn provider_at(base: &str) -> Provider {
         enabled: true,
         added_at: String::new(),
         proxy: None,
+        wire: None,
         models: Vec::new(),
         quota: None,
         accounts: Vec::new(),

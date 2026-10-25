@@ -106,6 +106,7 @@ async fn device_login_refresh_and_single_flight() {
         enabled: true,
         added_at: chrono::Utc::now().to_rfc3339(),
         proxy: None,
+        wire: None,
         models: Vec::new(),
         quota: None,
         accounts: Vec::new(),

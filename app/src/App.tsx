@@ -1,32 +1,33 @@
 import { useEffect } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Topbar } from './components/Topbar';
-import { ToastHost } from './components/ui';
-import { LicenseDialog } from './components/License';
+import { ToastHost, ConfirmHost } from './components/ui';
 import { useApp, applyTheme } from './lib/store';
 import { initGateway } from './lib/gateway';
 import { Overview } from './pages/Overview';
 import { Models } from './pages/Models';
-import { Providers } from './pages/Providers';
-import { Accounts } from './pages/Accounts';
-import { Discover } from './pages/Discover';
+import { Connect } from './pages/Connect';
 import { Routing } from './pages/Routing';
 import { Agents } from './pages/Agents';
 import { Extensions } from './pages/Extensions';
 import { Logs } from './pages/Logs';
+import { Reports } from './pages/Reports';
 import { Settings } from './pages/Settings';
 import { Playground } from './pages/Playground';
 
+// 厂商/凭据/发现统一进「连接」页；旧 id 仍可达（深链兼容），渲染同一聚合页
 const pages = {
   overview: Overview,
   models: Models,
-  providers: Providers,
-  accounts: Accounts,
-  discover: Discover,
+  connect: Connect,
+  providers: Connect,
+  accounts: Connect,
+  discover: Connect,
   routing: Routing,
   agents: Agents,
   extensions: Extensions,
   logs: Logs,
+  reports: Reports,
   settings: Settings,
   playground: Playground,
 };
@@ -54,8 +55,8 @@ export default function App() {
           <View />
         </section>
       </main>
-      <LicenseDialog />
       <ToastHost />
+      <ConfirmHost />
     </div>
   );
 }

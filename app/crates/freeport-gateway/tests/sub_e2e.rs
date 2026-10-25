@@ -143,6 +143,7 @@ fn provider(id: &str, name: &str, base: &str) -> freeport_core::model::Provider 
         enabled: true,
         added_at: chrono::Utc::now().to_rfc3339(),
         proxy: None,
+        wire: None,
         models: Vec::new(),
         quota: None,
         accounts: Vec::new(),

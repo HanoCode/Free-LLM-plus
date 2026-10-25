@@ -11,7 +11,7 @@ import {
   TriangleAlert,
 } from 'lucide-react';
 import { T, tx, useLang } from '../lib/i18n';
-import { Badge, Status, Switch, TierBadge, toast } from '../components/ui';
+import { Badge, Status, Switch, TierBadge, confirmDanger, toast } from '../components/ui';
 import { BrandLogo } from '../components/BrandLogo';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
@@ -400,7 +400,7 @@ export function Accounts() {
                       )
                     ) : (
                       r.a.auth && (
-                        <span className="badge ok" title={expiryHint(r.a.expiresAt)}>
+                        <span className="badge ok" title={expiryHint(r.a.expiresAt, lang)}>
                           {r.a.auth === 'copilot'
                             ? 'GitHub 登录'
                             : r.a.auth === 'claude'
@@ -515,7 +515,7 @@ export function Accounts() {
                   />
                   <button
                     className="btn ghost sm"
-                    title={`用 ${r.a.name} 这把 key 校验`}
+                    data-tip={`用 ${r.a.name} 这把 key 校验`}
                     disabled={!r.a.hasKey}
                     onClick={async () => {
                       const out = await probeAccount(r.p.id, r.a.id);
@@ -533,7 +533,7 @@ export function Accounts() {
                   {(r.a.auth === 'claude' || r.a.auth === 'codex') && (
                     <button
                       className="btn ghost sm"
-                      title="问厂商：这个订阅还剩多少额度"
+                      data-tip="问厂商：这个订阅还剩多少额度"
                       onClick={() => setUsageOf({ p: r.p, a: r.a })}
                     >
                       <Gauge size={11} />
@@ -543,14 +543,23 @@ export function Accounts() {
                     <T zh="编辑" en="Edit" />
                   </button>
                   <button
-                    className="btn ghost sm"
-                    title="删除这条凭据"
+                    className="btn ghost sm tip-right"
+                    data-tip="删除这条凭据 / Delete"
                     onClick={async () => {
-                      if (r.index === 0 && g.rows.length > 1) {
-                        toast('这条是主凭据，删掉后路由会改用下一条；确认无误再点一次');
-                      }
+                      if (
+                        !(await confirmDanger({
+                          zh: `删除凭据「${r.p.name} / ${r.a.name}」？密文与额度账本会一并清除，此操作不可撤销。`,
+                          en: `Delete credential "${r.p.name} / ${r.a.name}"? Its ciphertext and quota ledger will be cleared. This cannot be undone.`,
+                          confirmWord: '删除',
+                        }))
+                      )
+                        return;
                       await removeAccount(r.p.id, r.a.id);
-                      toast(`已删除 ${r.p.name} / ${r.a.name}，密文与账本一并清除`);
+                      toast(
+                        lang === 'zh'
+                          ? `已删除 ${r.p.name} / ${r.a.name}，密文与账本一并清除`
+                          : `Deleted ${r.p.name} / ${r.a.name}; credential and ledger cleared`,
+                      );
                     }}
                   >
                     <Trash2 size={11} />
@@ -734,6 +743,7 @@ function AccountDialog({
 }) {
   const addAccount = useGateway((s) => s.addAccount);
   const patchAccount = useGateway((s) => s.patchAccount);
+  const providers = useGateway((s) => s.providers);
   const lang = useLang();
   const edit = !!account;
 
@@ -744,6 +754,36 @@ function AccountDialog({
   const [pool, setPool] = useState<AccountPurpose[]>(account?.purposes ?? []);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+
+  /**
+   * 保存前预演：按当前草稿算一遍「每个用途是否仍有凭据可接」。
+   * 用途池是收窄语义，勾错一个标签就可能让某类请求全部 503——
+   * 与其等用户去日志里破案，不如在保存前把后果摆出来。
+   * 只用界面里已有的 providers 状态推演，不向后端要任何新数据。
+   */
+  const preview = useMemo(() => {
+    const out: Record<AccountPurpose, boolean> = {
+      chat: false,
+      coding: false,
+      vision: false,
+      probe: false,
+    };
+    for (const p of PURPOSE_ORDER) {
+      out[p] = providers.some((prov) =>
+        prov.accounts.some((a) => {
+          if (account && a.id === account.id) {
+            // 这条凭据用草稿里的 pool 演算
+            return a.enabled && (pool.length === 0 || pool.includes(p));
+          }
+          return a.enabled && (a.purposes ?? []).length === 0
+            ? true
+            : (a.purposes ?? []).includes(p);
+        }),
+      );
+    }
+    return out;
+  }, [providers, pool, account]);
+  const lostPurposes = PURPOSE_ORDER.filter((p) => !preview[p] && p !== 'probe');
 
   /** 空字符串 = 这个维度不拦，所以只在填了数字时才进 quota */
   const quotaOf = (): ProviderQuotaInput | undefined => {
@@ -760,11 +800,11 @@ function AccountDialog({
 
   const submit = async () => {
     setErr('');
-    if (!edit && !apiKey.trim()) return setErr('请填入 API Key');
+    if (!edit && !apiKey.trim()) return setErr(tx(lang, '请填入 API Key', 'Enter an API key'));
 
     const q = quotaOf();
     if (Object.keys(limits).some((k) => limits[k]?.trim()) && !q) {
-      return setErr('限额要填正整数，留空表示该维度不拦');
+      return setErr(tx(lang, '限额要填正整数，留空表示该维度不拦', 'Limits must be positive integers; leave empty for no cap'));
     }
 
     setBusy(true);
@@ -778,7 +818,7 @@ function AccountDialog({
           // 空数组就是「不限」，能直接表达，不需要额外的 clear 开关
           purposes: pool,
         });
-        toast(`已更新 ${name.trim() || account.name}`);
+        toast(tx(lang, `已更新 ${name.trim() || account.name}`, `Updated ${name.trim() || account.name}`));
       } else {
         await addAccount({
           providerId: provider.id,
@@ -787,7 +827,7 @@ function AccountDialog({
           quota: q,
           purposes: pool,
         });
-        toast(`已追加一条凭据，额度独立记账`);
+        toast(tx(lang, '已追加一条凭据，额度独立记账', 'Credential added; quota tracked separately'));
       }
       onClose();
     } catch (e) {
@@ -822,7 +862,9 @@ function AccountDialog({
         </p>
 
         <div className="field">
-          <label>NAME</label>
+          <label>
+            <T zh="名称" en="NAME" />
+          </label>
           <input
             value={name}
             placeholder={`key-${provider.accounts.length + 1}`}
@@ -832,7 +874,9 @@ function AccountDialog({
 
         {!edit && (
           <div className="field">
-            <label>API KEY</label>
+            <label>
+              <T zh="API 密钥" en="API KEY" />
+            </label>
             <input
               type="password"
               autoFocus
@@ -873,6 +917,23 @@ function AccountDialog({
               en="Checking a purpose restricts this credential to those request types; leaving all unchecked accepts everything. Probes honour the tag too — keep “Probe” off to keep them away from this quota."
             />
           </p>
+          {/* 保存前预演：勾错标签导致 503 的事故在弹窗里就地拦住 */}
+          <p className="hint-line" style={{ marginTop: 6 }}>
+            <T zh="保存后各用途仍有凭据可接：" en="After saving, credentials still admit: " />
+            {PURPOSE_ORDER.map((p) => (
+              <Badge key={p} tone={preview[p] ? 'ok' : 'bad'}>
+                {tx(lang, PURPOSE_META[p].zh, PURPOSE_META[p].en)} {preview[p] ? '✓' : '✗'}
+              </Badge>
+            ))}
+          </p>
+          {lostPurposes.length > 0 && (
+            <p className="hint-line" style={{ marginTop: 4, color: 'var(--bad)' }}>
+              <T
+                zh={`警告：保存后「${lostPurposes.map((p) => tx(lang, PURPOSE_META[p].zh, PURPOSE_META[p].en)).join('、')}」将没有任何凭据可接，这类请求会直接 503。`}
+                en={`Warning: after saving, no credential admits ${lostPurposes.join('/')} — such requests will 503.`}
+              />
+            </p>
+          )}
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -1105,15 +1166,20 @@ function UsageDialog({
    两条流程的交互完全不同，混在一个界面里用户不知道该点哪个：
    - **设备码**：给一个短码 + 网址，我们按上游给的节奏轮询。
    - **授权码**：给一条授权链接，浏览器跳回本机回环就自动完成；
-     端口绑不上（比如 1455 被官方 CLI 占着）时退回「粘贴回调地址」。 */
+     端口绑不上（比如 1455 被官方 CLI 占着）时退回「粘贴回调地址」。
+   导出供「厂商」页接入弹窗串联调用：订阅类接入完成后直接进入登录，
+   不让用户自己去别处找「登录」按钮。 */
 
-function expiryHint(expiresAt?: number): string | undefined {
+function expiryHint(expiresAt: number | undefined, lang: 'zh' | 'en'): string | undefined {
   if (!expiresAt) return undefined;
   const mins = Math.round((expiresAt * 1000 - Date.now()) / 60000);
-  return mins <= 0 ? '授权即将到期，下一次请求会自动续期' : `授权还剩约 ${mins} 分钟，快到期会自动续期`;
+  return mins <= 0
+    ? tx(lang, '授权即将到期，下一次请求会自动续期', 'Authorization is about to expire; it renews on the next request')
+    : tx(lang, `授权还剩约 ${mins} 分钟，快到期会自动续期`, `Authorization has about ${mins} min left; it renews before expiry`);
 }
 
-function LoginDialog({ provider, onClose }: { provider: GwProvider; onClose: () => void }) {
+export function LoginDialog({ provider, onClose }: { provider: GwProvider; onClose: () => void }) {
+  const lang = useLang();
   const loginStart = useGateway((s) => s.loginStart);
   const loginPoll = useGateway((s) => s.loginPoll);
   const loginWait = useGateway((s) => s.loginWait);
@@ -1143,7 +1209,13 @@ function LoginDialog({ provider, onClose }: { provider: GwProvider; onClose: () 
   const done = (out: GwLoginState) => {
     setState(out);
     if (out.status === 'ready') {
-      toast(`已登录${out.login ? `为 ${out.login}` : ''}，凭据已加入 ${provider.name}`);
+      toast(
+      tx(
+        lang,
+        `已登录${out.login ? `为 ${out.login}` : ''}，凭据已加入 ${provider.name}`,
+        `Signed in${out.login ? ` as ${out.login}` : ''}; credential added to ${provider.name}`,
+      ),
+    );
       onClose();
     }
   };
@@ -1372,6 +1444,7 @@ function CookieDialog({
   account?: GwAccount;
   onClose: () => void;
 }) {
+  const lang = useLang();
   const addCookieAccount = useGateway((s) => s.addCookieAccount);
   const setAccountCookie = useGateway((s) => s.setAccountCookie);
   const [raw, setRaw] = useState('');
@@ -1381,7 +1454,7 @@ function CookieDialog({
 
   const submit = async () => {
     if (!raw.trim()) {
-      setErr('先粘贴会话内容');
+      setErr(tx(lang, '先粘贴会话内容', 'Paste the session content first'));
       return;
     }
     setBusy(true);
@@ -1389,10 +1462,10 @@ function CookieDialog({
     try {
       if (account) {
         await setAccountCookie(provider.id, account.id, raw);
-        toast(`已更新 ${provider.name} 的会话`);
+        toast(tx(lang, `已更新 ${provider.name} 的会话`, `Updated session for ${provider.name}`));
       } else {
         await addCookieAccount(provider.id, name.trim() || undefined, raw);
-        toast(`会话已加入 ${provider.name}`);
+        toast(tx(lang, `会话已加入 ${provider.name}`, `Session added to ${provider.name}`));
       }
       onClose();
     } catch (e) {

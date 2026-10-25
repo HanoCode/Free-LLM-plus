@@ -20,6 +20,10 @@ pub struct DesktopPrefs {
     /// 退出前回滚本机用户级注入。默认关：清理会改用户自己的客户端配置，
     /// 这种事必须是用户点名要的，不能替他决定。
     pub cleanup_on_quit: bool,
+    /// 界面语言（`zh` / `en`）。前端是权威来源，这里只给托盘菜单用——
+    /// 托盘在 Rust 侧，读不到 localStorage。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_lang: Option<String>,
 }
 
 impl Default for DesktopPrefs {
@@ -27,6 +31,7 @@ impl Default for DesktopPrefs {
         Self {
             start_minimized: false,
             cleanup_on_quit: false,
+            ui_lang: None,
         }
     }
 }
@@ -37,6 +42,7 @@ impl Default for DesktopPrefs {
 pub struct PrefsPatch {
     pub start_minimized: Option<bool>,
     pub cleanup_on_quit: Option<bool>,
+    pub ui_lang: Option<String>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -79,6 +85,9 @@ pub fn apply(patch: PrefsPatch) -> Result<DesktopPrefs, String> {
     }
     if let Some(v) = patch.cleanup_on_quit {
         cur.cleanup_on_quit = v;
+    }
+    if let Some(v) = patch.ui_lang {
+        cur.ui_lang = Some(v);
     }
     save(&cur)?;
     Ok(cur)

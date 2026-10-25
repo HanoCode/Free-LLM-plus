@@ -76,6 +76,48 @@ mod tests {
         assert!(b.providers.iter().any(|p| p.free_tier));
     }
 
+    /// 断网冷启动的唯一模型来源就是这份基线：每家都得带上自己的免费模型，
+    /// 总量太少用户第一屏就没东西可看。
+    #[test]
+    fn baseline_ships_enough_free_models() {
+        let b = load();
+        let total: usize = b.providers.iter().map(|p| p.models.len()).sum();
+        assert!(total >= 70, "基线模型数 {total}");
+        for p in &b.providers {
+            assert!(
+                !p.models.is_empty(),
+                "{} 没有内置免费模型",
+                p.id
+            );
+        }
+    }
+
+    /// 免费是硬规则：基线里每条模型都必须显式标 `free: true`。
+    /// 漏标会让离线路由把用户打到付费档。
+    #[test]
+    fn every_baseline_model_is_marked_free() {
+        let b = load();
+        for p in &b.providers {
+            for m in &p.models {
+                assert!(m.free, "{}/{} 未标注 free", p.id, m.id);
+                assert!(!m.id.is_empty());
+            }
+        }
+    }
+
+    /// (provider, model) 不能重复：重复条目会让 enrich 命中随机的一个。
+    #[test]
+    fn model_ids_are_unique_per_provider() {
+        let b = load();
+        for p in &b.providers {
+            let mut ids: Vec<&str> = p.models.iter().map(|m| m.id.as_str()).collect();
+            let n = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), n, "{} 有重复模型 id", p.id);
+        }
+    }
+
     #[test]
     fn anonymous_providers_ship_their_models() {
         let b = load();

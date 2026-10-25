@@ -1,6 +1,6 @@
 import {
+  BarChart3,
   Boxes,
-  Compass,
   FlaskConical,
   LayoutDashboard,
   Plug,
@@ -9,14 +9,15 @@ import {
   ScrollText,
   Server,
   Settings,
-  Sparkles,
-  Users,
   ArrowUpRight,
 } from 'lucide-react';
 import { useApp, type PageId } from '../lib/store';
 import { T } from '../lib/i18n';
 import { CopyBtn } from './ui';
 import { useGateway } from '../lib/gateway';
+/* 品牌图标直接取自 src-tauri/icons 的同一张图（复制到 assets 供打包）：
+   侧栏、favicon、应用图标从此是同一个源，不会再各画一套 */
+import brandIcon from '../assets/brand.png';
 
 interface NavDef {
   id: PageId;
@@ -27,11 +28,8 @@ interface NavDef {
   accent?: boolean;
 }
 
-/** 宽限期剩余天数（向上取整）。宽限内能力完整，但 `daysLeft` 已是负数，得另算。 */
-function graceDays(until?: number): number {
-  if (!until) return 0;
-  return Math.max(0, Math.ceil((until - Date.now() / 1000) / 86400));
-}
+/** 连接页聚合的旧 id：深链落在其中任何一个，侧栏都点亮「连接」 */
+const CONNECT_GROUP: PageId[] = ['connect', 'providers', 'accounts', 'discover'];
 
 const groups: { zh: string; en: string; items: NavDef[] }[] = [
   {
@@ -40,9 +38,7 @@ const groups: { zh: string; en: string; items: NavDef[] }[] = [
     items: [
       { id: 'overview', label_zh: '概览', label_en: 'Overview', icon: LayoutDashboard },
       { id: 'models', label_zh: '模型', label_en: 'Models', icon: Boxes },
-      { id: 'providers', label_zh: '厂商', label_en: 'Providers', icon: Server },
-      { id: 'accounts', label_zh: '账号', label_en: 'Accounts', icon: Users },
-      { id: 'discover', label_zh: '发现', label_en: 'Discover', icon: Compass, accent: true },
+      { id: 'connect', label_zh: '连接', label_en: 'Connect', icon: Server },
       { id: 'playground', label_zh: '试验场', label_en: 'Playground', icon: FlaskConical },
     ],
   },
@@ -60,17 +56,17 @@ const groups: { zh: string; en: string; items: NavDef[] }[] = [
     items: [
       { id: 'extensions', label_zh: '扩展', label_en: 'Extensions', icon: Puzzle },
       { id: 'logs', label_zh: '日志', label_en: 'Logs', icon: ScrollText },
+      { id: 'reports', label_zh: '报表', label_en: 'Reports', icon: BarChart3 },
       { id: 'settings', label_zh: '设置', label_en: 'Settings', icon: Settings },
     ],
   },
 ];
 
 export function Sidebar() {
-  const { page, setPage, setLicenseDialog } = useApp();
+  const { page, setPage } = useApp();
   const gw = useGateway((s) => s.status);
   const providers = useGateway((s) => s.providers);
   const agents = useGateway((s) => s.agents);
-  const license = useGateway((s) => s.license);
 
   const running = gw ? gw.running : true;
   const port = gw?.port ?? 8787;
@@ -96,17 +92,11 @@ export function Sidebar() {
 
       <div className="brand">
         <div className="logo">
-          <Sparkles />
+          <img src={brandIcon} alt="Freeport" draggable={false} />
         </div>
         <div>
           <div className="brand-name" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Freeport
-            {/* 档位徽标跟着许可证走：宽限期仍是 Pro，但用警示色提示续费 */}
-            {license?.pro && (
-              <span className={`brand-pro ${license.status === 'grace' ? 'warn' : ''}`}>
-                PRO
-              </span>
-            )}
           </div>
           <div className="brand-tag">自由港</div>
         </div>
@@ -120,21 +110,20 @@ export function Sidebar() {
             </div>
             {g.items.map((it) => {
               const Icon = it.icon;
+              const active = it.id === 'connect' ? CONNECT_GROUP.includes(page) : page === it.id;
               // 只显示真实计数；没有数据时不显示，不用占位数字充数
               const live =
                 it.id === 'models' && modelCount
                   ? String(modelCount)
-                  : it.id === 'providers' && providers.length
-                    ? String(providers.length)
-                    : it.id === 'accounts' && credentialCount
-                      ? String(credentialCount)
-                      : it.id === 'agents' && injectedCount
-                        ? String(injectedCount)
-                        : it.count;
+                  : it.id === 'connect' && credentialCount
+                    ? String(credentialCount)
+                    : it.id === 'agents' && injectedCount
+                      ? String(injectedCount)
+                      : it.count;
               return (
                 <button
                   key={it.id}
-                  className={`nav-item ${page === it.id ? 'active' : ''}`}
+                  className={`nav-item ${active ? 'active' : ''}`}
                   onClick={() => setPage(it.id)}
                 >
                   <Icon />
@@ -156,7 +145,7 @@ export function Sidebar() {
             <span>
               <T zh={running ? '网关运行中' : '网关未启动'} en={running ? 'Gateway running' : 'Gateway offline'} />
             </span>
-            <CopyBtn value={addr} label="" />
+            <CopyBtn value={addr} label="" tip="复制网关地址 / Copy address" />
           </div>
           <div className="gw-addr">
             <span>127.0.0.1:{port}</span>
@@ -169,46 +158,6 @@ export function Sidebar() {
               <T zh={`今日 ${requests.toLocaleString()} 次`} en={`${requests.toLocaleString()} today`} />
             </span>
           </div>
-        </div>
-
-        <div className={`pro-card ${license?.pro ? 'active' : ''}`}>
-          <b>
-            <T zh="Freeport Pro" en="Freeport Pro" />
-          </b>
-          {license?.pro ? (
-            <>
-              <p>
-                {license.status === 'grace' ? (
-                  <T
-                    zh={`宽限期：${license.subject ?? 'Pro'} 已过期，完全能力还保留 ${graceDays(license.graceUntil)} 天。`}
-                    en={`Grace: ${license.subject ?? 'Pro'} expired, full features for ${graceDays(license.graceUntil)} more days.`}
-                  />
-                ) : (
-                  <T
-                    zh={`已激活 · ${license.subject ?? 'Pro'} · 还剩 ${license.daysLeft ?? 0} 天。`}
-                    en={`Active · ${license.subject ?? 'Pro'} · ${license.daysLeft ?? 0} days left.`}
-                  />
-                )}
-              </p>
-              <button onClick={() => setPage('settings')}>
-                <T zh="管理许可证" en="Manage license" />
-                <ArrowUpRight size={11} />
-              </button>
-            </>
-          ) : (
-            <>
-              <p>
-                <T
-                  zh="实时目录 · 额度情报 · 多机同步。免费版功能完整，只是目录 7 天更新一次。"
-                  en="Live catalog, quota intel, multi-device sync. Free tier keeps every feature, catalog refreshes weekly."
-                />
-              </p>
-              <button onClick={() => setLicenseDialog(true)}>
-                <T zh="输入激活码" en="Enter license key" />
-                <ArrowUpRight size={11} />
-              </button>
-            </>
-          )}
         </div>
       </div>
     </aside>

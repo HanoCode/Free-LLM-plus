@@ -793,6 +793,23 @@ impl Swrr {
     ) -> Vec<Candidate> {
         match strategy {
             Strategy::Balanced => self.order(cands, data, ledger, now),
+            _ => self.order_with_weights(strategy, cands, data, ledger, now, None),
+        }
+    }
+
+    /// 带权重覆盖的版本（策略档用）：`balanced` 的第三因子改用给定权重，
+    /// 其余策略与 [`order_with`] 完全一致——极值策略本来就只看一个维度。
+    pub fn order_with_weights(
+        &mut self,
+        strategy: Strategy,
+        cands: Vec<Candidate>,
+        data: &AppData,
+        ledger: &Ledger,
+        now: i64,
+        weights_override: Option<crate::model::RouteWeights>,
+    ) -> Vec<Candidate> {
+        match strategy {
+            Strategy::Balanced => self.order_weighted(cands, data, ledger, now, weights_override),
             Strategy::Order => cands,
             Strategy::Rotate => {
                 if cands.len() < 2 {
@@ -895,11 +912,24 @@ impl Swrr {
         ledger: &Ledger,
         now: i64,
     ) -> Vec<Candidate> {
+        self.order_weighted(cands, data, ledger, now, None)
+    }
+
+    /// `order` 的权重可覆盖版本。`weights_override` 优先于全局配置
+    /// （策略档命中时用）；`None` 时行为与 [`order`] 完全一致。
+    pub fn order_weighted(
+        &mut self,
+        cands: Vec<Candidate>,
+        data: &AppData,
+        ledger: &Ledger,
+        now: i64,
+        weights_override: Option<crate::model::RouteWeights>,
+    ) -> Vec<Candidate> {
         if cands.len() < 2 {
             return cands;
         }
 
-        let weights = data.routing.weights.active();
+        let weights = weights_override.or_else(|| data.routing.weights.active());
         let mut live: Vec<(Candidate, f64, String)> = Vec::with_capacity(cands.len());
         for c in cands {
             let p = &data.providers[c.provider];
@@ -1233,6 +1263,7 @@ mod tests {
             enabled: true,
             added_at: String::new(),
             proxy: None,
+            wire: None,
             quota: None,
             accounts: vec![Account {
                 id: format!("{id}_a"),

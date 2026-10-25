@@ -34,7 +34,7 @@
     "active": true,
     "targets": "all",
     "publisher": "HanoCode",
-    "copyright": "© 2026 HanoCode and Freeport contributors · AGPL-3.0-or-later",
+    "copyright": "© 2026 HanoCode · Proprietary · See EULA.md",
     "category": "DeveloperTool",
     "shortDescription": "Local gateway that unifies free LLM providers",
     "longDescription": "Freeport discovers free model tiers you already have access to, routes requests across them with a three-stage gate, and injects the gateway into the coding agents you already use. Everything runs on 127.0.0.1: credentials are encrypted at rest, logs never leave the machine, and every injected file can be rolled back byte-for-byte.",
@@ -62,5 +62,13 @@
       }
     },
     "createUpdaterArtifacts": false
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/HanoCode/Free-LLM-plus/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhGNkQxRjRCMTkyOEYyRTIKUldUaThpZ1pTeDl0ajlxRHBNZVZSNVdxNXA0c1ErM0kvUUNCcWZ5YWNFY1ljd1o4TXFkaHdKM3U"
+    }
   }
 }

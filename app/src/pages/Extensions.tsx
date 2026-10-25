@@ -10,6 +10,11 @@ import type { GwExt } from '../lib/bridge';
  * v1 起这两个能力是真的：ASR 与图片生成各自跑在独立 sidecar 进程里，
  * 不进 chat 主链路。这一页展示的是 manifest 里声明过的权限与运行状态——
  * 端口号不在这里，它只存在于网关与 sidecar 之间的内部路由表。
+ *
+ * 常见误会（页头文案专门澄清）：chat 请求体里的 tools（function calling）
+ * 由主网关原样透传，模型支持就直接用、不支持被能力门禁降权——那一路
+ * **零配置**。这一页的扩展是 chat 协议之外的能力（语音转写、图片生成），
+ * chat 免费厂商不提供这些端点，所以上游要单独配，与工具调用无关。
  */
 
 function ExtIcon({ kind }: { kind: string }) {
@@ -220,8 +225,8 @@ export function Extensions() {
           </h1>
           <p>
             <T
-              zh="独立进程的能力插件，只为 chat 之外的东西存在。装之前先看清它能访问什么。"
-              en="Out-of-process capability plugins. Read the permissions before you install."
+              zh="chat 之外的能力插件（语音转写、图片生成）。工具调用不在这里——它随主链路自动透传，零配置。"
+              en="Capability plugins for things outside chat (ASR, image). Tool calling is NOT here — it passes through the main gateway, zero config."
             />
           </p>
         </div>
@@ -237,6 +242,38 @@ export function Extensions() {
             <Code2 />
             <T zh="开发者模式" en="Developer mode" />
           </button>
+        </div>
+      </div>
+
+      {/* 常见误会当场说清：工具调用走主链路零配置，扩展是另一条路 */}
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div className="card-body" style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+          <div style={{ flex: 1, minWidth: 260 }}>
+            <div style={{ marginBottom: 4 }}>
+              <b>
+                <T zh="工具调用（function calling）—— 不用配" en="Tool calling — nothing to configure" />
+              </b>
+            </div>
+            <div className="sub" style={{ lineHeight: 1.7 }}>
+              <T
+                zh="Agent 请求里的 tools 参数随主网关原样透传：模型支持就直接用；没实测支持会被能力门禁降权、自动换支持的家。全程零配置，也不需要扩展。"
+                en="The tools parameter in agent requests passes through the gateway untouched: supported models use it directly; unverified ones get down-weighted by the capability gate. Zero config, no extension needed."
+              />
+            </div>
+          </div>
+          <div style={{ flex: 1, minWidth: 260 }}>
+            <div style={{ marginBottom: 4 }}>
+              <b>
+                <T zh="扩展（语音 / 图片）—— 要单独配上游" en="Extensions (ASR / image) — need their own upstream" />
+              </b>
+            </div>
+            <div className="sub" style={{ lineHeight: 1.7 }}>
+              <T
+                zh="语音转写、图片生成不是 chat 模型的能力，免费 chat 厂商不提供这类端点——所以每个扩展单独配一个支持它的上游（地址 / 模型 / key）。配一次，之后按需自动拉起。"
+                en="ASR and image generation are not chat-model capabilities — free chat providers don't serve them. Each extension points at its own upstream (URL / model / key); configure once, it auto-starts on demand."
+              />
+            </div>
+          </div>
         </div>
       </div>
 

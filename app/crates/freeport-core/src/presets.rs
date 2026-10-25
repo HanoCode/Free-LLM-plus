@@ -14,6 +14,10 @@ pub struct ProviderPreset {
     pub homepage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// 上游线格式。空 = OpenAI 兼容（绝大多数预设都是）；
+    /// 只有「额度只能从原生端点用掉」的预设才声明，接入时会写进 Provider。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire: Option<String>,
 }
 
 const fn p(
@@ -49,7 +53,11 @@ const PRESETS: &[(&str, &str, &str, &str, &str, &str)] = &[
     // ── 以下为「常见 OpenAI 兼容端点」预设 ────────────────────────────
     // 只写端点与申请页，不写额度数字：额度随时会变，写死就成了界面上的假数据。
     p("openai", "OpenAI", "https://api.openai.com/v1", "C", "https://platform.openai.com/api-keys", "官方付费端点，也用于自建中转"),
-    p("google", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "A", "https://aistudio.google.com/apikey", "官方提供 OpenAI 兼容层，免费档按模型给"),
+    p("google", "Google Gemini（OpenAI 兼容）", "https://generativelanguage.googleapis.com/v1beta/openai", "A", "https://aistudio.google.com/apikey", "官方提供 OpenAI 兼容层，免费档按模型给"),
+    // Gemini 原生协议：functionCall / systemInstruction 按官方语义走，
+    // 由网关做双向转换（见 freeport-gateway::upwire）。兼容层覆盖不到的
+    // 场景（工具调用的严格模式、thinkingConfig）只有原生端点认。
+    p("google-gemini", "Google Gemini（原生）", "https://generativelanguage.googleapis.com/v1beta", "A", "https://aistudio.google.com/apikey", "Gemini 原生协议端点，免费档按模型给；与兼容层二选一即可"),
     p("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "C", "https://platform.deepseek.com/api_keys", "余额制，价格低"),
     p("moonshot", "Moonshot Kimi", "https://api.moonshot.cn/v1", "C", "https://platform.moonshot.cn/console/api-keys", "国内端点，长上下文"),
     p("zhipuai", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "A", "https://open.bigmodel.cn/usercenter/apikeys", "有免费模型档，具体以官网为准"),
@@ -88,6 +96,14 @@ const PRESETS: &[(&str, &str, &str, &str, &str, &str)] = &[
     p("custom", "自定义", "", "C", "", "任意 OpenAI 兼容端点（含本地 chat2api / Ollama 代理）"),
 ];
 
+/// 声明非 OpenAI 线格式的预设。只有「额度只能从原生端点用掉」的厂商才上这张表；
+/// 不在表里的一律 OpenAI 兼容，不需要给 47 家各写一个 `""`。
+const WIRED: &[(&str, &str)] = &[
+    ("claude-sub", "anthropic"),
+    ("codex-sub", "responses"),
+    ("google-gemini", "gemini"),
+];
+
 pub fn all() -> Vec<ProviderPreset> {
     PRESETS
         .iter()
@@ -98,6 +114,10 @@ pub fn all() -> Vec<ProviderPreset> {
             tier: (*tier).to_string(),
             homepage: if homepage.is_empty() { None } else { Some((*homepage).to_string()) },
             note: if note.is_empty() { None } else { Some((*note).to_string()) },
+            wire: WIRED
+                .iter()
+                .find(|(w, _)| *w == *id)
+                .map(|(_, v)| v.to_string()),
         })
         .collect()
 }

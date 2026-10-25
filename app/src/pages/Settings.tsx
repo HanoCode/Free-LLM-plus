@@ -1,13 +1,12 @@
 import { useEffect, useState } from 'react';
 import { ExternalLink } from 'lucide-react';
-import { T, tx } from '../lib/i18n';
+import { T, tx, useLang } from '../lib/i18n';
 import { useApp } from '../lib/store';
 import { useGateway } from '../lib/gateway';
-import { CopyBtn, Switch, toast } from '../components/ui';
+import { CopyBtn, Switch, confirmDanger, toast } from '../components/ui';
 import { ApiKeys } from '../components/ApiKeys';
 import { Transfer } from '../components/Transfer';
-import { License } from '../components/License';
-import type { DesktopPrefs, UpdateCheck } from '../lib/bridge';
+import type { DesktopPrefs, GwBackupFile, UpdateCheck } from '../lib/bridge';
 
 const REPO = 'https://github.com/HanoCode/Free-LLM-plus';
 
@@ -16,6 +15,7 @@ export function Settings() {
   const desktop = useGateway((s) => s.available);
   const gw = useGateway((s) => s.status);
   const setRequireAuth = useGateway((s) => s.setRequireAuth);
+  const setRemote = useGateway((s) => s.setRemote);
   const setBudget = useGateway((s) => s.setBudget);
   const setCompress = useGateway((s) => s.setCompress);
   const patchConfig = useGateway((s) => s.patchConfig);
@@ -30,6 +30,15 @@ export function Settings() {
   const [update, setUpdate] = useState<UpdateCheck | null>(null);
   const [prefs, setPrefs] = useState<DesktopPrefs | null>(null);
   const [autostart, setAutostart] = useState(false);
+  /** 进阶设置默认收起：压缩/缓存/目录/巡检等留给需要的用户 */
+  const [showAdv, setShowAdv] = useState(
+    () => localStorage.getItem('fp.settings.adv') === '1',
+  );
+  /** 开发者档：MCP JSON、协议入口明细。默认彻底隐藏，点两下才解锁（防误触，不设密码） */
+  const [showDev, setShowDev] = useState(
+    () => localStorage.getItem('fp.settings.dev') === '1',
+  );
+  const [devArm, setDevArm] = useState(false);
 
   useEffect(() => {
     const api = window.freeport?.app;
@@ -53,12 +62,49 @@ export function Settings() {
   const addr = `http://127.0.0.1:${gw?.port ?? 8787}`;
   const zh = lang === 'zh';
 
-  /** 真去 GitHub 查，不弹「已是最新」的假提示 */
+  /** 下载进度文本。null = 没在进行 */
+  const [upProgress, setUpProgress] = useState<string | null>(null);
+
+  useEffect(() => {
+    const off = window.freeport?.gateway.onUpdaterProgress?.((p) => {
+      if (p.phase === 'install') {
+        setUpProgress(zh ? '安装中，即将重启…' : 'Installing, restarting…');
+      } else if (p.total) {
+        const pct = Math.round(((p.downloaded ?? 0) / p.total) * 100);
+        setUpProgress(`${zh ? '下载中' : 'Downloading'} ${pct}%`);
+      } else {
+        setUpProgress(zh ? '下载中…' : 'Downloading…');
+      }
+    });
+    return off;
+  }, [zh]);
+
+  /** 真去 GitHub 查，不弹「已是最新」的假提示。
+   *  优先走带签名校验的更新通道（tauri-plugin-updater）；没配置或
+   *  不可达时回落到 GitHub API + 打开浏览器页的老路。 */
   const checkUpdate = async () => {
     const api = window.freeport?.app;
     if (!api) return toast(zh ? '检查更新需要桌面端' : 'Update check needs the desktop app');
     setChecking(true);
     try {
+      try {
+        const u = await api.updaterCheck();
+        setUpdate({
+          current: u.current,
+          latest: u.version ?? u.current,
+          updateAvailable: u.available,
+          url: null,
+          notes: u.notes ?? null,
+        });
+        if (u.available) {
+          toast(tx(lang, `有新版本 v${u.version}`, `v${u.version} is available`));
+        } else {
+          toast(tx(lang, `已是最新（v${u.current}）`, `Up to date (v${u.current})`));
+        }
+        return;
+      } catch {
+        // 更新通道未配置或不可达：走老通道
+      }
       const r = await api.checkUpdate();
       setUpdate(r);
       if (r.updateAvailable) {
@@ -70,6 +116,20 @@ export function Settings() {
       toast(String(e));
     } finally {
       setChecking(false);
+    }
+  };
+
+  /** 自动更新：下载 + 安装 + 重启。失败把进度清掉并把原因说给用户听 */
+  const installUpdate = async () => {
+    const api = window.freeport?.app;
+    if (!api) return;
+    setUpProgress(zh ? '准备下载…' : 'Preparing…');
+    try {
+      await api.updaterInstall();
+      // 成功路径不会走到这里：应用直接重启
+    } catch (e) {
+      setUpProgress(null);
+      toast(String(e));
     }
   };
 
@@ -100,6 +160,54 @@ export function Settings() {
         </div>
       </div>
 
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+        <button
+          className="btn ghost sm"
+          onClick={() => {
+            const v = !showAdv;
+            setShowAdv(v);
+            localStorage.setItem('fp.settings.adv', v ? '1' : '0');
+          }}
+        >
+          <T zh={showAdv ? '隐藏进阶设置' : '显示进阶设置'} en={showAdv ? 'Hide advanced' : 'Show advanced'} />
+        </button>
+        <span className="sub">
+          {showAdv ? (
+            <T zh="以下进阶项保留默认值即可" en="defaults are fine for most setups" />
+          ) : (
+            <T zh="压缩、缓存、目录、巡检、迁移备份都收在这里" en="compression, cache, catalog, patrol and backup live here" />
+          )}
+        </span>
+        <button
+          className={`btn ghost sm ${showDev ? '' : 'faint'}`}
+          style={{ marginLeft: 'auto' }}
+          title={zh ? '面向开发者的诊断信息' : 'developer diagnostics'}
+          onClick={() => {
+            if (showDev) {
+              setShowDev(false);
+              setDevArm(false);
+              localStorage.setItem('fp.settings.dev', '0');
+              return;
+            }
+            // 两步解锁：第一下只点亮确认，第二下才真的开
+            if (!devArm) {
+              setDevArm(true);
+              return;
+            }
+            setShowDev(true);
+            setDevArm(false);
+            localStorage.setItem('fp.settings.dev', '1');
+            toast(zh ? '开发者选项已开启' : 'Developer options enabled');
+          }}
+        >
+          {showDev
+            ? zh ? '隐藏开发者选项' : 'Hide developer options'
+            : devArm
+              ? zh ? '再点一次确认开启' : 'Click again to confirm'
+              : zh ? '开发者选项' : 'Developer options'}
+        </button>
+      </div>
+
       <div className="set-grid">
         <div className="stack">
           <div className="card">
@@ -114,15 +222,53 @@ export function Settings() {
                   <T zh="监听地址" en="Listen address" />
                 </div>
                 <div className="d">
-                  <T zh="只绑回环，不对外暴露" en="loopback only, never exposed" />
+                  {gw && gw.bind && gw.bind !== '127.0.0.1' ? (
+                    <T
+                      zh="正在对局域网监听——请确认你在可信网络里，且鉴权保持开启"
+                      en="listening on LAN — make sure you trust this network and keep auth on"
+                    />
+                  ) : (
+                    <T zh="只绑回环，不对外暴露" en="loopback only, never exposed" />
+                  )}
                   {gw && !gw.running && (
                     <span style={{ color: 'var(--bad)' }}> · {gw.error || 'offline'}</span>
                   )}
                 </div>
               </div>
               <div className="v" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span className="mono">127.0.0.1:{gw?.port ?? 8787}</span>
-                <CopyBtn value={addr} label="" />
+                <span className="mono">{gw?.bind || '127.0.0.1'}:{gw?.port ?? 8787}</span>
+                <CopyBtn value={addr} label="" tip="复制网关地址 / Copy address" />
+              </div>
+            </div>
+            <div className="set-row">
+              <div>
+                <div className="k" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <T zh="远程接入" en="Remote access" />
+                </div>
+                <div className="d">
+                  <T
+                    zh="允许局域网里的其他设备（手机、另一台电脑）调用这台网关。开启后强制要求鉴权；改完重启网关生效。"
+                    en="Let other devices on your LAN (phone, another computer) call this gateway. Auth is forced on; restart the gateway to apply."
+                  />
+                </div>
+              </div>
+              <div className="v">
+                <Switch
+                  on={!!gw && gw.bind !== '127.0.0.1'}
+                  disabled={desktop === false}
+                  onChange={(v) => {
+                    if (!setRemote) return;
+                    setRemote(v)
+                      .then(() =>
+                        toast(
+                          v
+                            ? '已切换到局域网监听，重启网关后生效'
+                            : '已收回本机监听，重启网关后生效',
+                        ),
+                      )
+                      .catch((e) => toast(e instanceof Error ? e.message : String(e)));
+                  }}
+                />
               </div>
             </div>
             <div className="set-row">
@@ -135,7 +281,7 @@ export function Settings() {
                 </div>
               </div>
               <div className="v" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                {desktop && gw && <CopyBtn value={gw.authToken} label="" />}
+                {desktop && gw && <CopyBtn value={gw.authToken} label="" tip="复制 / Copy" />}
                 {desktop && gw && (
                   <Switch
                     on={gw.requireAuth}
@@ -147,6 +293,8 @@ export function Settings() {
                 )}
               </div>
             </div>
+            {showAdv && (
+            <>
             <div className="set-row">
               <div>
                 <div className="k">
@@ -203,8 +351,8 @@ export function Settings() {
                       void patchConfig({ compressSmart: v });
                       toast(
                         v
-                          ? '已开启智能过滤：结构化输出按结构裁，省得更多'
-                          : '已关闭智能过滤：统一走首尾截断',
+                          ? tx(lang, '已开启智能过滤：结构化输出按结构裁，省得更多', 'Structure-aware trimming on: recognised shapes are trimmed by structure')
+                          : tx(lang, '已关闭智能过滤：统一走首尾截断', 'Structure-aware trimming off: head + tail trimming only'),
                       );
                     }}
                   />
@@ -260,8 +408,8 @@ export function Settings() {
                         void patchConfig({ cache: v });
                         toast(
                           v
-                            ? '已开启响应缓存：完全相同的请求直接复用，不消耗上游额度'
-                            : '已关闭响应缓存：每个请求都会真的发出去',
+                            ? tx(lang, '已开启响应缓存：完全相同的请求直接复用，不消耗上游额度', 'Response cache on: identical requests are reused without hitting upstream')
+                            : tx(lang, '已关闭响应缓存：每个请求都会真的发出去', 'Response cache off: every request goes upstream for real'),
                         );
                       }}
                     />
@@ -269,6 +417,115 @@ export function Settings() {
                 )}
               </div>
             </div>
+            {/* ── OTLP 导出（opt-in）──
+                把请求元数据推给用户自己的观测栈。默认关、不含对话内容、
+                绝不反压——这三条缺一条都不能做成默认行为。 */}
+            <div className="set-row">
+              <div>
+                <div className="k">
+                  <T zh="OTLP 导出" en="OTLP export" />
+                </div>
+                <div className="d">
+                  <T
+                    zh="把每次请求的 span（厂商 / 模型 / 耗时 / token / 折算成本，不含对话内容）按 OTLP/HTTP+JSON 推给你自己的 collector（Jaeger、Tempo、SigNoz…）。默认关：这会把请求元数据发往网络。"
+                    en="Push one span per request (provider / model / latency / tokens / cost, never conversation content) to your own collector (Jaeger, Tempo, SigNoz…) over OTLP/HTTP+JSON. Off by default: this sends request metadata over the network."
+                  />
+                </div>
+              </div>
+              <div className="v">
+                {desktop && gw && (
+                  <Switch
+                    on={gw.otlpEnabled}
+                    onChange={(v) => {
+                      void patchConfig({ otlpEnabled: v });
+                      toast(
+                        v
+                          ? tx(lang, '已开启 OTLP 导出', 'OTLP export on')
+                          : tx(lang, '已关闭 OTLP 导出', 'OTLP export off'),
+                      );
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+            {desktop && gw && gw.otlpEnabled && (
+              <>
+                <div className="set-row">
+                  <div>
+                    <div className="k">
+                      <T zh="Collector 地址" en="Collector endpoint" />
+                    </div>
+                    <div className="d">
+                      <T
+                        zh="如 http://127.0.0.1:4318（自动补 /v1/traces）。失败只记日志，不影响请求。"
+                        en="e.g. http://127.0.0.1:4318 (/v1/traces appended automatically). Failures are logged only; requests are never affected."
+                      />
+                    </div>
+                  </div>
+                  <div className="v">
+                    <input
+                      type="text"
+                      defaultValue={gw.otlpEndpoint}
+                      key={`otlp-${gw.otlpEndpoint}`}
+                      placeholder="http://127.0.0.1:4318"
+                      onBlur={(e) => {
+                        const v = e.target.value.trim();
+                        if (v === gw.otlpEndpoint) return;
+                        void patchConfig({ otlpEndpoint: v });
+                      }}
+                      style={{
+                        width: 260,
+                        height: 28,
+                        padding: '0 8px',
+                        border: '1px solid var(--line)',
+                        borderRadius: 7,
+                        background: 'var(--panel-2)',
+                        color: 'var(--text)',
+                        fontFamily: 'var(--mono)',
+                        fontSize: 11.5,
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="set-row">
+                  <div>
+                    <div className="k">
+                      <T zh="自定义请求头" en="Custom headers" />
+                    </div>
+                    <div className="d">
+                      <T
+                        zh="一行一个 Key: Value，collector 要求鉴权时用。失焦即保存。"
+                        en="One `Key: Value` per line, for collectors that require auth. Saved on blur."
+                      />
+                    </div>
+                  </div>
+                  <div className="v">
+                    <textarea
+                      defaultValue={gw.otlpHeaders.join('\n')}
+                      key={`otlph-${gw.otlpHeaders.join('|')}`}
+                      placeholder={'Authorization: Bearer …'}
+                      rows={2}
+                      onBlur={(e) => {
+                        const v = e.target.value;
+                        if (v === gw.otlpHeaders.join('\n')) return;
+                        void patchConfig({ otlpHeaders: v.split('\n') });
+                      }}
+                      style={{
+                        width: 260,
+                        padding: '6px 8px',
+                        border: '1px solid var(--line)',
+                        borderRadius: 7,
+                        background: 'var(--panel-2)',
+                        color: 'var(--text)',
+                        fontFamily: 'var(--mono)',
+                        fontSize: 11.5,
+                        resize: 'vertical',
+                      }}
+                    />
+                  </div>
+                </div>
+              </>
+            )}
             <div className="set-row">
               <div>
                 <div className="k">
@@ -293,7 +550,11 @@ export function Settings() {
                       const v = Math.max(0, Math.min(10000, Number(e.target.value) || 0));
                       if (v === gw.identifierLimit) return;
                       void patchConfig({ identifierLimit: v });
-                      toast(v === 0 ? '已取消单来源限速' : `单来源限速已设为 ${v} 次/分钟`);
+                      toast(
+                        v === 0
+                          ? tx(lang, '已取消单来源限速', 'Per-source rate limit removed')
+                          : tx(lang, `单来源限速已设为 ${v} 次/分钟`, `Per-source rate limit set to ${v}/min`),
+                      );
                     }}
                     style={{
                       width: 90,
@@ -327,9 +588,16 @@ export function Settings() {
                 {desktop && (
                   <button
                     className="btn ghost sm"
-                    onClick={() => {
+                    onClick={async () => {
+                      if (
+                        !(await confirmDanger({
+                          zh: '解除全部冷却？被限速的凭据会立刻重新参与路由，可能再次触发上游限流。',
+                          en: 'Clear all cooldowns? Rate-limited credentials will rejoin routing immediately and may hit upstream limits again.',
+                        }))
+                      )
+                        return;
                       void clearCooldowns();
-                      toast('已清除全部冷却 / Cooldowns cleared');
+                      toast(tx(lang, '已清除全部冷却', 'All cooldowns cleared'));
                     }}
                   >
                     <T zh="全部解除" en="Clear all" />
@@ -337,6 +605,9 @@ export function Settings() {
                 )}
               </div>
             </div>
+            </>
+            )}
+            {showDev && (
             <div className="set-row">
               <div>
                 <div className="k">
@@ -353,12 +624,14 @@ export function Settings() {
                 <span className="badge ok">5 / 5</span>
               </div>
             </div>
+            )}
           </div>
 
           <ApiKeys desktop={desktop} />
 
-          <Transfer desktop={desktop} />
+          {showAdv && <Transfer desktop={desktop} />}
 
+          {showDev && (
           <div className="card">
             <div className="card-head">
               <h3>
@@ -416,6 +689,7 @@ export function Settings() {
               </div>
             </div>
           </div>
+          )}
 
           <div className="card">
             <div className="card-head">
@@ -513,6 +787,7 @@ export function Settings() {
             </div>
           </div>
 
+          {showAdv && (
           <div className="card">
             <div className="card-head">
               <h3>
@@ -581,9 +856,12 @@ export function Settings() {
               </div>
             </div>
           </div>
+          )}
         </div>
 
         <div className="stack">
+          {showAdv && (
+          <>
           <div className="card">
             <div className="card-head">
               <h3>
@@ -802,7 +1080,10 @@ export function Settings() {
                   <T zh="今日探针预算" en="Daily probe budget" />
                 </div>
                 <div className="d">
-                  <T zh="默认 clamp(日配额×1%, 60, 800)" en="default clamp(1% of quota, 60, 800)" />
+                  <T
+                    zh="按已配厂商的日额度 1% 自动扩展（下限 60、上限 2400）"
+                    en="scales with your configured daily quota (min 60, max 2400)"
+                  />
                 </div>
               </div>
               <div className="v mono">
@@ -823,8 +1104,10 @@ export function Settings() {
               </div>
             </div>
           </div>
+          </>
+          )}
 
-          <License />
+          <ProCard />
 
           <div className="card">
             <div className="card-head">
@@ -924,10 +1207,16 @@ export function Settings() {
                   )}
                 </div>
               </div>
-              <div className="v" style={{ display: 'flex', gap: 6 }}>
-                {update?.updateAvailable && update.url && (
+              <div className="v" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                {upProgress && <span className="sub">{upProgress}</span>}
+                {update?.updateAvailable && !upProgress && (
+                  <button className="btn sm" onClick={() => void installUpdate()}>
+                    <T zh="自动更新" en="Auto-update" />
+                  </button>
+                )}
+                {update?.updateAvailable && update.url && !upProgress && (
                   <button
-                    className="btn sm"
+                    className="btn ghost sm"
                     onClick={() => void window.freeport?.shell.openExternal(update.url!)}
                   >
                     <T zh="去下载" en="Download" />
@@ -962,7 +1251,7 @@ export function Settings() {
                   <T zh="许可与隐私" en="License & privacy" />
                 </div>
                 <div className="d">
-                  <T zh="AGPL-3.0 · 本地优先，无遥测；崩溃日志只留在本机" en="AGPL-3.0 · local-first, no telemetry; crash logs stay local" />
+                  <T zh="专有软件（EULA）· 本地优先，无遥测；崩溃日志只留在本机" en="Proprietary (EULA) · local-first, no telemetry; crash logs stay local" />
                 </div>
               </div>
               <div className="v" style={{ display: 'flex', gap: 6 }}>
@@ -1016,6 +1305,358 @@ function Row({
       <div className="v">
         <Switch on={on} onChange={set} />
       </div>
+    </div>
+  );
+}
+
+/* ── 增强功能开关 ─────────────────────────────
+   全部免费可用、全部本机运行：预热、解粘阈值、粘性窗口、加密自动备份。 */
+
+function ProCard() {
+  const lang = useLang();
+  const zh = lang === 'zh';
+  const pro = useGateway((s) => s.pro);
+  const loadPro = useGateway((s) => s.loadPro);
+  const updatePro = useGateway((s) => s.updatePro);
+  const backupNow = useGateway((s) => s.backupNow);
+  const backupList = useGateway((s) => s.backupList);
+  const backupRestore = useGateway((s) => s.backupRestore);
+
+  const [backups, setBackups] = useState<GwBackupFile[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void loadPro();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const patch = async (p: Parameters<typeof updatePro>[0], okMsg: string) => {
+    setBusy(true);
+    try {
+      await updatePro(p);
+      toast(okMsg);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshList = async () => {
+    try {
+      setBackups(await backupList());
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const doBackupNow = async () => {
+    setBusy(true);
+    try {
+      const path = await backupNow();
+      toast(zh ? `已备份到 ${path}` : `Backed up to ${path}`);
+      await refreshList();
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doRestore = async (name: string) => {
+    if (
+      !(await confirmDanger({
+        zh: `从快照 ${name} 恢复？按合并方式导入：同名配置以快照为准，其余保留。`,
+        en: `Restore from snapshot ${name}? Imports in merge mode: snapshot wins on conflicts, everything else is kept.`,
+      }))
+    )
+      return;
+    setBusy(true);
+    try {
+      await backupRestore(name);
+      toast(zh ? '已恢复，列表与额度已刷新' : 'Restored; lists and quota refreshed');
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const backup = pro?.backup;
+  const inputStyle: React.CSSProperties = {
+    width: 210,
+    height: 28,
+    padding: '0 8px',
+    border: '1px solid var(--line)',
+    borderRadius: 7,
+    background: 'var(--panel-2)',
+    color: 'var(--text)',
+    fontFamily: 'var(--mono)',
+    fontSize: 11.5,
+  };
+  const off = busy;
+
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h3>
+          <T zh="增强功能" en="Enhancements" />
+        </h3>
+        <span className="sub">
+          <T zh="全部免费可用，数据不出本机" en="all free, everything runs locally" />
+        </span>
+      </div>
+
+      {!pro ? (
+        <div className="card-body">
+          <span className="sub">
+            <T zh="读取中…" en="loading…" />
+          </span>
+        </div>
+      ) : (
+        <>
+          <div className="set-row">
+            <div>
+              <div className="k">
+                <T zh="会话预热" en="Session prewarm" />
+              </div>
+              <div className="d">
+                <T
+                  zh="粘住的通道剩余额度跌破 30% 时，提前探针下一个候选——切换发生在你需要它之前，而不是正好卡在半截。"
+                  en="When the sticky channel drops below 30% headroom, probe the next candidate early — the switch happens before you need it."
+                />
+              </div>
+            </div>
+            <div className="v">
+              <Switch
+                on={pro.prewarm}
+                disabled={off}
+                onChange={(v) => void patch({ prewarm: v }, v ? '已开启会话预热' : '已关闭会话预热')}
+              />
+            </div>
+          </div>
+
+          <div className="set-row">
+            <div>
+              <div className="k">
+                <T zh="解粘阈值" en="Unstick threshold" />
+              </div>
+              <div className="d">
+                <T
+                  zh="粘住的会话剩余额度低于这个比例时主动解粘，换更宽裕的通道。默认 0.10（10%）；清空即恢复默认。"
+                  en="The sticky session unsticks below this remaining ratio and moves to a roomier channel. Default 0.10; clear to restore."
+                />
+              </div>
+            </div>
+            <div className="v" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input
+                type="number"
+                min={0.02}
+                max={0.5}
+                step={0.01}
+                defaultValue={pro.unstickRatio ?? ''}
+                key={`unstick-${pro.unstickRatio ?? 'default'}`}
+                placeholder="0.10"
+                disabled={off}
+                onBlur={(e) => {
+                  const raw = e.target.value.trim();
+                  if (raw === '') {
+                    if (pro.unstickRatio == null) return;
+                    void patch({ unstickRatio: null }, '解粘阈值已恢复默认 0.10');
+                    return;
+                  }
+                  const v = Math.max(0.02, Math.min(0.5, Number(raw) || 0.1));
+                  if (v === pro.unstickRatio) return;
+                  void patch({ unstickRatio: v }, `解粘阈值已设为 ${Math.round(v * 100)}%`);
+                }}
+                style={{ ...inputStyle, width: 90 }}
+              />
+              <span className="faint" style={{ fontSize: 11 }}>
+                0.02 – 0.5
+              </span>
+            </div>
+          </div>
+
+          <div className="set-row">
+            <div>
+              <div className="k">
+                <T zh="粘性保持" en="Session stickiness" />
+              </div>
+              <div className="d">
+                <T
+                  zh="同一段对话粘回上次的通道，第二次起读上游缓存：更快、更省额度。免费版固定 30 分钟；Pro 可调 5 分钟–24 小时，长会话不用中途换家重烧缓存。"
+                  en="A conversation sticks to its last channel so upstream prompt caches hit: faster and cheaper. Free is fixed at 30 minutes; Pro tunes 5 minutes – 24 hours."
+                />
+              </div>
+            </div>
+            <div className="v">
+              <select
+                className="select"
+                value={String(pro.stickTtlMin ?? 30)}
+                disabled={off}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  void patch(
+                    { stickTtlMin: v === 30 ? null : v },
+                    v === 30 ? '粘性窗口已恢复默认 30 分钟' : `粘性窗口已设为 ${v >= 60 ? `${v / 60} 小时` : `${v} 分钟`}`,
+                  );
+                }}
+              >
+                <option value={5}>5 分钟</option>
+                <option value={15}>15 分钟</option>
+                <option value={30}>30 分钟（默认）</option>
+                <option value={60}>1 小时</option>
+                <option value={120}>2 小时</option>
+                <option value={360}>6 小时</option>
+                <option value={720}>12 小时</option>
+                <option value={1440}>24 小时</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="set-row">
+            <div>
+              <div className="k">
+                <T zh="加密自动备份" en="Encrypted auto-backup" />
+              </div>
+              <div className="d">
+                <T
+                  zh="定期把全部配置打包成迁移信封（Argon2id + AES-256-GCM，口令由本机主密钥派生，不落盘）。恢复走合并，不会整盘覆盖。"
+                  en="Periodically packs all config into a transfer envelope (Argon2id + AES-256-GCM, passphrase derived from the local master key). Restore merges; never wipes."
+                />
+              </div>
+            </div>
+            <div className="v">
+              <Switch
+                on={backup?.enabled ?? false}
+                disabled={off}
+                onChange={(v) => void patch({ backupEnabled: v }, v ? '已开启自动备份' : '已关闭自动备份')}
+              />
+            </div>
+          </div>
+
+          {(backup?.enabled ?? false) && (
+            <>
+              <div className="set-row">
+                <div>
+                  <div className="k">
+                    <T zh="备份目录" en="Backup directory" />
+                  </div>
+                  <div className="d">
+                    <T
+                      zh="绝对路径。留空用实例目录下的 backups/。目录要你自己能找到——备份的意义在网关之外。"
+                      en="Absolute path; empty uses backups/ inside the instance dir. Pick somewhere you can find — a backup only matters outside the app."
+                    />
+                  </div>
+                </div>
+                <div className="v">
+                  <input
+                    defaultValue={backup?.dir ?? ''}
+                    key={`bdir-${backup?.dir ?? ''}`}
+                    placeholder={zh ? '留空 = 实例目录/backups' : 'empty = instance dir/backups'}
+                    spellCheck={false}
+                    disabled={busy}
+                    onBlur={(e) => {
+                      const v = e.target.value.trim();
+                      if (v === (backup?.dir ?? '')) return;
+                      void patch({ backupDir: v }, v ? `备份目录已设为 ${v}` : '备份目录已恢复默认');
+                    }}
+                    style={inputStyle}
+                  />
+                </div>
+              </div>
+              <div className="set-row">
+                <div>
+                  <div className="k">
+                    <T zh="间隔与保留" en="Interval & retention" />
+                  </div>
+                  <div className="d">
+                    <T
+                      zh={`每 ${backup?.intervalHours ?? 24} 小时一份，最多留 ${backup?.keep ?? 7} 份，旧的自动清`}
+                      en={`every ${backup?.intervalHours ?? 24}h, keep ${backup?.keep ?? 7}, older ones pruned`}
+                    />
+                  </div>
+                </div>
+                <div className="v" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <select
+                    className="select"
+                    value={backup?.intervalHours ?? 24}
+                    disabled={busy}
+                    onChange={(e) =>
+                      void patch(
+                        { backupIntervalHours: Number(e.target.value) },
+                        `备份间隔已设为 ${e.target.value} 小时`,
+                      )
+                    }
+                  >
+                    <option value={6}>6h</option>
+                    <option value={12}>12h</option>
+                    <option value={24}>24h</option>
+                    <option value={48}>48h</option>
+                  </select>
+                  <input
+                    type="number"
+                    min={1}
+                    max={30}
+                    defaultValue={backup?.keep ?? 7}
+                    key={`bkeep-${backup?.keep ?? 7}`}
+                    disabled={busy}
+                    onBlur={(e) => {
+                      const v = Math.max(1, Math.min(30, Number(e.target.value) || 7));
+                      if (v === (backup?.keep ?? 7)) return;
+                      void patch({ backupKeep: v }, `保留份数已设为 ${v}`);
+                    }}
+                    style={{ ...inputStyle, width: 70 }}
+                  />
+                  <button className="btn ghost sm" disabled={busy} onClick={() => void doBackupNow()}>
+                    <T zh="立即备份" en="Back up now" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="set-row">
+                <div>
+                  <div className="k">
+                    <T zh="快照" en="Snapshots" />
+                  </div>
+                  <div className="d">
+                    {backup?.lastAt
+                      ? tx(
+                          lang,
+                          `上次备份：${new Date(backup.lastAt * 1000).toLocaleString()}`,
+                          `Last backup: ${new Date(backup.lastAt * 1000).toLocaleString()}`,
+                        )
+                      : tx(lang, '还没有备份过', 'never backed up yet')}
+                  </div>
+                </div>
+                <div className="v">
+                  <button className="btn ghost sm" disabled={busy} onClick={() => void refreshList()}>
+                    <T zh="刷新列表" en="Refresh list" />
+                  </button>
+                </div>
+              </div>
+
+              {backups !== null && backups.length > 0 && (
+                <div className="card-body" style={{ paddingTop: 0 }}>
+                  <div className="chain-list">
+                    {backups.map((f) => (
+                      <div className="chain-row" key={f.name}>
+                        <code style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{f.name}</code>
+                        <span className="faint" style={{ flex: 'none' }}>
+                          {(f.bytes / 1024).toFixed(1)} KB
+                        </span>
+                        <button className="btn ghost sm" disabled={busy} onClick={() => void doRestore(f.name)}>
+                          <T zh="恢复" en="Restore" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
     </div>
   );
 }

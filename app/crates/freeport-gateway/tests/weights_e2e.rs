@@ -114,8 +114,10 @@ async fn weights_persist_and_reorder_the_chain() {
             speed: 15,
             intelligence: 15,
         }),
+        profiles: None,
     })
-    .await;
+    .await
+    .unwrap();
     let head = chain_head(&client, port).await;
     assert_eq!(head["provider"], "slow", "{head}");
     assert!(
@@ -135,8 +137,10 @@ async fn weights_persist_and_reorder_the_chain() {
             speed: 100,
             intelligence: 0,
         }),
+        profiles: None,
     })
-    .await;
+    .await
+    .unwrap();
     let head = chain_head(&client, port).await;
     assert_eq!(head["provider"], "fast", "速度压满时该选快的：{head}");
 
@@ -161,8 +165,10 @@ async fn weights_persist_and_reorder_the_chain() {
             speed: 15,
             intelligence: 15,
         }),
+        profiles: None,
     })
-    .await;
+    .await
+    .unwrap();
     let head = chain_head(&client, port).await;
     assert_eq!(head["provider"], "slow", "关掉权重应退回「只看健康」：{head}");
     assert!(head["factors"]["blend"].is_null(), "{head}");

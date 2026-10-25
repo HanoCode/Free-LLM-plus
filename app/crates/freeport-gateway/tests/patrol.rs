@@ -93,7 +93,10 @@ async fn patrol_probes_and_drives_the_health_state_machine() {
     let pat = gw.patrol().await;
     assert_eq!(pat.used_today, 1, "预算应当被扣一次");
     assert_eq!(pat.probes_ok, 1);
-    assert!(pat.budget_today >= 60);
+    // 免费开放时代（pro::FREE_FOR_ALL）预算走 Pro 路径：空配额目录钳到下限 60。
+    // 原断言（免费固定 5）保留在注释里，恢复收费时改回。
+    // assert_eq!(pat.budget_today, 5, "免费巡检预算固定 5");
+    assert_eq!(pat.budget_today, 60, "免费时代按 Pro 路径，下限 60");
 
     let again = gw.patrol_pass(false).await;
     assert_eq!(again.ran, 0, "刚探过不该再探：{again:?}");
@@ -164,6 +167,7 @@ async fn patrol_probes_and_drives_the_health_state_machine() {
                     purposes: Vec::new(),
                 }],
                 proxy: None,
+                wire: None,
                 models: vec![freeport_core::model::ModelInfo {
                     id: "m1".into(),
                     owned_by: "bad".into(),

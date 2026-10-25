@@ -29,12 +29,13 @@ aes-gcm = "0.10"
 argon2 = { workspace = true }
 rand = "0.8"
 base64 = { workspace = true }
+# 设备密钥（Ed25519）：激活时上报公钥、续签时对服务器 nonce 签名自证身份。
+# 这只是本机自己的密钥对，与许可证签发私钥无关。
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
-# 只在测试里签名：发布包不含私钥相关代码
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 # 测试要能自己签发许可证；`issuer` 只在这个测试构建里打开
 freeport-license = { path = "../freeport-license", features = ["issuer"] }
 # 端到端跑真实的目录服务端：客户端与服务端的判定必须对得上，
