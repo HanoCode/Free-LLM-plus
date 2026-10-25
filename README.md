@@ -11,6 +11,8 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)](https://github.com/HanoCode/Free-LLM-plus/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-FFC131)](https://v2.tauri.app/)
 
+简体中文 | [English](README.en.md)
+
 </div>
 
 ---
