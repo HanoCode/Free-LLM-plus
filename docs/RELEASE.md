@@ -87,10 +87,13 @@ git push origin v0.1.0
 
 CI 会产出 **draft release**，不做自动发布。draft 里应当有：
 
-- `Freeport_0.1.0_aarch64.dmg` + `.sha256`
-- `Freeport_0.1.0_x64.dmg` + `.sha256`
-- `Freeport_0.1.0_x64-setup.exe` + `.sha256`
+- `Freeport_0.1.0_aarch64.dmg` + `.sha256`（Apple Silicon）
+- `Freeport_0.1.0_x64-setup.exe` + `.sha256`（Windows）
 - 配了更新密钥时还有 `*.app.tar.gz` / `*.sig` 与 `latest.json`
+
+> **Intel mac 暂无安装包**：GitHub 已退役 macos-13 runner，Intel 构建腿拿不到机器
+> （2026-10-25 从矩阵移除，恢复方式见 release.yml 内注释）。Intel 用户暂时只能源码
+> 自建（`cargo tauri build --target x86_64-apple-darwin`）。
 
 ## 2. 发之前必须验的四件事
 
