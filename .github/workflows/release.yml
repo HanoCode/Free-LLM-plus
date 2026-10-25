@@ -73,13 +73,13 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-            asset_glob: 'app/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg'
+            asset_glob: 'app/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg'
           - os: macos-13
             target: x86_64-apple-darwin
-            asset_glob: 'app/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg'
+            asset_glob: 'app/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg'
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset_glob: 'app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe'
+            asset_glob: 'app/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -228,7 +228,7 @@ jobs:
   #     endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
   #     trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
   #     certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
-  #     files-folder: app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis
+  #     files-folder: app/target/x86_64-pc-windows-msvc/release/bundle/nsis
   #     files-folder-filter: exe
   #     file-digest: SHA256
   #     timestamp-rfc3161: http://timestamp.acs.microsoft.com
